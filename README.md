@@ -119,13 +119,11 @@ docker run -p 30333:30333 -v subhost-data:/data subhost/subhost-web3 node --vali
 
 ---
 
-## 📖 Documentation
+## Documentation
 
-- **[Architecture](docs/architecture.md)** - Deep dive into system design
 - **[Tokenomics](docs/tokenomics.md)** - SUB token economics & incentives
 - **[Security](docs/security/threat-model.md)** - Threat model & audit reports
 - **[API Reference](https://subhost.vercel.app/docs)** - Full API documentation
-- **[Contributing](CONTRIBUTING.md)** - How to contribute
 
 ### Documentation Website
 
@@ -137,6 +135,36 @@ Complete documentation available at:
 - **Features**: [https://subhost.vercel.app/docs/features](https://subhost.vercel.app/docs/features)
 - **Smart Contracts**: [https://subhost.vercel.app/docs/contracts](https://subhost.vercel.app/docs/contracts)
 - **Staking**: [https://subhost.vercel.app/docs/staking](https://subhost.vercel.app/docs/staking)
+
+```bash
+cd website
+npm install
+npm run dev
+```
+
+---
+
+## Security
+
+### Audits
+
+- **Trail of Bits** - Consensus & Cryptography (Q1 2026)
+- **OpenZeppelin** - Smart Contracts & IBC (Q1 2026)
+- **Least Authority** - Zero-Knowledge Circuits (Q2 2026)
+
+### Bug Bounty
+
+Active bug bounty program: [immunefi.com/bounty/subhost](https://immunefi.com/bounty/subhost)
+
+| Severity | Bounty |
+|----------|--------|
+| Critical | \$500,000 - \$1,000,000 |
+| High | \$100,000 - \$500,000 |
+| Medium | \$10,000 - \$100,000 |
+
+### Known Limitations (By Design)
+
+All architectural limitations are documented with mitigation strategies. See [Threat Model](docs/security/threat-model.md).
 
 ---
 
