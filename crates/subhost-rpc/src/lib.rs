@@ -1,13 +1,13 @@
 use serde::{Serialize, Deserialize};
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct subhostrpcConfig {
+pub struct SubhostrpcConfig {
     pub enabled: bool,
     pub max_connections: usize,
 }
 
-impl Default for subhostrpcConfig {
+impl Default for SubhostrpcConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -16,8 +16,8 @@ impl Default for subhostrpcConfig {
     }
 }
 
-pub struct subhostrpcModule {
-    config: subhostrpcConfig,
+pub struct SubhostrpcModule {
+    config: SubhostrpcConfig,
     metrics: Metrics,
 }
 
@@ -28,9 +28,9 @@ pub struct Metrics {
     pub latency_ms: u64,
 }
 
-impl subhostrpcModule {
-    pub fn new(config: subhostrpcConfig) -> Self {
-        info!("Initializing subhostrpcModule");
+impl SubhostrpcModule {
+    pub fn new(config: SubhostrpcConfig) -> Self {
+        info!("Initializing SubhostrpcModule");
         Self {
             config,
             metrics: Metrics::default(),
@@ -48,7 +48,7 @@ impl subhostrpcModule {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum subhostrpcError {
+pub enum SubhostrpcError {
     #[error("Configuration error: {0}")]
     Config(String),
     #[error("Processing error: {0}")]
@@ -61,14 +61,14 @@ mod tests {
     
     #[test]
     fn test_default_config() {
-        let config = subhostrpcConfig::default();
+        let config = SubhostrpcConfig::default();
         assert!(config.enabled);
         assert_eq!(config.max_connections, 1000);
     }
     
     #[test]
     fn test_module_creation() {
-        let module = subhostrpcModule::new(subhostrpcConfig::default());
+        let module = SubhostrpcModule::new(SubhostrpcConfig::default());
         assert!(module.config.enabled);
     }
 }

@@ -1,13 +1,13 @@
 use serde::{Serialize, Deserialize};
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct subhosttelemetryConfig {
+pub struct SubhosttelemetryConfig {
     pub enabled: bool,
     pub max_connections: usize,
 }
 
-impl Default for subhosttelemetryConfig {
+impl Default for SubhosttelemetryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -16,8 +16,8 @@ impl Default for subhosttelemetryConfig {
     }
 }
 
-pub struct subhosttelemetryModule {
-    config: subhosttelemetryConfig,
+pub struct SubhosttelemetryModule {
+    config: SubhosttelemetryConfig,
     metrics: Metrics,
 }
 
@@ -28,9 +28,9 @@ pub struct Metrics {
     pub latency_ms: u64,
 }
 
-impl subhosttelemetryModule {
-    pub fn new(config: subhosttelemetryConfig) -> Self {
-        info!("Initializing subhosttelemetryModule");
+impl SubhosttelemetryModule {
+    pub fn new(config: SubhosttelemetryConfig) -> Self {
+        info!("Initializing SubhosttelemetryModule");
         Self {
             config,
             metrics: Metrics::default(),
@@ -48,7 +48,7 @@ impl subhosttelemetryModule {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum subhosttelemetryError {
+pub enum SubhosttelemetryError {
     #[error("Configuration error: {0}")]
     Config(String),
     #[error("Processing error: {0}")]
@@ -61,14 +61,14 @@ mod tests {
     
     #[test]
     fn test_default_config() {
-        let config = subhosttelemetryConfig::default();
+        let config = SubhosttelemetryConfig::default();
         assert!(config.enabled);
         assert_eq!(config.max_connections, 1000);
     }
     
     #[test]
     fn test_module_creation() {
-        let module = subhosttelemetryModule::new(subhosttelemetryConfig::default());
+        let module = SubhosttelemetryModule::new(SubhosttelemetryConfig::default());
         assert!(module.config.enabled);
     }
 }

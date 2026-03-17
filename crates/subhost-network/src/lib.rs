@@ -1,14 +1,15 @@
 use libp2p::{
-    gossipsub::{self, IdentTopic, MessageAuthenticity, ValidationMode},
+    gossipsub::{self, MessageAuthenticity, ValidationMode},
     identity::Keypair,
     kad::{self, store::MemoryStore},
     mdns,
     noise, ping,
-    swarm::{NetworkBehaviour, SwarmBuilder, SwarmEvent},
-    tcp, yamux, PeerId, Swarm,
+    swarm::{NetworkBehaviour, SwarmEvent},
+    tcp, yamux, PeerId, Swarm, SwarmBuilder,
 };
+use libp2p::futures::StreamExt;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
@@ -36,7 +37,7 @@ impl Default for NetworkConfig {
 pub struct SubhostBehavior {
     pub gossipsub: gossipsub::Behaviour,
     pub kademlia: kad::Behaviour<MemoryStore>,
-    pub mdns: mdns::tokio::Behaviour,
+    pub mdns: mdns::async_io::Behaviour,
     pub ping: ping::Behaviour,
 }
 
@@ -65,16 +66,16 @@ impl NetworkManager {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(ValidationMode::Strict)
             .build()
-            .map_err(|e: Box<dyn std::error::Error + Send + Sync>| NetworkError::Config(e.to_string()))?;
+            .map_err(|e| NetworkError::Config(e.to_string()))?;
 
         let gossipsub = gossipsub::Behaviour::new(
             MessageAuthenticity::Signed(id_keys.clone()),
             gossipsub_config,
-        )?;
+        ).map_err(|e| NetworkError::Libp2p(e.to_string()))?;
 
         let store = MemoryStore::new(local_peer_id);
         let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad::Config::default());
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer_id)?;
+        let mdns = mdns::async_io::Behaviour::new(mdns::Config::default(), local_peer_id)?;
         let ping = ping::Behaviour::default();
 
         let behavior = SubhostBehavior {
@@ -84,13 +85,17 @@ impl NetworkManager {
             ping,
         };
 
-        let swarm = SwarmBuilder::with_existing_identity(id_keys)
-            .with_tokio()
+        let swarm_result = SwarmBuilder::with_existing_identity(id_keys)
+            .with_async_std()
             .with_tcp(tcp::Config::default(), noise::Config::new, yamux::Config::default)?
-            .with_quic()
-            .with_behaviour(|_| Ok(behavior))?
-            .with_swarm_config(|c| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
-            .build();
+            .with_behaviour(|_| Ok(behavior));
+        
+        let swarm = match swarm_result {
+            Ok(builder) => builder
+                .with_swarm_config(|c: libp2p::swarm::Config| c.with_idle_connection_timeout(std::time::Duration::from_secs(60)))
+                .build(),
+            Err(e) => return Err(NetworkError::Libp2p(e.to_string())),
+        };
 
         let (tx, _rx) = mpsc::channel(1000);
 
@@ -118,7 +123,7 @@ impl NetworkManager {
         }
     }
 
-    async fn handle_event(&mut self, event: SwarmEvent<SubhostBehavior>) {
+    async fn handle_event(&mut self, event: SwarmEvent<<SubhostBehavior as NetworkBehaviour>::ToSwarm>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on {:?}", address);
@@ -153,6 +158,18 @@ impl From<gossipsub::SubscriptionError> for NetworkError {
 
 impl From<std::io::Error> for NetworkError {
     fn from(e: std::io::Error) -> Self {
+        NetworkError::Libp2p(e.to_string())
+    }
+}
+
+impl From<libp2p::noise::Error> for NetworkError {
+    fn from(e: libp2p::noise::Error) -> Self {
+        NetworkError::Libp2p(e.to_string())
+    }
+}
+
+impl From<&str> for NetworkError {
+    fn from(e: &str) -> Self {
         NetworkError::Libp2p(e.to_string())
     }
 }

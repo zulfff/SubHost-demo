@@ -1,4 +1,4 @@
-use subhost_core::{Block, BlockHeader, Hash, Address, BlockHeight};
+use subhost_core::{Block, BlockHeader, Hash, Address};
 use std::collections::{HashMap, BTreeMap, HashSet};
 use tokio::sync::{RwLock, mpsc};
 
@@ -45,6 +45,7 @@ impl DAGVertex {
 pub struct DAG {
     vertices: BTreeMap<u64, Vec<DAGVertex>>,
     edges: HashMap<Hash, Vec<Hash>>,
+    #[allow(dead_code)]
     committed: HashSet<Hash>,
     config: ConsensusConfig,
 }
@@ -130,6 +131,7 @@ pub struct QuorumCertificate {
 pub struct HotStuff {
     view: u64,
     high_qc: Option<QuorumCertificate>,
+    #[allow(dead_code)]
     locked_view: u64,
     config: ConsensusConfig,
     validators: Vec<Address>,
@@ -188,9 +190,13 @@ impl HotStuff {
 }
 
 pub struct ConsensusEngine {
+    #[allow(dead_code)]
     dag: std::sync::Arc<RwLock<DAG>>,
+    #[allow(dead_code)]
     hotstuff: std::sync::Arc<RwLock<HotStuff>>,
+    #[allow(dead_code)]
     config: ConsensusConfig,
+    #[allow(dead_code)]
     finalized_tx: mpsc::Sender<Block>,
 }
 

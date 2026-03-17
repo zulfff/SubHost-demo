@@ -1,13 +1,13 @@
 use serde::{Serialize, Deserialize};
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct subhostmempoolConfig {
+pub struct SubhostmempoolConfig {
     pub enabled: bool,
     pub max_connections: usize,
 }
 
-impl Default for subhostmempoolConfig {
+impl Default for SubhostmempoolConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -16,8 +16,8 @@ impl Default for subhostmempoolConfig {
     }
 }
 
-pub struct subhostmempoolModule {
-    config: subhostmempoolConfig,
+pub struct SubhostmempoolModule {
+    config: SubhostmempoolConfig,
     metrics: Metrics,
 }
 
@@ -28,9 +28,9 @@ pub struct Metrics {
     pub latency_ms: u64,
 }
 
-impl subhostmempoolModule {
-    pub fn new(config: subhostmempoolConfig) -> Self {
-        info!("Initializing subhostmempoolModule");
+impl SubhostmempoolModule {
+    pub fn new(config: SubhostmempoolConfig) -> Self {
+        info!("Initializing SubhostmempoolModule");
         Self {
             config,
             metrics: Metrics::default(),
@@ -48,7 +48,7 @@ impl subhostmempoolModule {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum subhostmempoolError {
+pub enum SubhostmempoolError {
     #[error("Configuration error: {0}")]
     Config(String),
     #[error("Processing error: {0}")]
@@ -61,14 +61,14 @@ mod tests {
     
     #[test]
     fn test_default_config() {
-        let config = subhostmempoolConfig::default();
+        let config = SubhostmempoolConfig::default();
         assert!(config.enabled);
         assert_eq!(config.max_connections, 1000);
     }
     
     #[test]
     fn test_module_creation() {
-        let module = subhostmempoolModule::new(subhostmempoolConfig::default());
+        let module = SubhostmempoolModule::new(SubhostmempoolConfig::default());
         assert!(module.config.enabled);
     }
 }

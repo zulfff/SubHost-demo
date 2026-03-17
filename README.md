@@ -91,8 +91,7 @@
 ### Prerequisites
 
 - Rust 1.75+
-- Node.js 18+ (for documentation website)
-- Docker (optional, for running node)
+- - Docker (optional, for running node)
 
 ### Installation
 
@@ -135,12 +134,6 @@ Complete documentation available at:
 - **Features**: [https://subhost.vercel.app/docs/features](https://subhost.vercel.app/docs/features)
 - **Smart Contracts**: [https://subhost.vercel.app/docs/contracts](https://subhost.vercel.app/docs/contracts)
 - **Staking**: [https://subhost.vercel.app/docs/staking](https://subhost.vercel.app/docs/staking)
-
-```bash
-cd website
-npm install
-npm run dev
-```
 
 ---
 

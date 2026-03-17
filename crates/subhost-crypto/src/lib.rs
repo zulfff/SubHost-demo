@@ -1,7 +1,6 @@
 use ark_bls12_381::{G1Projective, G2Projective, Fr as Scalar};
-use ark_ec::{pairing::Pairing, Group, CurveGroup};
+use ark_ec::{pairing::Pairing, Group};
 use ark_ff::{Field, PrimeField};
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use rand::RngCore;

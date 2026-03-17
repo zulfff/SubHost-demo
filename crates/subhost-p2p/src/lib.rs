@@ -1,13 +1,13 @@
 use serde::{Serialize, Deserialize};
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct subhostp2pConfig {
+pub struct Subhostp2pConfig {
     pub enabled: bool,
     pub max_connections: usize,
 }
 
-impl Default for subhostp2pConfig {
+impl Default for Subhostp2pConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -16,8 +16,8 @@ impl Default for subhostp2pConfig {
     }
 }
 
-pub struct subhostp2pModule {
-    config: subhostp2pConfig,
+pub struct Subhostp2pModule {
+    config: Subhostp2pConfig,
     metrics: Metrics,
 }
 
@@ -28,9 +28,9 @@ pub struct Metrics {
     pub latency_ms: u64,
 }
 
-impl subhostp2pModule {
-    pub fn new(config: subhostp2pConfig) -> Self {
-        info!("Initializing subhostp2pModule");
+impl Subhostp2pModule {
+    pub fn new(config: Subhostp2pConfig) -> Self {
+        info!("Initializing Subhostp2pModule");
         Self {
             config,
             metrics: Metrics::default(),
@@ -48,7 +48,7 @@ impl subhostp2pModule {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum subhostp2pError {
+pub enum Subhostp2pError {
     #[error("Configuration error: {0}")]
     Config(String),
     #[error("Processing error: {0}")]
@@ -61,14 +61,14 @@ mod tests {
     
     #[test]
     fn test_default_config() {
-        let config = subhostp2pConfig::default();
+        let config = Subhostp2pConfig::default();
         assert!(config.enabled);
         assert_eq!(config.max_connections, 1000);
     }
     
     #[test]
     fn test_module_creation() {
-        let module = subhostp2pModule::new(subhostp2pConfig::default());
+        let module = Subhostp2pModule::new(Subhostp2pConfig::default());
         assert!(module.config.enabled);
     }
 }
