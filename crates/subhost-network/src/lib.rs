@@ -65,7 +65,7 @@ impl NetworkManager {
         let gossipsub_config = gossipsub::ConfigBuilder::default()
             .validation_mode(ValidationMode::Strict)
             .build()
-            .map_err(|e| NetworkError::Config(e.to_string()))?;
+            .map_err(|e: Box<dyn std::error::Error + Send + Sync>| NetworkError::Config(e.to_string()))?;
 
         let gossipsub = gossipsub::Behaviour::new(
             MessageAuthenticity::Signed(id_keys.clone()),
@@ -118,7 +118,7 @@ impl NetworkManager {
         }
     }
 
-    async fn handle_event(&mut self, event: SwarmEvent<SubhostBehaviorEvent>) {
+    async fn handle_event(&mut self, event: SwarmEvent<SubhostBehavior>) {
         match event {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!("Listening on {:?}", address);

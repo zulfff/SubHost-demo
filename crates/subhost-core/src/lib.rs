@@ -177,6 +177,8 @@ pub enum CoreError {
 }
 
 pub mod hex {
+    use std::fmt;
+
     pub fn encode(bytes: impl AsRef<[u8]>) -> String {
         let mut result = String::with_capacity(bytes.as_ref().len() * 2);
         for byte in bytes.as_ref() {
