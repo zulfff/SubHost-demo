@@ -86,7 +86,72 @@
 
 ---
 
-## Quick Start
+## Features
+
+### CLI Tool
+```bash
+# Wallet management
+subhost wallet new --password <pass> --name mywallet
+subhost wallet list
+subhost wallet import --private-key <key> --password <pass>
+
+# Transactions
+subhost tx send --from <addr> --to <addr> --amount 1000
+subhost tx status <tx_hash>
+
+# Queries
+subhost query balance <address>
+subhost query block --height 12345
+subhost query validators
+
+# Node operations
+subhost init --chain-id 1 --data-dir ./data
+subhost node --validator --bootnodes /dns4/boot.subhost.io
+```
+
+### JSON-RPC API
+- Ethereum-compatible API on port 8545
+- Methods: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`, `eth_getTransactionReceipt`, `eth_gasPrice`, `net_version`
+
+### Wallet & Key Management
+- AES-256-GCM encryption with scrypt key derivation
+- Secure key storage with PBKDF2
+- HD wallet support (BIP-39/44 ready)
+
+### Docker Compose Testnet
+```bash
+docker-compose up -d
+```
+Spins up 4 validators, 1 RPC node, faucet, Prometheus, and Grafana.
+
+### Testnet Faucet
+- Web API at port 8080
+- Rate limited (1 request per 24h per address)
+- Request test tokens: `POST /drip { "address": "0x..." }`
+
+### Benchmark Tool
+```bash
+subhost-bench tps --endpoint http://localhost:8545 --duration 60 --concurrency 100
+subhost-bench latency --duration 60
+subhost-bench load --duration 300
+```
+
+### Block Explorer
+- Web UI at port 3000
+- View blocks, transactions, accounts
+- Search by height, hash, or address
+
+### Prometheus Metrics
+- Metrics endpoint at port 9090
+- Grafana dashboard included
+- Track TPS, block height, peer count, latency
+
+### IBC Bridge
+- Cross-chain transfers to Cosmos SDK chains
+- Channel lifecycle management
+- Packet acknowledgement tracking
+
+---
 
 ### Prerequisites
 
