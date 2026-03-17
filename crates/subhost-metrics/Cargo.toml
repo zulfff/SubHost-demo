@@ -14,6 +14,9 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+anyhow = { workspace = true }
+prometheus = "0.13"
+axum = "0.7"
 
 [dev-dependencies]
 tokio-test = { workspace = true }

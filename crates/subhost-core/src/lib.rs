@@ -219,3 +219,67 @@ pub mod hex {
     
     impl std::error::Error for HexError {}
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenesisConfig {
+    pub chain_id: u64,
+    pub initial_validators: Vec<ValidatorInfo>,
+    pub allocations: std::collections::HashMap<Address, u128>,
+    pub block_time_ms: u64,
+    pub gas_limit: u64,
+    pub genesis_time: u64,
+}
+
+impl Default for GenesisConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: 1,
+            initial_validators: vec![],
+            allocations: std::collections::HashMap::new(),
+            block_time_ms: 1000,
+            gas_limit: 30_000_000,
+            genesis_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatorInfo {
+    pub address: Address,
+    pub public_key: Vec<u8>,
+    pub power: u64,
+}
+
+impl GenesisConfig {
+    pub fn validate(&self) -> Result<(), CoreError> {
+        if self.chain_id == 0 {
+            return Err(CoreError::Serialization("Chain ID cannot be 0".to_string()));
+        }
+        if self.block_time_ms == 0 {
+            return Err(CoreError::Serialization("Block time must be > 0".to_string()));
+        }
+        if self.initial_validators.is_empty() {
+            return Err(CoreError::Serialization("At least one validator required".to_string()));
+        }
+        Ok(())
+    }
+    
+    pub fn load(path: &std::path::Path) -> Result<Self, CoreError> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+        let config: GenesisConfig = serde_json::from_str(&content)
+            .map_err(|e| CoreError::Deserialization(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+    
+    pub fn save(&self, path: &std::path::Path) -> Result<(), CoreError> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| CoreError::Serialization(e.to_string()))?;
+        std::fs::write(path, json)
+            .map_err(|e| CoreError::Serialization(e.to_string()))
+    }
+}
