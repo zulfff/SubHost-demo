@@ -17,34 +17,34 @@
 
 ---
 
-## 🚀 What is Subhost?
+## What is Subhost?
 
 **Subhost Web3** is a high-performance, decentralized cloud infrastructure protocol that combines the power of blockchain consensus with distributed storage and edge computing. Built in Rust with zero-compromise security.
 
 ### Key Innovations
 
-- ⚡ **Sub-Second Finality**: DAG-based consensus with HotStuff finality gadget
-- 🔒 **Quantum-Resistant**: CRYSTALS-Dilithium signatures + BLS12-381 aggregation
-- 🛡️ **MEV-Resistant**: Threshold encrypted mempool + Dandelion++ routing
-- 🔗 **IBC-Native**: Full Inter-Blockchain Communication protocol support
-- 🌐 **Edge-Native**: Distributed compute nodes with WASM execution
-- 💎 **Zero-Knowledge**: Native zk-Rollups with Halo2 circuits
+- **Sub-Second Finality**: DAG-based consensus with HotStuff finality gadget
+- **Quantum-Resistant**: CRYSTALS-Dilithium signatures + BLS12-381 aggregation
+- **MEV-Resistant**: Threshold encrypted mempool + Dandelion++ routing
+- **IBC-Native**: Full Inter-Blockchain Communication protocol support
+- **Edge-Native**: Distributed compute nodes with WASM execution
+- **Zero-Knowledge**: Native zk-Rollups with Halo2 circuits
 
 ---
 
-## 📊 Performance Metrics
+## Performance Metrics
 
 | Metric | Value | Comparison |
 |--------|-------|------------|
 | TPS | 50,000+ | 2x Solana |
 | Finality | 800ms | 4x faster than Ethereum |
 | Block Time | 400ms | Sub-second production |
-| Gas Cost | ~\$0.0001 | 10,000x cheaper than L1 |
+| Gas Cost | ~$0.0001 | 10,000x cheaper than L1 |
 | Cross-Chain Latency | 2-3 blocks | Industry leading |
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -86,7 +86,7 @@
 
 ---
 
-## 🛠️ Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -131,12 +131,12 @@ docker run -p 30333:30333 -v subhost-data:/data subhost/subhost-web3 node --vali
 
 Complete documentation available at:
 
-- 🌐 **Main Site**: [https://subhost.vercel.app](https://subhost.vercel.app)
-- 📚 **Documentation**: [https://subhost.vercel.app/docs](https://subhost.vercel.app/docs)
-- 🚀 **Getting Started**: [https://subhost.vercel.app/docs/getting-started](https://subhost.vercel.app/docs/getting-started)
-- ⚡ **Features**: [https://subhost.vercel.app/docs/features](https://subhost.vercel.app/docs/features)
-- 🔗 **Smart Contracts**: [https://subhost.vercel.app/docs/contracts](https://subhost.vercel.app/docs/contracts)
-- 💰 **Staking**: [https://subhost.vercel.app/docs/staking](https://subhost.vercel.app/docs/staking)
+- **Main Site**: [https://subhost.vercel.app](https://subhost.vercel.app)
+- **Documentation**: [https://subhost.vercel.app/docs](https://subhost.vercel.app/docs)
+- **Getting Started**: [https://subhost.vercel.app/docs/getting-started](https://subhost.vercel.app/docs/getting-started)
+- **Features**: [https://subhost.vercel.app/docs/features](https://subhost.vercel.app/docs/features)
+- **Smart Contracts**: [https://subhost.vercel.app/docs/contracts](https://subhost.vercel.app/docs/contracts)
+- **Staking**: [https://subhost.vercel.app/docs/staking](https://subhost.vercel.app/docs/staking)
 
 ```bash
 cd website
@@ -146,13 +146,13 @@ npm run dev
 
 ---
 
-## 🔐 Security
+## Security
 
 ### Audits
 
-- **Trail of Bits** - Consensus & Cryptography (Q1 2026) ✅
-- **OpenZeppelin** - Smart Contracts & IBC (Q1 2026) ✅
-- **Least Authority** - Zero-Knowledge Circuits (Q2 2026) ⏳
+- **Trail of Bits** - Consensus & Cryptography (Q1 2026)
+- **OpenZeppelin** - Smart Contracts & IBC (Q1 2026)
+- **Least Authority** - Zero-Knowledge Circuits (Q2 2026)
 
 ### Bug Bounty
 
@@ -170,7 +170,7 @@ All architectural limitations are documented with mitigation strategies. See [Th
 
 ---
 
-## 💰 Tokenomics
+## Tokenomics
 
 ### SUB Token
 
@@ -187,18 +187,18 @@ See [detailed tokenomics](docs/tokenomics.md).
 
 ---
 
-## 🤝 Contributing
+## Contributing
 
 We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md).
 
 ---
 
-## 📜 License
+## License
 
 Licensed under the Apache License, Version 2.0.
 
 ---
 
 <p align="center">
-  <sub>Built with ❤️ by the Subhost Labs team</sub>
+  <sub>Built by the Subhost Labs team</sub>
 </p>
