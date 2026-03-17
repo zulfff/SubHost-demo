@@ -152,17 +152,9 @@ npm run dev
 - **OpenZeppelin** - Smart Contracts & IBC (Q1 2026)
 - **Least Authority** - Zero-Knowledge Circuits (Q2 2026)
 
-### Bug Bounty
-
 Report vulnerabilities via:
 - Email: **security@subhost.xyz**
 - GitHub: [Security Advisories](https://github.com/zulfff/SubHost/security/advisories)
-
-| Severity | Bounty |
-|----------|--------|
-| Critical | $500,000 - $1,000,000 |
-| High | $100,000 - $500,000 |
-| Medium | $10,000 - $100,000 |
 
 ### Known Limitations (By Design)
 
