@@ -1,102 +1,114 @@
-# Contributing to SubHost 🚀
+# Contributing to SubHost
 
-Halo! Makasih udah mau bantu bikin SubHost jadi lebih keren! 🎉
+Hey, thanks for wanting to help out! Really appreciate it.
 
-## Cara Mulai 🏁
+## Getting Started
 
-### 1. Fork & Clone dulu ya 🔧
+First things first, fork the repo and clone it:
+
 ```bash
 git clone https://github.com/zulfff/SubHost.git
 cd SubHost
 ```
 
-### 2. Setup Environment ⚙️
-Pastikan Rust udah keinstall:
+Make sure you got Rust installed (need 1.75+):
+
 ```bash
-cargo --version  # minimal 1.75 ya
+rustc --version
 ```
 
-Kalau belom, install dulu di [rustup.rs](https://rustup.rs) 🔨
+If not, grab it from [rustup.rs](https://rustup.rs).
 
-## Workflow 🌊
+## How to Contribute
 
-### 1. Buat Branch Baru 🌿
+### 1. Create a branch
+
 ```bash
-git checkout -b fitur-keren-gaes
+git checkout -b my-awesome-feature
 ```
 
-### 2. Coding & Test 🧪
+### 2. Do your thing
+
+Write code, break things, fix them, you know the drill.
+
+Before you commit, run these:
+
 ```bash
-cargo check   # cek error dulu
-cargo test    # jalanin test
-cargo fmt     # format code biar rapi
-cargo clippy  # cek best practices
+cargo check    # catch errors early
+cargo test     # make sure tests pass
+cargo fmt      # keep it pretty
+cargo clippy   # catch silly mistakes
 ```
 
-**Wajib** pass semua test sebelum push! ✅
+Tests gotta pass. No exceptions.
 
-### 3. Commit & Push 🚀
+### 3. Commit it
+
 ```bash
 git add .
-git commit -m "feat: tambah fitur XYZ"
-git push origin fitur-keren-gaes
+git commit -m "what you did in plain english"
+git push origin my-awesome-feature
 ```
 
-### 4. Bikin Pull Request 🎯
-Buka GitHub, klik "Compare & Pull Request"
-- Deskripsi yang jelas
-- Screenshots kalau ada UI changes
-- Mention issue kalau related
+### 4. Open a Pull Request
 
-## Convention Code 📝
+Go to GitHub, hit "New Pull Request", and tell us:
+- What you changed and why
+- Any issues it fixes
+- Screenshots if there's UI stuff
 
-### Commit Message Format
+## Code Style
+
+We try to keep it simple:
+
+- Run `cargo fmt` before committing
+- Fix clippy warnings, don't ignore them
+- Document your public functions with `///` comments
+- Use `thiserror` or `anyhow` for errors
+
+### Commit message format (optional but nice)
+
 ```
-feat: tambah fitur baru
-fix: perbaiki bug consensus
-docs: update dokumentasi
-refactor: rapihin code
-perf: optimasi speed
-test: tambah unit test
+feat: add new thing
+fix: fix broken thing
+docs: update readme
+refactor: clean up mess
+perf: make it faster
+test: add more tests
 ```
 
-### Rust Style Guide
-- Follow `cargo fmt` 📐
-- Fix semua `cargo clippy` warning ⚠️
-- Document public API pake `///` 📚
-- Error handling pake `thiserror` atau `anyhow`
+## Where We Need Help
 
-## Area yang Butuh Bantuan 🆘
+These areas could use some love:
 
-- 🔐 Crypto & ZK proofs - masih bisa dioptimasi
-- 🌐 P2P Networking - libp2p integration
-- ⛓️ Consensus - HotStuff/DAG improvements  
-- 🧊 EVM compatibility - revm integration
-- 📊 Performance benchmarking
+- **Crypto/ZK stuff** - optimizations, new curves
+- **P2P networking** - libp2p is tricky, help welcome
+- **Consensus** - HotStuff and DAG improvements
+- **EVM compatibility** - revm integration work
+- **Benchmarks** - performance testing
+- **Documentation** - always behind on this
 
-## Reporting Bug 🐛
+## Found a Bug?
 
-Buka issue dengan format:
-- **Judul**: deskriptif & singkat
-- **Steps to reproduce**: gimana cara ngebugnya
-- **Expected behavior**: harusnya gimana
-- **Actual behavior**: malah gimana
-- **Environment**: OS, Rust version, etc
+Open an issue and tell us:
+1. What you were trying to do
+2. What you expected to happen
+3. What actually happened
+4. How to reproduce it
+5. Your setup (OS, Rust version, etc)
 
-## Join Komunitas 💬
+The more detail, the faster we can fix it.
 
-Ada pertanyaan? Mau diskusi fitur?
-- Buka Discussion tab di GitHub
-- Tag maintainers di issue/PR
+## Questions?
 
-## Code of Conduct 🤝
+- Open a GitHub Discussion
+- Comment on relevant issues
+- Or just open an issue and ask
 
-- Hormat sesama contributor
-- Terima kritik dengan positif
-- Fokus ke solusi, bukan masalah
-- Bantu yang baru belajar 🌱
+## One Rule
+
+Don't be a jerk. Help others learn, be patient with mistakes, assume good intentions.
 
 ---
 
-Dibuat dengan ❤️ oleh komunitas SubHost
-Let's build the future of web3 together! 🚀✨
+That's pretty much it. Looking forward to your PR!
