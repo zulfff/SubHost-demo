@@ -211,9 +211,14 @@ impl StateDB {
             return Ok(());
         }
 
-        // Calculate rent
+        // SECURITY: Checked arithmetic to prevent overflow
         let storage_size = self.get_account_storage_size(addr)?;
-        let rent_due = Amount::from(storage_size) * 100 * Amount::from(epochs_elapsed);
+        let rent_per_epoch = storage_size.checked_mul(100)
+            .ok_or(StateError::Database("Storage size overflow".to_string()))?;
+        let rent_due = rent_per_epoch.checked_mul(epochs_elapsed as u64)
+            .and_then(|r| Amount::try_from(r).ok())
+            .map(|r| Amount::from(r))
+            .unwrap_or(Amount::MAX); // Cap at MAX if overflow would occur
 
         // Check rent-exempt
         if account.balance > 1_000_000 {

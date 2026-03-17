@@ -262,11 +262,16 @@ impl NetworkManager {
                 }).await;
             }
             "omnichain/dag" => {
-                // Forward to consensus
-                let _ = self.dag_out.send(DAGMessage::Vertex(
-                    // Deserialize in production
-                    panic!("TODO: deserialize")
-                )).await;
+                // SECURITY: Safe deserialization with error handling
+                match bincode::deserialize::<omnichain_consensus::DAGVertex>(&message.data) {
+                    Ok(vertex) => {
+                        let _ = self.dag_out.send(DAGMessage::Vertex(vertex)).await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize DAG vertex from {:?}: {}", source, e);
+                        // Don't panic - just drop the invalid message
+                    }
+                }
             }
             _ => {
                 debug!("Unknown topic: {}", topic);

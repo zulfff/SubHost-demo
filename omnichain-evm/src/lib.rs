@@ -356,9 +356,38 @@ trait TransactionHash {
     fn hash(&self) -> omnichain_core::Hash;
 }
 
+/// Transaction data without signature for hash calculation
+/// SECURITY: Prevents signature malleability attacks
+#[derive(serde::Serialize)]
+struct TransactionDataForHash {
+    tx_type: omnichain_core::TransactionType,
+    nonce: omnichain_core::Nonce,
+    from: omnichain_core::Address,
+    to: Option<omnichain_core::Address>,
+    value: omnichain_core::Amount,
+    gas_price: u128,
+    gas_limit: omnichain_core::Gas,
+    data: Vec<u8>,
+    chain_id: omnichain_core::ChainId,
+}
+
 impl TransactionHash for Transaction {
     fn hash(&self) -> omnichain_core::Hash {
-        let encoded = bincode::serialize(self).expect("serialization should not fail");
+        // SECURITY: Hash only transaction data, NOT signature
+        // This prevents signature malleability attacks where attacker
+        // modifies signature components to create different hash for same tx
+        let data = TransactionDataForHash {
+            tx_type: self.tx_type,
+            nonce: self.nonce,
+            from: self.from,
+            to: self.to,
+            value: self.value,
+            gas_price: self.gas_price,
+            gas_limit: self.gas_limit,
+            data: self.data.clone(),
+            chain_id: self.chain_id,
+        };
+        let encoded = bincode::serialize(&data).expect("serialization should not fail");
         omnichain_core::Hash::from_data(&encoded)
     }
 }

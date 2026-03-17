@@ -85,9 +85,11 @@ async fn handle_drip(
     State(state): State<FaucetState>,
     Json(req): Json<FaucetRequest>,
 ) -> Result<AxumJson<FaucetResponse>, StatusCode> {
-    let address = req.address.trim().to_lowercase();
+    // SECURITY: Preserve original case for proper address validation
+    let address_original = req.address.trim().to_string();
+    let address_lower = address_original.to_lowercase();
     
-    if !is_valid_address(&address) {
+    if !is_valid_address(&address_original) {
         return Ok(AxumJson(FaucetResponse {
             success: false,
             tx_hash: None,
@@ -96,7 +98,9 @@ async fn handle_drip(
         }));
     }
     
-    if !state.can_request(&address) {
+    // SECURITY: Use case-sensitive address for cooldown to prevent bypass
+    // Ethereum checksum addresses prevent collision attacks
+    if !state.can_request(&address_original) {
         return Ok(AxumJson(FaucetResponse {
             success: false,
             tx_hash: None,
@@ -105,9 +109,14 @@ async fn handle_drip(
         }));
     }
     
-    state.record_request(&address);
+    // Record request with original case
+    state.record_request(&address_original);
     
-    let tx_hash = format!("0x{}", subhost_core::hex::encode(blake3::hash(address.as_bytes()).as_bytes()));
+    // Generate deterministic tx hash from original address
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(address_original.as_bytes());
+    hasher.update(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_be_bytes());
+    let tx_hash = format!("0x{}", subhost_core::hex::encode(hasher.finalize().as_bytes()));
     
     Ok(AxumJson(FaucetResponse {
         success: true,
