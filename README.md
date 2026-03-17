@@ -154,13 +154,15 @@ npm run dev
 
 ### Bug Bounty
 
-Active bug bounty program: [immunefi.com/bounty/subhost](https://immunefi.com/bounty/subhost)
+Report vulnerabilities via:
+- Email: **security@subhost.xyz**
+- GitHub: [Security Advisories](https://github.com/zulfff/SubHost/security/advisories)
 
 | Severity | Bounty |
 |----------|--------|
-| Critical | \$500,000 - \$1,000,000 |
-| High | \$100,000 - \$500,000 |
-| Medium | \$10,000 - \$100,000 |
+| Critical | $500,000 - $1,000,000 |
+| High | $100,000 - $500,000 |
+| Medium | $10,000 - $100,000 |
 
 ### Known Limitations (By Design)
 
