@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zulfff/SubHost/main/assets/logo.svg" width="200" alt="Subhost Web3">
+  <img src="https://raw.githubusercontent.com/zulfff/SubHost/main/logo.png" width="200" alt="Subhost Web3">
 </p>
 
 <h1 align="center">Subhost Web3</h1>
@@ -157,12 +157,6 @@ npm run dev
 Report vulnerabilities via:
 - Email: **security@subhost.xyz**
 - GitHub: [Security Advisories](https://github.com/zulfff/SubHost/security/advisories)
-
-| Severity | Bounty |
-|----------|--------|
-| Critical | $500,000 - $1,000,000 |
-| High | $100,000 - $500,000 |
-| Medium | $10,000 - $100,000 |
 
 ### Known Limitations (By Design)
 
