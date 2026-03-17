@@ -1,0 +1,55 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#8b5cf6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a855f7;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="grad2" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#6366f1;stop-opacity:1" />
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+  
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="240" fill="#0f0f23"/>
+  
+  <!-- Outer ring -->
+  <circle cx="256" cy="256" r="220" stroke="url(#grad1)" stroke-width="2" fill="none" opacity="0.3"/>
+  
+  <!-- Central hexagon -->
+  <polygon points="256,140 304,168 304,220 256,248 208,220 208,168" fill="url(#grad1)" filter="url(#glow)"/>
+  
+  <!-- Connecting lines to outer nodes -->
+  <line x1="256" y1="248" x2="256" y2="340" stroke="url(#grad2)" stroke-width="3" opacity="0.6"/>
+  <line x1="304" y1="220" x2="380" y2="280" stroke="url(#grad2)" stroke-width="3" opacity="0.6"/>
+  <line x1="304" y1="168" x2="360" y2="120" stroke="url(#grad2)" stroke-width="3" opacity="0.6"/>
+  <line x1="256" y1="140" x2="256" y2="60" stroke="url(#grad2)" stroke-width="3" opacity="0.6"/>
+  <line x1="208" y1="168" x2="140" y2="120" stroke="url(#grad2)" stroke-width="3" opacity="0.6"/>
+  <line x1="208" y1="220" x2="120" y2="280" stroke="url(#grad2)" stroke-width="3" opacity="0.6"/>
+  
+  <!-- Outer hexagonal nodes -->
+  <polygon points="256,340 280,354 280,382 256,396 232,382 232,354" fill="#6366f1" opacity="0.9"/>
+  <polygon points="380,280 404,294 404,322 380,336 356,322 356,294" fill="#8b5cf6" opacity="0.9"/>
+  <polygon points="360,120 384,134 384,162 360,176 336,162 336,134" fill="#a855f7" opacity="0.9"/>
+  <polygon points="256,60 280,74 280,102 256,116 232,102 232,74" fill="#3b82f6" opacity="0.9"/>
+  <polygon points="140,120 164,134 164,162 140,176 116,162 116,134" fill="#6366f1" opacity="0.9"/>
+  <polygon points="120,280 144,294 144,322 120,336 96,322 96,294" fill="#8b5cf6" opacity="0.9"/>
+  
+  <!-- Inner detail lines -->
+  <line x1="256" y1="168" x2="256" y2="220" stroke="#ffffff" stroke-width="2" opacity="0.4"/>
+  <line x1="232" y1="194" x2="280" y2="194" stroke="#ffffff" stroke-width="2" opacity="0.4"/>
+  
+  <!-- Small accent dots -->
+  <circle cx="256" cy="168" r="4" fill="#ffffff" opacity="0.8"/>
+  <circle cx="280" cy="194" r="4" fill="#ffffff" opacity="0.8"/>
+  <circle cx="232" cy="194" r="4" fill="#ffffff" opacity="0.8"/>
+  <circle cx="256" cy="220" r="4" fill="#ffffff" opacity="0.8"/>
+</svg>
