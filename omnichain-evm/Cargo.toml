@@ -1,0 +1,24 @@
+[package]
+name = "omnichain-evm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+omnichain-core = { path = "../omnichain-core" }
+omnichain-state = { path = "../omnichain-state" }
+omnichain-crypto = { path = "../omnichain-crypto" }
+revm = { workspace = true }
+alloy-primitives = { workspace = true }
+alloy-sol-types = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+num_cpus = { workspace = true }
+wasmer = { workspace = true }
+wasmtime = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }

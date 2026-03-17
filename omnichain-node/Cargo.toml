@@ -1,0 +1,28 @@
+[package]
+name = "omnichain-node"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "omnichain"
+path = "src/main.rs"
+
+[dependencies]
+omnichain-core = { path = "../omnichain-core" }
+omnichain-crypto = { path = "../omnichain-crypto" }
+omnichain-consensus = { path = "../omnichain-consensus" }
+omnichain-network = { path = "../omnichain-network" }
+omnichain-evm = { path = "../omnichain-evm" }
+omnichain-state = { path = "../omnichain-state" }
+omnichain-zk = { path = "../omnichain-zk" }
+omnichain-ibc = { path = "../omnichain-ibc" }
+omnichain-governance = { path = "../omnichain-governance" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { version = "4.4", features = ["derive"] }
+anyhow = { workspace = true }

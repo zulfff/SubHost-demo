@@ -1,0 +1,56 @@
+graph TB
+    subgraph "Application Layer"
+        SC[Smart Contracts]
+        WR[WASM Runtime]
+        IBC[IBC Bridge]
+        GOV[Governance]
+    end
+
+    subgraph "Execution Layer"
+        EVM[Parallel EVM]
+        SM[State Manager]
+        GM[Gas Meter]
+        RM[Resource Monitor]
+    end
+
+    subgraph "Consensus Layer"
+        DAG[Narwhal DAG]
+        HS[HotStuff Finality]
+        BLS[BLS Aggregation]
+        SL[Slashing Module]
+    end
+
+    subgraph "Network Layer"
+        P2P[Libp2p Transport]
+        DP[Dandelion++]
+        TE[Threshold Encryption]
+        MS[MEV Shield]
+    end
+
+    subgraph "Storage Layer"
+        MPT[Merkle Patricia Trie]
+        EC[Erasure Coding]
+        SR[State Rent]
+        AR[Archival Nodes]
+    end
+
+    SC --> EVM
+    WR --> EVM
+    IBC --> SM
+    GOV --> SM
+    
+    EVM --> DAG
+    SM --> MPT
+    GM --> HS
+    
+    DAG --> P2P
+    HS --> BLS
+    BLS --> SL
+    
+    P2P --> DP
+    DP --> TE
+    TE --> MS
+    
+    MPT --> EC
+    EC --> SR
+    SR --> AR

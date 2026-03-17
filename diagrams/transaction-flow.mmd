@@ -1,0 +1,35 @@
+sequenceDiagram
+    participant User
+    participant Wallet
+    participant Node
+    participant Mempool
+    participant Consensus
+    participant Network
+    participant Block
+
+    User->>Wallet: Create transaction
+    Wallet->>Wallet: Sign with BLS
+    Wallet->>Node: Submit signed tx
+    
+    Node->>Node: Validate signature
+    Node->>Mempool: Check nonce & balance
+    
+    alt Valid Transaction
+        Mempool->>Network: Dandelion++ stem phase
+        Network->>Network: 2-4 hops anonymization
+        Network->>Mempool: Fluff phase broadcast
+        
+        Mempool->>Consensus: Include in DAG vertex
+        Consensus->>Consensus: BLS aggregate signatures
+        Consensus->>Consensus: HotStuff finality
+        
+        Consensus->>Block: Commit block
+        Block->>Network: Propagate to peers
+        Network->>Node: Receive block
+        Node->>Wallet: Confirm inclusion
+        Wallet->>User: Transaction confirmed
+    else Invalid Transaction
+        Node-->>Wallet: Reject with error
+        Wallet-->>User: Show error
+    end
+EOF

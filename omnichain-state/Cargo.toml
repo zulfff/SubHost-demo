@@ -1,0 +1,24 @@
+[package]
+name = "omnichain-state"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+omnichain-core = { path = "../omnichain-core" }
+omnichain-crypto = { path = "../omnichain-crypto" }
+rocksdb = { workspace = true }
+redb = { workspace = true }
+parking_lot = { workspace = true }
+sha3 = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+dashmap = { workspace = true }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+tempfile = { workspace = true }
