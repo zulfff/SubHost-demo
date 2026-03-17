@@ -136,12 +136,6 @@ Complete documentation available at:
 - **Smart Contracts**: [https://subhost.vercel.app/docs/contracts](https://subhost.vercel.app/docs/contracts)
 - **Staking**: [https://subhost.vercel.app/docs/staking](https://subhost.vercel.app/docs/staking)
 
-```bash
-cd website
-npm install
-npm run dev
-```
-
 ---
 
 ## Security
@@ -192,5 +186,5 @@ Licensed under the Apache License, Version 2.0.
 ---
 
 <p align="center">
-  <sub>Built by the Subhost Labs team</sub>
+  <sub>Built by the zulfff and SubHost Labs team</sub>
 </p>
