@@ -60,7 +60,7 @@ rocksdb = { version = "0.21", default-features = false, features = ["lz4"] }
 redb = "1.5"
 parking_lot = "0.12"
 revm = { version = "3.5", features = ["std", "serde"] }
-alloy-primitives = { version = "0.6", features = ["serde", "k256"] }
+alloy-primitives = { version = "1.6", features = ["serde", "k256"] }
 alloy-sol-types = { version = "0.6", features = ["json"] }
 wasmtime = "16.0"
 wasmer = "4.2"
