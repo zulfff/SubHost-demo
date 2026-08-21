@@ -53,7 +53,7 @@ chacha20poly1305 = "0.10"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 ed25519-dalek = "3.0"
 zeroize = "1.7"
-libp2p = { version = "0.53", features = ["tcp", "tls", "dns", "noise", "yamux"] }
+libp2p = { version = "0.55", features = ["tcp", "tls", "dns", "noise", "yamux"] }
 quinn = "0.10"
 rustls = { version = "0.21", features = ["quic"] }
 rocksdb = { version = "0.21", default-features = false, features = ["lz4"] }
