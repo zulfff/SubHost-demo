@@ -151,7 +151,8 @@ Now a real in-memory account store with:
   contradictory numbers (minimum stake 1,000 vs 10,000 vs 10,000,000; circulation
   15% vs allocation 100%).
 - `docs/security/threat-model.md`: added an implementation-status disclaimer
-  (many mitigations are design goals, not live), marked the bug bounty as planned.
+  (many mitigations are design goals, not live); removed the bug-bounty section
+  entirely (there is no bug bounty program).
 
 ---
 

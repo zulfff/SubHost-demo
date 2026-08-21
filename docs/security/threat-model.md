@@ -9,7 +9,7 @@ This document outlines the security assumptions, potential threats, and mitigati
 > in-memory mempool and state, a JSON-RPC server, and a libp2p scaffold. It does
 > **not** yet implement: an encrypted mempool, Dandelion++ routing, threshold
 > encryption / going, a production consensus loop, oracle / MEV defenses, an HSM
-> program, or a payout-bearing bug bounty. Mitigations below should be read as the
+> program, or a bug bounty (there is none). Mitigations below should be read as the
 > roadmap, not as an assurance that they are live today.
 
 ## Security Objectives
