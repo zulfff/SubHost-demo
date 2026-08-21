@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://subhost.vercel.app"><img src="https://img.shields.io/badge/Docs-Live-green.svg" alt="Documentation"></a>
-  <a href="https://github.com/zulfff/SubHost/actions/workflows/rust.yml"><img src="https://github.com/zulfff/SubHost/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/zulfff/SubHost/actions/workflows/rust.yml"><img src="https://github.com/zulfff/SubHost-demo/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
   <a href="https://subhost.vercel.app"><img src="https://img.shields.io/badge/Website-subhost.vercel.app-6366f1.svg" alt="Website"></a>
 </p>
