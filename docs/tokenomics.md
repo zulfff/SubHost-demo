@@ -1,10 +1,16 @@
 # Tokenomics
 
-The SUB token powers the Subhost network. This doc explains how it works, how tokens get created, and what you can do with them.
+The SUB token is the design for the Subhost network.
+
+> **Status: this is a design specification, not a description of what is deployed.**
+> There is no live SUB token, and most of the mechanics below (staking rewards,
+> inflation, going, fee burn, governance voting) are **not implemented in the code**
+> in this repository. Numbers are planning targets and may change. Anything that
+> *is* partially implemented is called out inline.
 
 ## Token Basics
 
-| Parameter | Value |
+| Parameter | Value (design target) |
 |-----------|-------|
 | Total Supply | 1,000,000,000 SUB |
 | Initial Circulation | 150,000,000 SUB (15%) |
@@ -13,9 +19,15 @@ The SUB token powers the Subhost network. This doc explains how it works, how to
 | Treasury | 20% of inflation |
 | Burn Mechanism | 50% of fees burned |
 
+> The "aliquots" below allocate 100% of total supply; "initial circulation" of 15%
+> refers to the portion unlocked at genesis. The rest is vested/locked and enters
+> circulation over time, which is why both figures can be consistent.
+
 ## Token Distribution
 
 ### Initial Allocation
+
+Allocation splits the **total** 1B supply (vested over time, not all circulating day one):
 
 - **Community & Ecosystem**: 40% (400M SUB) - Airdrops, grants, partnerships
 - **Team & Advisors**: 20% (200M SUB) - 4-year vesting with 1-year cliff
@@ -39,10 +51,14 @@ Most of it (70%) goes to validators and stakers as rewards for securing the netw
 
 You can stake your SUB tokens to help secure the network and earn rewards. Here's how it works:
 
-- **Minimum Stake**: 1,000 SUB
-- **Unbonding Period**: 14 days (your tokens are locked when you unstake)
-- **Reward Distribution**: Every block (roughly every second)
+- **Minimum Validator Self-Stake**: 10,000,000 SUB (matches `subhost-consensus/src/staking.rs`)
+- **Minimum Delegation**: 1,000 SUB
+- **Unbonding Period**: 14 days (design target; not yet enforced in code)
+- **Reward Distribution**: Per block (design target; no reward issuance implemented)
 - **Slashing**: You can lose part of your stake if your validator misbehaves
+
+> Note: `subhost-consensus` has a minimal `StakingModule` (add validator / delegate /
+> slash) but **no** delegation-bonding, reward distribution, or unbonding is wired.
 
 ### Validator Economics
 

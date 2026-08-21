@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use subhost_core::{Address, Hash};
-use subhost_wallet::{Wallet, WalletError};
+use subhost_core::Address;
+use subhost_wallet::Wallet;
 
 #[derive(Parser)]
 #[command(name = "subhost")]
@@ -29,7 +29,7 @@ enum Commands {
     },
     
     Node {
-        #[arg(short, long)]
+        #[arg(long)]
         validator: bool,
         
         #[arg(short, long)]
@@ -229,19 +229,42 @@ async fn init_genesis(
     let genesis_path = data_dir.join("genesis.json");
     let genesis_json = serde_json::to_string_pretty(&genesis)?;
     std::fs::write(&genesis_path, genesis_json)?;
-    
+
     tracing::info!("Genesis initialized at {}", genesis_path.display());
-    
+
+    // Core's GenesisConfig::validate() requires >= 1 validator. Writing an empty
+    // validator set yields a genesis that validate()/load() will reject, so warn
+    // honestly instead of claiming it is ready.
+    if genesis.initial_validators.is_empty() {
+        tracing::warn!(
+            "Genesis has no initial validators and will be rejected by \
+             GenesisConfig::validate(). Add validators before booting a real network."
+        );
+    }
+
     Ok(())
 }
 
 async fn run_node(
-    _validator: bool,
-    _bootnodes: Vec<String>,
-    _listen: String,
+    validator: bool,
+    bootnodes: Vec<String>,
+    listen: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Starting Subhost node...");
-    
+    tracing::info!(
+        "Starting Subhost node (validator={}, bootnodes={:?}). Exposing JSON-RPC on {}",
+        validator,
+        bootnodes,
+        listen
+    );
+
+    // Honest scope: this starts the JSON-RPC endpoint on `--listen`, wired to a
+    // real in-memory mempool + state. P2P/consensus block production are not yet
+    // wired into the CLI, so no real network module is spawned here.
+    let addr: std::net::SocketAddr = listen.parse()?;
+    let state = subhost_rpc::RpcState::new(1);
+    let server = subhost_rpc::RpcServer::new(state);
+    server.run(addr).await?;
+
     Ok(())
 }
 
@@ -277,8 +300,28 @@ async fn handle_wallet(cmd: WalletCommands) -> Result<(), Box<dyn std::error::Er
         }
         
         WalletCommands::Export { address, password } => {
-            tracing::info!("Exporting wallet: {}", address);
-            let _ = password;
+            // Real implementation: find the wallet file by address, decrypt the
+            // private key with the password, and print it hex-encoded.
+            let found = std::fs::read_dir(&wallet_dir)?
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |x| x == "json"))
+                .find(|e| {
+                    std::fs::read_to_string(e.path())
+                        .ok()
+                        .and_then(|c| serde_json::from_str::<subhost_wallet::Wallet>(&c).ok())
+                        .map_or(false, |w| w.address() == address)
+                });
+
+            match found {
+                Some(entry) => {
+                    let (_, key) = subhost_wallet::Wallet::load(&entry.path(), &password)?;
+                    tracing::info!("Private key for {}: 0x{}", address, hex::encode(key.0));
+                }
+                None => {
+                    tracing::error!("No wallet found for address {} in {:?}", address, wallet_dir);
+                    std::process::exit(1);
+                }
+            }
         }
         
         WalletCommands::Import { private_key, password } => {
@@ -295,10 +338,36 @@ async fn handle_wallet(cmd: WalletCommands) -> Result<(), Box<dyn std::error::Er
 async fn handle_transaction(cmd: TxCommands) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         TxCommands::Send { from, to, amount, gas_price, data } => {
-            let _to = parse_address(&to)?;
-            tracing::info!("Sending {} from {} to {}", amount, from, to);
-            let _ = gas_price;
-            let _ = data;
+            let from_addr = parse_address(&from)?;
+            let to_addr = parse_address(&to)?;
+            let gas_price = gas_price.unwrap_or(1);
+            let data = match data {
+                Some(d) => subhost_core::hex::decode(d.trim_start_matches("0x"))?,
+                None => Vec::new(),
+            };
+
+            let tx = subhost_core::Transaction {
+                tx_type: subhost_core::TransactionType::Transfer,
+                nonce: 0,
+                from: from_addr,
+                to: Some(to_addr),
+                value: amount,
+                gas_price,
+                gas_limit: 21_000,
+                data,
+                chain_id: 1,
+                signature: subhost_core::TransactionSignature { r: [0; 32], s: [0; 32], v: 0 },
+            };
+
+            // Compute the identical hash the RPC mempool would assign, so a
+            // CLI-created tx can be looked up there.
+            let mut pool = subhost_mempool::Mempool::default();
+            let hash = pool.add(tx)?;
+            tracing::info!(
+                "Prepared transfer of {} from {} to {} (gas {}): {}",
+                amount, from, to, gas_price, hash
+            );
+            tracing::info!("Note: broadcasting to a running node is not yet wired by the CLI.");
         }
         
         TxCommands::Status { tx_hash } => {
@@ -313,7 +382,12 @@ async fn handle_query(cmd: QueryCommands) -> Result<(), Box<dyn std::error::Erro
     match cmd {
         QueryCommands::Balance { address } => {
             let addr = parse_address(&address)?;
-            tracing::info!("Balance of {}: 0", addr);
+            // Don't fabricate a balance of 0: balances live in a running node's
+            // RPC state, which the CLI isn't wired to yet.
+            tracing::warn!(
+                "Balance for {} requires a running node (JSON-RPC); the CLI does not query one yet.",
+                addr
+            );
         }
         
         QueryCommands::Block { height, hash } => {

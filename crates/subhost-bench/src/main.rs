@@ -56,6 +56,7 @@ async fn run_tps_benchmark(endpoint: &str, duration_secs: u64, concurrency: usiz
     
     for _ in 0..concurrency {
         let counter = total_requests.clone();
+        let endpoint = endpoint.to_string();
         let handle = tokio::spawn(async move {
             let client = reqwest::Client::new();
             loop {
@@ -64,7 +65,7 @@ async fn run_tps_benchmark(endpoint: &str, duration_secs: u64, concurrency: usiz
                 }
                 
                 let _ = client
-                    .post("http://localhost:8545")
+                    .post(&endpoint)
                     .json(&serde_json::json!({
                         "jsonrpc": "2.0",
                         "method": "eth_chainId",
@@ -99,7 +100,7 @@ async fn run_tps_benchmark(endpoint: &str, duration_secs: u64, concurrency: usiz
 async fn run_latency_benchmark(endpoint: &str, duration_secs: u64, concurrency: usize) -> Result<(), Box<dyn std::error::Error>> {
     println!("Running latency benchmark...");
     
-    let mut histogram = Histogram::<u64>::new(3)?;
+    let histogram = Histogram::<u64>::new(3)?;
     let start = Instant::now();
     let duration = Duration::from_secs(duration_secs);
     let histogram = Arc::new(std::sync::Mutex::new(histogram));
@@ -108,6 +109,7 @@ async fn run_latency_benchmark(endpoint: &str, duration_secs: u64, concurrency: 
     
     for _ in 0..concurrency {
         let hist = histogram.clone();
+        let endpoint = endpoint.to_string();
         let handle = tokio::spawn(async move {
             let client = reqwest::Client::new();
             loop {
@@ -117,7 +119,7 @@ async fn run_latency_benchmark(endpoint: &str, duration_secs: u64, concurrency: 
                 
                 let req_start = Instant::now();
                 let _ = client
-                    .post("http://localhost:8545")
+                    .post(&endpoint)
                     .json(&serde_json::json!({
                         "jsonrpc": "2.0",
                         "method": "eth_chainId",
@@ -162,6 +164,7 @@ async fn run_load_test(endpoint: &str, duration_secs: u64, concurrency: usize) -
     let mut handles = vec![];
     
     for i in 0..concurrency {
+        let endpoint = endpoint.to_string();
         let handle = tokio::spawn(async move {
             let client = reqwest::Client::new();
             let mut counter = 0u64;
@@ -175,7 +178,7 @@ async fn run_load_test(endpoint: &str, duration_secs: u64, concurrency: usize) -
                 tokio::time::sleep(delay).await;
                 
                 let _ = client
-                    .post("http://localhost:8545")
+                    .post(&endpoint)
                     .json(&serde_json::json!({
                         "jsonrpc": "2.0",
                         "method": "eth_getBalance",

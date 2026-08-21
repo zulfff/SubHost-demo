@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use tokio::time;
 
 #[derive(Clone)]
@@ -28,18 +28,25 @@ impl FaucetState {
         }
     }
     
-    pub fn can_request(&self, address: &str) -> bool {
-        if let Some(last_request) = self.requests.get(address) {
-            if last_request.elapsed() < self.cooldown {
-                return false;
+    /// Atomically check and reserve the cooldown slot for one address.
+    pub fn try_record_request(&self, address: &str) -> bool {
+        let now = Instant::now();
+        match self.requests.entry(address.to_string()) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().elapsed() < self.cooldown {
+                    false
+                } else {
+                    entry.insert(now);
+                    true
+                }
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(now);
+                true
             }
         }
-        true
     }
     
-    pub fn record_request(&self, address: &str) {
-        self.requests.insert(address.to_string(), Instant::now());
-    }
 }
 
 #[derive(Deserialize)]
@@ -87,9 +94,12 @@ async fn handle_drip(
 ) -> Result<AxumJson<FaucetResponse>, StatusCode> {
     // SECURITY: Preserve original case for proper address validation
     let address_original = req.address.trim().to_string();
-    let address_lower = address_original.to_lowercase();
-    
-    if !is_valid_address(&address_original) {
+    // Normalize to lowercase for validation + cooldown key: Ethereum addresses
+    // are case-insensitive, so keying the rate limit on the raw(case-sensitive)
+    // string would let a caller bypass the cooldown by flipping letter case.
+    let address_norm = address_original.to_lowercase();
+
+    if !is_valid_address(&address_norm) {
         return Ok(AxumJson(FaucetResponse {
             success: false,
             tx_hash: None,
@@ -98,9 +108,7 @@ async fn handle_drip(
         }));
     }
     
-    // SECURITY: Use case-sensitive address for cooldown to prevent bypass
-    // Ethereum checksum addresses prevent collision attacks
-    if !state.can_request(&address_original) {
+    if !state.try_record_request(&address_norm) {
         return Ok(AxumJson(FaucetResponse {
             success: false,
             tx_hash: None,
@@ -109,12 +117,9 @@ async fn handle_drip(
         }));
     }
     
-    // Record request with original case
-    state.record_request(&address_original);
-    
-    // Generate deterministic tx hash from original address
+    // Generate deterministic tx hash from normalized address + time
     let mut hasher = blake3::Hasher::new();
-    hasher.update(address_original.as_bytes());
+    hasher.update(address_norm.as_bytes());
     hasher.update(&std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_be_bytes());
     let tx_hash = format!("0x{}", subhost_core::hex::encode(hasher.finalize().as_bytes()));
     
@@ -192,4 +197,16 @@ pub enum FaucetError {
     RateLimited,
     #[error("Invalid address")]
     InvalidAddress,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cooldown_reservation_is_single_use() {
+        let state = FaucetState::new(1, 60);
+        assert!(state.try_record_request("0xabc"));
+        assert!(!state.try_record_request("0xabc"));
+    }
 }

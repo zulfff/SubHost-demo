@@ -11,7 +11,7 @@
 <p align="center">
   <a href="https://subhost.vercel.app"><img src="https://img.shields.io/badge/Docs-Live-green.svg" alt="Documentation"></a>
   <a href="https://github.com/zulfff/SubHost/actions/workflows/rust.yml"><img src="https://github.com/zulfff/SubHost/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
   <a href="https://subhost.vercel.app"><img src="https://img.shields.io/badge/Website-subhost.vercel.app-6366f1.svg" alt="Website"></a>
 </p>
 
@@ -19,28 +19,23 @@
 
 ## What is Subhost?
 
-**Subhost Web3** is a high-performance, decentralized cloud infrastructure protocol that combines the power of blockchain consensus with distributed storage and edge computing. Built in Rust with zero-compromise security.
+**Subhost Web3** is a Rust workspace exploring a high-performance, decentralized cloud infrastructure (consensus + distributed storage + edge compute). It is an active codebase, **not yet a production network** — the sections below state exactly what is implemented today.
 
-### Key Innovations
+### Current Status (honest, verified against the code)
 
-- **Sub-Second Finality**: DAG-based consensus with HotStuff finality gadget
-- **Quantum-Resistant**: CRYSTALS-Dilithium signatures + BLS12-381 aggregation
-- **MEV-Resistant**: Threshold encrypted mempool + Dandelion++ routing
-- **IBC-Native**: Full Inter-Blockchain Communication protocol support
-- **Edge-Native**: Distributed compute nodes with WASM execution
-- **Zero-Knowledge**: Native zk-Rollups with Halo2 circuits
+| Area | Status |
+|------|--------|
+| **Core types** (`subhost-core`) | Real: `Hash`/`Address` (blake3), `BlockHeader`/`Block`/`Transaction`/`Receipt`, genesis config |
+| **Crypto** (`subhost-crypto`) | Real: BLS12-381 sign/verify/aggregate + proof-of-possession, ChaCha20-Poly1305 AEAD, ed25519, X25519 key-exchange, scrypt/AES-GCM wallets |
+| **Consensus** (`subhost-consensus`) | Scaffold: DAG + HotStuff structs, staking sets, quorum checks. **No full consensus loop / block production yet** |
+| **Networking** (`subhost-network`) | Scaffold: libp2p swarm (gossipsub/kad/mdns/ping) wired for publish. **Message dispatch is minimal** |
+| **Mempool** (`subhost-mempool`) | Real: per-sender nonce pool, gas-price ordering, capacity eviction, replace-by-nonce, dedupe |
+| **State** (`subhost-state`) | Real (in-memory): accounts, balances, nonce/replay enforcement, transfer execution |
+| **JSON-RPC** (`subhost-rpc`) | Real subset: `eth_chainId`, `eth_blockNumber`, `eth_getBalance` (reads state), `eth_sendTransaction` (inserts into mempool), `eth_gasPrice`, `net_version`; `eth_getTransactionReceipt` returns `null` (no confirmation backend yet) |
+| **WASM / EVM / zk** | **Not implemented** — crates are placeholders |
+| **IBC / Governance / Storage / P2P / Metrics / Faucet** | Partial / scaffolded; not production-ready |
 
----
-
-## Performance Metrics
-
-| Metric | Value | Comparison |
-|--------|-------|------------|
-| TPS | 50,000+ | 2x Solana |
-| Finality | 800ms | 4x faster than Ethereum |
-| Block Time | 400ms | Sub-second production |
-| Gas Cost | ~$0.0001 | 10,000x cheaper than L1 |
-| Cross-Chain Latency | 2-3 blocks | Industry leading |
+The README's older marketing claims (50k TPS, 800ms finality, parallel EVM, zk-rollups, threshold-encrypted mempool, Dandelion++, MPT, erasure-coded store) describe the **design vision**, not verified measurements — no benchmark currently reproduces them.
 
 ---
 
@@ -111,45 +106,54 @@ subhost node --validator --bootnodes /dns4/boot.subhost.io
 
 ### JSON-RPC API
 - Ethereum-compatible API on port 8545
-- Methods: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`, `eth_getTransactionReceipt`, `eth_gasPrice`, `net_version`
+- Methods: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`, `eth_gasPrice`, `net_version`
+- `eth_getTransactionReceipt` returns `null` (no confirmation backend yet)
+- `eth_sendTransaction` is **not** standard Ethereum: it requires an extra
+  `"publicKey"` (32-byte hex ed25519 public key) and `"signature"` (64-byte hex
+  ed25519 signature over the bincode-serialized unsigned transaction). Unsigned or
+  wrongly-signed payloads are rejected with `Invalid signature`.
+- `eth_sendTransaction` requires a `0x`-encoded 32-byte Ed25519 public key, a
+  `0x`-encoded 64-byte signature over the canonical unsigned transaction, the
+  configured chain ID, and the account's exact current nonce.
 
 ### Wallet & Key Management
-- AES-256-GCM encryption with scrypt key derivation
-- Secure key storage with PBKDF2
-- HD wallet support (BIP-39/44 ready)
+- AES-256-GCM encryption with **scrypt** key derivation _(implemented in `subhost-wallet`)_
+- Note: "PBKDF2" and HD/BIP-39/BIP-44 derivation are **not implemented** — private keys are raw 32-byte values, encrypted at rest.
 
 ### Docker Compose Testnet
 ```bash
 docker-compose up -d
 ```
-Spins up 4 validators, 1 RPC node, faucet, Prometheus, and Grafana.
+`docker-compose.yml` is included as a reference (validators, RPC, faucet, Prometheus,
+Grafana) but the containers are **not end-to-end functional yet** — consensus/block
+production is not wired, so this is not a usable testnet at the moment.
 
 ### Testnet Faucet
 - Web API at port 8080
-- Rate limited (1 request per 24h per address)
+- Rate limited (1 request per day per address, case-insensitive)
 - Request test tokens: `POST /drip { "address": "0x..." }`
+- Caveat: currently returns a fabricated `tx_hash`; it does **not** actually credit
+  a live chain state.
 
 ### Benchmark Tool
 ```bash
 subhost-bench tps --endpoint http://localhost:8545 --duration 60 --concurrency 100
-subhost-bench latency --duration 60
-subhost-bench load --duration 300
+subhost-bench latency --endpoint http://localhost:8545 --duration 60
+subhost-bench load --endpoint http://localhost:8545 --duration 300
 ```
+Measures TPS/latency against a live JSON-RPC endpoint. It reports what the endpoint
+actually serves; it does **not** benchmark consensus throughput.
 
 ### Block Explorer
-- Web UI at port 3000
-- View blocks, transactions, accounts
-- Search by height, hash, or address
+- An `explorer/` project is scaffolded (Rust) but is **not part of the workspace** and not confirmed to run as "Web UI at port 3000".
 
 ### Prometheus Metrics
-- Metrics endpoint at port 9090
-- Grafana dashboard included
-- Track TPS, block height, peer count, latency
+- `subhost-metrics` exposes a `/metrics` endpoint at port 9090 with request/latency/peers/height gauges.
+- The grafana dashboard referenced in docker-compose is provided but unverified.
 
 ### IBC Bridge
-- Cross-chain transfers to Cosmos SDK chains
-- Channel lifecycle management
-- Packet acknowledgement tracking
+- `subhost-ibc` implements in-memory channel/transfer/ack **bookkeeping only**.
+- It does **not** perform real cross-chain transfers to Cosmos SDK chains yet.
 
 ---
 
@@ -161,25 +165,28 @@ subhost-bench load --duration 300
 ### Installation
 
 ```bash
-git clone https://github.com/subhost-labs/subhost-web3.git
-cd subhost-web3
+git clone https://github.com/zulfff/SubHost.git
+cd SubHost
 
 # Build optimized release
 cargo build --release
 
-# Initialize genesis state
-./target/release/subhost-web3 init --config genesis.toml
+# Initialize genesis state (writes ./data/genesis.json)
+./target/release/subhost init --chain-id 1 --data-dir ./data
 
-# Run validator node
-./target/release/subhost-web3 node --validator --bootnodes /dns4/boot.subhost.io
+# Run a node (currently: exposes the JSON-RPC endpoint; no P2P/consensus yet)
+./target/release/subhost node --listen 127.0.0.1:8545
 ```
+
+> Note: the release binary is named `subhost` (from `crates/subhost-cli`). The
+> `--validator --bootnodes` flags are parsed but do not yet start a real
+> P2P/consensus network.
 
 ### Docker
 
-```bash
-docker pull subhost/subhost-web3:latest
-docker run -p 30333:30333 -v subhost-data:/data subhost/subhost-web3 node --validator
-```
+The repo ships a `Dockerfile`; `docker-compose.yml` is provided as a reference but
+the containers it describes are not yet end-to-end functional. Validate images
+locally before relying on them.
 
 ---
 
@@ -206,13 +213,22 @@ Complete documentation available at:
 
 ### Audits
 
-- **Trail of Bits** - Consensus & Cryptography (Q1 2026)
-- **OpenZeppelin** - Smart Contracts & IBC (Q1 2026)
-- **Least Authority** - Zero-Knowledge Circuits (Q2 2026)
+Planned / scheduled — **no audit has been completed yet.** Results will be linked here when/if they ship.
 
-### Bug Bounty
+- **Trail of Bits** - Consensus & Cryptography (proposed Q1 2026)
+- **OpenZeppelin** - Smart Contracts & IBC (proposed Q1 2026)
+- **Least Authority** - Zero-Knowledge Circuits (proposed Q2 2026)
 
-Report vulnerabilities via:
+### Changelog & Pentest Plan
+
+- **[CHANGELOG.md](CHANGELOG.md)** — exact list of every change made during the
+  audit/hardening pass (kept accurate; no un-verified claims).
+- **[PENTEST.md](PENTEST.md)** — a drop-in prompt for an LLM security audit with
+  a strict fix → test → repeat loop and anti-hallucination rules.
+
+### Reporting Security Issues
+
+There is **no bug bounty program**. Report vulnerabilities privately via:
 - Email: **security@subhost.xyz**
 - GitHub: [Security Advisories](https://github.com/zulfff/SubHost/security/advisories)
 

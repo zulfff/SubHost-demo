@@ -189,6 +189,9 @@ pub mod hex {
     
     pub fn decode(s: &str) -> Result<Vec<u8>, HexError> {
         let s = s.trim_start_matches("0x");
+        if !s.is_ascii() {
+            return Err(HexError::InvalidHex);
+        }
         if s.len() % 2 != 0 {
             return Err(HexError::OddLength);
         }
@@ -218,6 +221,14 @@ pub mod hex {
     }
     
     impl std::error::Error for HexError {}
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn hex_decode_rejects_non_ascii_without_panicking() {
+        assert!(super::hex::decode("aéb").is_err());
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

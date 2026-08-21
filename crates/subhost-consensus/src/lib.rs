@@ -13,6 +13,9 @@ pub struct ConsensusConfig {
 
 impl ConsensusConfig {
     pub fn new(validator_count: usize) -> Self {
+        // guard: a network with zero validators cannot form a quorum, and
+        // `(validator_count - 1)/3` would underflow below 1 anyway.
+        assert!(validator_count > 0, "validator_count must be > 0");
         let max_faulty = (validator_count - 1) / 3;
         let quorum_threshold = 2 * max_faulty + 1;
         
@@ -90,27 +93,37 @@ impl DAG {
     }
 
     pub fn has_quorum_support(&self, vertex_hash: &Hash) -> bool {
-        let parents = match self.edges.get(vertex_hash) {
-            Some(p) => p,
+        // Narwhal semantics: a vertex has quorum support when >= the quorum
+        // threshold of *other* validators produced a vertex (in the next round)
+        // that references it as a parent. The previous code counted the distinct
+        // validators among the vertex's OWN parents (its fan-in / ancestry), which
+        // is not "support for" this vertex and could trivially satisfy the quorum
+        // with unrelated history.
+        let target_round = match self.vertex_round(vertex_hash) {
+            Some(r) => r,
             None => return false,
         };
-        
-        let unique_validators: HashSet<_> = parents.iter()
-            .filter_map(|p| self.get_vertex_author(p))
-            .collect();
-        
-        unique_validators.len() >= self.config.quorum_threshold
+
+        let supporters: HashSet<Address> = self
+            .vertices
+            .get(&(target_round + 1))
+            .map(|round_vertices| {
+                round_vertices
+                    .iter()
+                    .filter(|v| v.parents.contains(vertex_hash))
+                    .map(|v| v.author)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        supporters.len() >= self.config.quorum_threshold
     }
 
-    fn get_vertex_author(&self, hash: &Hash) -> Option<Address> {
-        for vertices in self.vertices.values() {
-            for v in vertices {
-                if &v.hash() == hash {
-                    return Some(v.author);
-                }
-            }
-        }
-        None
+    fn vertex_round(&self, hash: &Hash) -> Option<u64> {
+        self.vertices
+            .iter()
+            .find(|(_, vs)| vs.iter().any(|v| &v.hash() == hash))
+            .map(|(round, _)| *round)
     }
 
     pub fn gc(&mut self, keep_rounds: u64) {
@@ -169,17 +182,27 @@ impl HotStuff {
     }
 
     pub fn validate_qc(&self, qc: &QuorumCertificate) -> bool {
-        if qc.signatures.len() < self.config.quorum_threshold {
+        let signers: HashSet<Address> = qc.signatures.iter().map(|(addr, _)| *addr).collect();
+        if signers.len() < self.config.quorum_threshold {
             return false;
         }
 
-        for (addr, _) in &qc.signatures {
-            if !self.validators.contains(addr) {
+        if qc.signatures.iter().any(|(_, sig)| sig.len() != 96) {
+            return false;
+        }
+
+        for addr in signers {
+            if !self.validators.contains(&addr) {
                 return false;
             }
+            // This scaffold stores validator public keys separately in the
+            // production validator registry. Until that registry is wired, QC
+            // validation must fail closed instead of accepting unsigned bytes.
+            let _ = addr;
+            return false;
         }
-        
-        true
+
+        false
     }
 
     pub fn update_high_qc(&mut self, qc: QuorumCertificate) {
@@ -228,4 +251,19 @@ mod tests {
         assert_eq!(config.max_faulty, 1);
         assert_eq!(config.quorum_threshold, 3);
     }
+
+    #[test]
+    fn qc_requires_distinct_validators() {
+        let config = ConsensusConfig::new(4);
+        let validator = Address::new([1u8; 20]);
+        let hotstuff = HotStuff::new(config, vec![validator]);
+        let qc = QuorumCertificate {
+            view: 1,
+            block_hash: Hash::ZERO,
+            signatures: vec![(validator, vec![]), (validator, vec![]), (validator, vec![])],
+        };
+        assert!(!hotstuff.validate_qc(&qc));
+    }
 }
+
+pub mod staking;

@@ -12,6 +12,7 @@ rust-version = "1.75"
 subhost-core = { path = "../subhost-core" }
 subhost-state = { path = "../subhost-state" }
 subhost-mempool = { path = "../subhost-mempool" }
+subhost-crypto = { path = "../subhost-crypto" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -24,6 +25,8 @@ tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 hex = { workspace = true }
 primitive-types = { workspace = true }
+bincode = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

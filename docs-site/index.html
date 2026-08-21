@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Accurate engineering documentation for the Subhost Web3 Rust workspace.">
+  <title>Subhost Docs | Engineering reference</title>
+  <link rel="icon" href="../assets/logo.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#content">Skip to content</a>
+  <div class="site-shell">
+    <header class="topbar">
+      <div class="brand-lockup">
+        <img src="../assets/logo.svg" alt="Subhost" class="brand-mark">
+        <div>
+          <div class="brand-name">Subhost</div>
+          <div class="brand-context">engineering documentation</div>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span class="status-dot"><span></span> v0.1 workspace</span>
+        <a class="top-link" href="../README.md">Repository</a>
+        <button class="icon-button" id="menuToggle" type="button" aria-label="Open navigation" aria-expanded="false">&#9776;</button>
+      </div>
+    </header>
+
+    <div class="layout">
+      <aside class="sidebar" id="sidebar">
+        <div class="sidebar-scroll">
+          <div class="version-row">
+            <span>Docs</span>
+            <span class="version-chip">0.1</span>
+          </div>
+          <label class="search-box" for="docSearch">
+            <span aria-hidden="true">&#8981;</span>
+            <input id="docSearch" type="search" placeholder="Search docs" autocomplete="off">
+            <kbd>/</kbd>
+          </label>
+          <nav class="doc-nav" aria-label="Documentation navigation">
+            <div class="nav-group">
+              <div class="nav-label">Start here</div>
+              <button class="nav-item active" data-target="overview">Overview <span>01</span></button>
+              <button class="nav-item" data-target="quickstart">Quickstart <span>02</span></button>
+              <button class="nav-item" data-target="status">Implementation status <span>03</span></button>
+            </div>
+            <div class="nav-group">
+              <div class="nav-label">Build with Subhost</div>
+              <button class="nav-item" data-target="architecture">Architecture <span>04</span></button>
+              <button class="nav-item" data-target="rpc">JSON-RPC <span>05</span></button>
+              <button class="nav-item" data-target="cli">CLI reference <span>06</span></button>
+              <button class="nav-item" data-target="packages">Package map <span>07</span></button>
+            </div>
+            <div class="nav-group">
+              <div class="nav-label">Protocol notes</div>
+              <button class="nav-item" data-target="security">Security model <span>08</span></button>
+              <button class="nav-item" data-target="tokenomics">Tokenomics <span>09</span></button>
+              <button class="nav-item" data-target="changes">Changelog <span>10</span></button>
+            </div>
+          </nav>
+          <div class="sidebar-footnote">
+            <span class="tiny-label">Source of truth</span>
+            <p>Runtime behavior is documented from <code>crates/*/src</code>. Roadmap material is labeled as design-only.</p>
+          </div>
+        </div>
+      </aside>
+
+      <main id="content" class="content">
+        <div class="content-grid">
+          <div class="article-column">
+            <section class="doc-view active" id="overview" data-title="Overview">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Subhost Web3 / engineering reference</div>
+              <h1>Build against what exists.</h1>
+              <p class="lede">Subhost is a Rust workspace for a decentralized cloud protocol. These docs describe the code that runs today, the interfaces you can call, and the pieces that are still deliberately unfinished.</p>
+              <div class="notice notice-amber">
+                <div class="notice-mark">!</div>
+                <div><strong>Pre-production software.</strong> Consensus block production, EVM/WASM/zk execution, persistence, and live cross-chain settlement are not wired into the node yet.</div>
+              </div>
+              <div class="signal-grid">
+                <div class="signal-card live"><span class="signal-kicker">Implemented</span><strong>Core types</strong><p>Addresses, hashes, transactions, blocks, receipts, and genesis config.</p></div>
+                <div class="signal-card live"><span class="signal-kicker">Implemented</span><strong>State + mempool</strong><p>In-memory balances, nonces, fee accounting, bounded transaction admission.</p></div>
+                <div class="signal-card partial"><span class="signal-kicker">Partial</span><strong>RPC + networking</strong><p>Useful local surfaces with explicit limits; no production node loop yet.</p></div>
+                <div class="signal-card planned"><span class="signal-kicker">Not wired</span><strong>Execution layer</strong><p>EVM, WASM, and zk crates are placeholders in this repository.</p></div>
+              </div>
+              <h2 id="orientation">A practical reading order</h2>
+              <div class="reading-list">
+                <a href="#quickstart" data-target-link="quickstart"><span>01</span><div><strong>Run the local surface</strong><small>Initialize a genesis directory and start the RPC-facing node.</small></div><b>&rarr;</b></a>
+                <a href="#architecture" data-target-link="architecture"><span>02</span><div><strong>Understand the boundaries</strong><small>See what owns validation, state transitions, ordering, and transport.</small></div><b>&rarr;</b></a>
+                <a href="#rpc" data-target-link="rpc"><span>03</span><div><strong>Integrate with JSON-RPC</strong><small>Use strict quantities, signed transaction payloads, and real state reads.</small></div><b>&rarr;</b></a>
+              </div>
+              <div class="source-row"><span>Last reviewed</span><strong>22 Aug 2026</strong><span class="source-separator">&bull;</span><span>Workspace version</span><strong>0.1.0</strong></div>
+            </section>
+
+            <section class="doc-view" id="quickstart" data-title="Quickstart">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Start here</div>
+              <h1>Quickstart</h1>
+              <p class="lede">Get a local Subhost binary and inspect the surfaces that are implemented today. This is a development workflow, not a testnet deployment guide.</p>
+              <h2>Prerequisites</h2>
+              <ul class="check-list"><li>Rust 1.75 or newer</li><li>Approximately 4 GB RAM for the full workspace; use two Cargo jobs</li><li>A Unix-like shell for the commands below</li></ul>
+              <h2>Build and initialize</h2>
+              <div class="code-block"><div class="code-head"><span>shell</span><button class="copy-button" data-copy="cargo check --workspace -j 2&#10;cargo run -p subhost-cli -- init --chain-id 1 --data-dir ./data">Copy</button></div><pre><code>cargo check --workspace -j 2
+cargo run -p subhost-cli -- init --chain-id 1 --data-dir ./data</code></pre></div>
+              <p class="muted">The genesis command creates the directory and writes a genesis configuration. A zero-validator genesis is rejected by validation and is not a production network configuration.</p>
+              <h2>Start the local RPC surface</h2>
+              <div class="code-block"><div class="code-head"><span>shell</span><button class="copy-button" data-copy="cargo run -p subhost-cli -- node --listen 127.0.0.1:8545">Copy</button></div><pre><code>cargo run -p subhost-cli -- node --listen 127.0.0.1:8545</code></pre></div>
+              <p>The current node exposes a local JSON-RPC subset. It does not run a complete consensus/block-production loop, so transaction receipts remain <code>null</code> until a confirmation backend exists.</p>
+              <h2>Smoke test</h2>
+              <div class="code-block"><div class="code-head"><span>shell</span><button class="copy-button" data-copy="curl -s http://127.0.0.1:8545 -H 'content-type: application/json' --data '{&quot;jsonrpc&quot;:&quot;2.0&quot;,&quot;id&quot;:1,&quot;method&quot;:&quot;eth_chainId&quot;,&quot;params&quot;:[]}'">Copy</button></div><pre><code>curl -s http://127.0.0.1:8545 \\
+  -H 'content-type: application/json' \\
+  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'</code></pre></div>
+              <div class="result-line"><span class="result-dot"></span><code>{"jsonrpc":"2.0","result":"0x1","id":1}</code></div>
+            </section>
+
+            <section class="doc-view" id="status" data-title="Implementation status">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Scope and maturity</div>
+              <h1>Implementation status</h1>
+              <p class="lede">Use this page to decide whether a package is appropriate for local development, integration tests, or a production design review.</p>
+              <div class="status-table" role="table" aria-label="Package implementation status">
+                <div class="status-row status-header" role="row"><span>Area</span><span>State</span><span>What is true in code</span></div>
+                <div class="status-row" role="row"><span>Core types</span><strong class="pill green">Implemented</strong><span><code>subhost-core</code> defines blake3 addresses/hashes, transactions, blocks, receipts, and genesis data.</span></div>
+                <div class="status-row" role="row"><span>Crypto</span><strong class="pill green">Implemented</strong><span>BLS12-381, proof-of-possession, ChaCha20-Poly1305, Ed25519, X25519, and wallet encryption helpers.</span></div>
+                <div class="status-row" role="row"><span>State</span><strong class="pill green">Implemented</strong><span>In-memory accounts, balance transfers, fee debit, chain-ID and nonce checks.</span></div>
+                <div class="status-row" role="row"><span>Mempool</span><strong class="pill green">Implemented</strong><span>Per-sender nonce index, replacement by higher gas price, caps, dedupe, and calldata bounds.</span></div>
+                <div class="status-row" role="row"><span>JSON-RPC</span><strong class="pill yellow">Partial</strong><span>Strict local API; signed submission enters mempool, but no confirmation pipeline is connected.</span></div>
+                <div class="status-row" role="row"><span>Consensus</span><strong class="pill yellow">Scaffold</strong><span>DAG/HotStuff structures and staking helpers exist. QC validation fails closed without a BLS key registry.</span></div>
+                <div class="status-row" role="row"><span>Network</span><strong class="pill yellow">Scaffold</strong><span>Libp2p transport, gossipsub, Kademlia, optional mDNS, ping, and connection limits.</span></div>
+                <div class="status-row" role="row"><span>IBC</span><strong class="pill yellow">Bookkeeping</strong><span>In-memory channel/packet checks; no real remote-chain settlement or light-client proof system.</span></div>
+                <div class="status-row" role="row"><span>EVM / WASM / zk</span><strong class="pill red">Placeholder</strong><span>Not implemented as execution engines in the production workspace.</span></div>
+              </div>
+            </section>
+
+            <section class="doc-view" id="architecture" data-title="Architecture">
+              <div class="eyebrow"><span class="eyebrow-line"></span> System map</div>
+              <h1>Architecture</h1>
+              <p class="lede">The workspace is intentionally layered. A transaction should be validated at the edge, admitted once, executed against a chain-bound state, and only then become consensus material.</p>
+              <div class="architecture-map">
+                <div class="arch-layer edge"><span>01</span><div><strong>Edge surfaces</strong><small>CLI &middot; JSON-RPC &middot; Faucet</small></div><em>parse / rate-limit</em></div>
+                <div class="arch-arrow">&darr;</div>
+                <div class="arch-layer pool"><span>02</span><div><strong>Admission</strong><small>Mempool &middot; nonce index &middot; gas policy</small></div><em>dedupe / bound</em></div>
+                <div class="arch-arrow">&darr;</div>
+                <div class="arch-layer state"><span>03</span><div><strong>State transition</strong><small>Balances &middot; fees &middot; chain ID &middot; nonce</small></div><em>checked arithmetic</em></div>
+                <div class="arch-arrow">&darr;</div>
+                <div class="arch-layer consensus"><span>04</span><div><strong>Consensus scaffold</strong><small>DAG &middot; HotStuff &middot; staking</small></div><em>not a live loop</em></div>
+              </div>
+              <h2>Boundaries that matter</h2>
+              <div class="two-col">
+                <div class="plain-card"><span class="card-index">A</span><h3>Identity</h3><p>RPC binds the submitted <code>from</code> address to a supplied Ed25519 public key. The signature covers the canonical unsigned transaction.</p></div>
+                <div class="plain-card"><span class="card-index">B</span><h3>Replay</h3><p>State requires the exact account nonce and increments it with checked arithmetic. IBC tracks received packets and acknowledgements.</p></div>
+                <div class="plain-card"><span class="card-index">C</span><h3>Resource limits</h3><p>RPC request bodies, batches, responses, connections, mempool payloads, and network transmit size are bounded.</p></div>
+                <div class="plain-card"><span class="card-index">D</span><h3>Truthful status</h3><p>Receipt queries return <code>null</code> until a producer/confirmation path exists. Placeholder engines are labeled rather than silently invoked.</p></div>
+              </div>
+            </section>
+
+            <section class="doc-view" id="rpc" data-title="JSON-RPC">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Integration reference</div>
+              <h1>JSON-RPC</h1>
+              <p class="lede">The RPC server is a deliberately small Ethereum-shaped surface for local development. All quantities are strict <code>0x</code>-prefixed hex strings.</p>
+              <div class="endpoint-list">
+                <article class="endpoint"><div class="endpoint-top"><code>eth_chainId</code><span class="pill green">read</span></div><p>Returns the configured numeric chain ID as a quantity. Default CLI state is chain <code>1</code>.</p><div class="endpoint-example"><code>&rarr; &quot;0x1&quot;</code></div></article>
+                <article class="endpoint"><div class="endpoint-top"><code>eth_blockNumber</code><span class="pill green">read</span></div><p>Returns the atomic block-height counter. It starts at <code>0x0</code> until a producer advances it.</p><div class="endpoint-example"><code>&rarr; &quot;0x0&quot;</code></div></article>
+                <article class="endpoint"><div class="endpoint-top"><code>eth_getBalance</code><span class="pill green">read</span></div><p>Parameters: <code>[address]</code> or <code>[address, block]</code>. Reads the in-memory state balance.</p><div class="endpoint-example"><code>&rarr; &quot;0x0&quot;</code></div></article>
+                <article class="endpoint"><div class="endpoint-top"><code>eth_gasPrice</code><span class="pill green">read</span></div><p>Returns the current local default gas price, <code>0x1</code>.</p></article>
+                <article class="endpoint"><div class="endpoint-top"><code>net_version</code><span class="pill green">read</span></div><p>Returns the chain ID as a decimal string for Ethereum tooling compatibility.</p></article>
+                <article class="endpoint"><div class="endpoint-top"><code>eth_getTransactionReceipt</code><span class="pill yellow">pending</span></div><p>Returns <code>null</code>. There is no connected block producer or confirmation store yet.</p></article>
+              </div>
+              <h2>Signed transaction submission</h2>
+              <p><code>eth_sendTransaction</code> accepts one object. Required identity fields are <code>from</code>, <code>publicKey</code>, and <code>signature</code>. The public key is 32 bytes, the signature is 64 bytes, and both must be <code>0x</code>-prefixed. The derived address must equal <code>from</code>.</p>
+              <div class="field-table"><div><code>nonce</code><span>quantity</span><small>Must equal the current account nonce.</small></div><div><code>chainId</code><span>quantity</span><small>Must equal the server chain ID.</small></div><div><code>value</code><span>u128 quantity</span><small>Defaults to zero.</small></div><div><code>gasPrice</code><span>u128 quantity</span><small>Defaults to <code>0x1</code>.</small></div><div><code>gasLimit</code><span>quantity</span><small>Defaults to <code>0x5208</code>.</small></div><div><code>data</code><span>bytes</span><small>Hex-encoded calldata; mempool bound is 128 KiB.</small></div></div>
+              <div class="notice notice-blue"><div class="notice-mark">i</div><div>The signature is verified over a bincode-encoded transaction with a zeroed signature field. This is an internal protocol surface, not a claim of full Ethereum transaction wire compatibility.</div></div>
+            </section>
+
+            <section class="doc-view" id="cli" data-title="CLI reference">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Developer tooling</div>
+              <h1>CLI reference</h1>
+              <p class="lede">The binary is named <code>subhost</code>. Commands below reflect the Clap surface in <code>crates/subhost-cli</code>; some commands report prerequisites instead of pretending a backend exists.</p>
+              <div class="cli-groups">
+                <div class="cli-group"><h3>Node lifecycle</h3><div class="cli-command"><code>subhost init --chain-id 1 --data-dir ./data</code><span>Write genesis configuration.</span></div><div class="cli-command"><code>subhost node --listen 127.0.0.1:8545</code><span>Start the local node/RPC surface.</span></div></div>
+                <div class="cli-group"><h3>Wallet</h3><div class="cli-command"><code>subhost wallet new --password &lt;pass&gt;</code><span>Create an encrypted wallet.</span></div><div class="cli-command"><code>subhost wallet list</code><span>List local wallet files.</span></div><div class="cli-command"><code>subhost wallet export &lt;address&gt; --password &lt;pass&gt;</code><span>Decrypt and export a private key.</span></div></div>
+                <div class="cli-group"><h3>Transactions</h3><div class="cli-command"><code>subhost tx send --from &lt;addr&gt; --to &lt;addr&gt; --amount 1000</code><span>Build a local transaction and print its hash.</span></div><div class="cli-command"><code>subhost tx status &lt;hash&gt;</code><span>Inspect status; confirmation needs a live backend.</span></div></div>
+                <div class="cli-group"><h3>Queries</h3><div class="cli-command"><code>subhost query balance &lt;address&gt;</code><span>Query a running node.</span></div><div class="cli-command"><code>subhost query block --height 123</code><span>Block lookup interface; producer backend is not wired.</span></div><div class="cli-command"><code>subhost query validators</code><span>Validator query surface.</span></div></div>
+                <div class="cli-group"><h3>Contract surface</h3><div class="cli-command"><code>subhost contract deploy --code &lt;path&gt;</code><span>CLI surface exists; execution backend is not implemented.</span></div><div class="cli-command"><code>subhost contract call --address &lt;addr&gt;</code><span>CLI surface exists; EVM/WASM engines remain placeholders.</span></div></div>
+              </div>
+            </section>
+
+            <section class="doc-view" id="packages" data-title="Package map">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Workspace map</div>
+              <h1>Package map</h1>
+              <p class="lede">The production workspace is the package set under <code>crates/</code>. The repository also contains legacy/experimental trees that are intentionally outside the root workspace.</p>
+              <div class="package-grid">
+                <div class="package-card"><code>subhost-core</code><span class="pill green">foundation</span><p>Primitive types, serialization models, addresses, hashes, genesis.</p></div>
+                <div class="package-card"><code>subhost-crypto</code><span class="pill green">security</span><p>BLS, Ed25519, X25519, AEAD, key zeroization helpers.</p></div>
+                <div class="package-card"><code>subhost-state</code><span class="pill green">runtime</span><p>In-memory account state and checked transaction application.</p></div>
+                <div class="package-card"><code>subhost-mempool</code><span class="pill green">runtime</span><p>Bounded pending transaction admission and ordering.</p></div>
+                <div class="package-card"><code>subhost-rpc</code><span class="pill yellow">partial</span><p>Strict JSON-RPC edge and mempool submission.</p></div>
+                <div class="package-card"><code>subhost-consensus</code><span class="pill yellow">scaffold</span><p>DAG/HotStuff data structures and staking helpers.</p></div>
+                <div class="package-card"><code>subhost-network</code><span class="pill yellow">scaffold</span><p>Libp2p transport and bounded gossip behavior.</p></div>
+                <div class="package-card"><code>subhost-ibc</code><span class="pill yellow">bookkeeping</span><p>In-memory packet/channel validation and replay checks.</p></div>
+                <div class="package-card"><code>subhost-wallet</code><span class="pill green">security</span><p>Scrypt/AES-GCM encrypted local wallet files.</p></div>
+                <div class="package-card"><code>subhost-evm</code><span class="pill red">placeholder</span><p>Execution engine not implemented.</p></div>
+                <div class="package-card"><code>subhost-wasm</code><span class="pill red">placeholder</span><p>Execution engine not implemented.</p></div>
+                <div class="package-card"><code>subhost-zk</code><span class="pill red">placeholder</span><p>Proof system not implemented.</p></div>
+              </div>
+            </section>
+
+            <section class="doc-view" id="security" data-title="Security model">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Security notes</div>
+              <h1>Security model</h1>
+              <p class="lede">The repository treats input validation and truthful failure as protocol behavior. The threat model is broader than the current implementation, so each roadmap mitigation is labeled accordingly.</p>
+              <div class="security-list"><div><strong>Input boundaries</strong><p>RPC quantities, addresses, signatures, data payloads, request bodies, batches, and network messages are bounded or rejected.</p></div><div><strong>Cryptographic hygiene</strong><p>Private material is zeroized where practical; X25519 rejects all-zero shared secrets; BLS identity points are rejected.</p></div><div><strong>Accounting integrity</strong><p>Transfers debit the sender, charge fees, reject insufficient balances, bind transactions to a chain ID, and enforce exact nonces.</p></div><div><strong>Fail closed</strong><p>Consensus QC validation does not accept arbitrary signature bytes while the validator public-key registry is absent.</p></div></div>
+              <div class="notice notice-amber"><div class="notice-mark">!</div><div>Not implemented: encrypted mempool, Dandelion++ privacy, threshold encryption, production consensus loop, HSM program, oracle/MEV defenses, and a live bug bounty program.</div></div>
+              <h2>Reporting</h2><p>Do not publish suspected vulnerabilities in an issue first. Follow <a href="../SECURITY.md">SECURITY.md</a> and include the exact commit, file/line, impact, reproduction, and mitigation.</p>
+            </section>
+
+            <section class="doc-view" id="tokenomics" data-title="Tokenomics">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Design document</div>
+              <h1>Tokenomics</h1>
+              <div class="notice notice-amber"><div class="notice-mark">!</div><div><strong>Design specification only.</strong> There is no live SUB token in this repository. Supply, inflation, rewards, burn, governance, and unbonding values are planning targets.</div></div>
+              <div class="token-summary"><div><span>Total supply target</span><strong>1B SUB</strong></div><div><span>Initial circulation target</span><strong>150M</strong></div><div><span>Annual inflation target</span><strong>5%</strong></div><div><span>Fee burn target</span><strong>50%</strong></div></div>
+              <h2>What is partially backed by code</h2><p><code>subhost-consensus</code> contains a minimal staking module with validator add/delegate/slash operations. Delegation bonding, reward distribution, unbonding, governance voting, fee burn, and token issuance are not wired.</p>
+              <p>Read the full planning document in <a href="../docs/tokenomics.md">docs/tokenomics.md</a>. Treat its figures as design inputs, not chain parameters.</p>
+            </section>
+
+            <section class="doc-view" id="changes" data-title="Changelog">
+              <div class="eyebrow"><span class="eyebrow-line"></span> Release notes</div>
+              <h1>Changelog</h1>
+              <p class="lede">The latest hardening pass focused on making the implemented surfaces honest and bounded.</p>
+              <div class="timeline"><div><span>01</span><div><strong>Admission hardening</strong><p>Strict RPC quantities, chain ID, signatures, exact nonces, body limits, batch limits, and connection caps.</p></div></div><div><span>02</span><div><strong>State correctness</strong><p>Checked balance/fee arithmetic, sender debit, nonce progression, and explicit unsupported transaction types.</p></div></div><div><span>03</span><div><strong>Replay resistance</strong><p>IBC channel/port binding, timeout checks, ordered sequence checks, replay markers, and overflow handling.</p></div></div><div><span>04</span><div><strong>Repository quality</strong><p>Tracked lockfile workflow, CI format/clippy/audit gates, Dependabot, CODEOWNERS, and security policy.</p></div></div></div>
+              <p class="muted">The canonical change log is available at <a href="../CHANGELOG.md">CHANGELOG.md</a>.</p>
+            </section>
+
+            <div class="not-found" id="notFound" hidden><h2>No matching section</h2><p>Try a package name, command, endpoint, or navigation label.</p></div>
+          </div>
+          <aside class="toc" aria-label="On this page">
+            <div class="toc-title">On this page</div>
+            <a href="#orientation">Reading order</a>
+            <a href="#quickstart">Quickstart</a>
+            <a href="#architecture">Boundaries</a>
+            <div class="toc-rule"></div>
+            <a class="toc-muted" href="../README.md">Open README</a>
+            <a class="toc-muted" href="../docs/security/threat-model.md">Threat model</a>
+          </aside>
+        </div>
+        <footer class="footer"><span>Subhost Web3 &middot; Apache-2.0</span><span>Docs are generated from the current repository, not the roadmap.</span></footer>
+      </main>
+    </div>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

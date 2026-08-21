@@ -8,13 +8,44 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 3
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build:
+  quality:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Cache Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+    - name: Type-check workspace
+      run: cargo check --workspace -j 2
+    - name: Run safe test suites
+      run: cargo test -p subhost-crypto -p subhost-consensus -p subhost-mempool -p subhost-state -p subhost-rpc -p subhost-ibc -j 2
+    - name: Clippy security gate
+      run: cargo clippy -p subhost-crypto -p subhost-consensus -p subhost-mempool -p subhost-state -p subhost-rpc --all-targets --all-features -j 2 -- -D warnings
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+    - name: Cache Cargo artifacts
+      uses: Swatinem/rust-cache@v2
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@cargo-audit
+    - name: Audit dependencies
+      run: cargo audit

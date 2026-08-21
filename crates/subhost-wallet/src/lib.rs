@@ -29,10 +29,24 @@ pub enum WalletError {
     
     #[error("Invalid private key")]
     InvalidPrivateKey,
+
+    #[error("Wallet address does not match the decrypted private key")]
+    AddressMismatch,
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct PrivateKey(pub [u8; 32]);
+
+impl PrivateKey {
+    /// The ed25519 public (verifying) key for this 32-byte secret seed. The wallet
+    /// address is derived from this key, matching `subhost_core::Address::from_public_key`
+    /// and the `eth_sendTransaction` signature gate in `subhost-rpc`.
+    pub fn public_key(&self) -> [u8; 32] {
+        ed25519_dalek::SigningKey::from_bytes(&self.0)
+            .verifying_key()
+            .to_bytes()
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Wallet {
@@ -104,6 +118,9 @@ impl Wallet {
             &wallet.nonce,
             password,
         )?;
+        if wallet.address != derive_address(&private_key.0).to_string() {
+            return Err(WalletError::AddressMismatch);
+        }
         Ok((wallet, private_key))
     }
     
@@ -113,10 +130,11 @@ impl Wallet {
 }
 
 fn derive_address(private_key: &[u8; 32]) -> Address {
-    let hash = blake3::hash(private_key);
-    let mut addr = [0u8; 20];
-    addr.copy_from_slice(&hash.as_bytes()[12..32]);
-    Address::new(addr)
+    // Derive the address from the ed25519 PUBLIC key, not from the raw secret.
+    // This keeps the wallet consistent with subhost_core::Address::from_public_key,
+    // which the RPC uses to bind `from` to the provided public key.
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(private_key);
+    Address::from_public_key(signing_key.verifying_key().as_bytes())
 }
 
 fn encrypt_private_key(
@@ -157,6 +175,10 @@ fn decrypt_private_key(
     nonce: &[u8],
     password: &str,
 ) -> Result<PrivateKey, WalletError> {
+    if salt.len() != 32 || nonce.len() != 12 {
+        return Err(WalletError::DecryptionFailed);
+    }
+
     let mut key = [0u8; 32];
     scrypt::scrypt(
         password.as_bytes(),
@@ -169,18 +191,57 @@ fn decrypt_private_key(
         .map_err(|_| WalletError::DecryptionFailed)?;
     
     let nonce = Nonce::from_slice(nonce);
-    let decrypted = cipher
+    let mut decrypted = cipher
         .decrypt(nonce, encrypted)
         .map_err(|_| WalletError::DecryptionFailed)?;
     
     key.zeroize();
     
     if decrypted.len() != 32 {
+        decrypted.zeroize();
         return Err(WalletError::DecryptionFailed);
     }
     
     let mut private_key = [0u8; 32];
     private_key.copy_from_slice(&decrypted);
+    // The plaintext buffer still holds the raw private key; wipe it so the secret
+    // does not linger on the heap longer than necessary.
+    decrypted.zeroize();
     
     Ok(PrivateKey(private_key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_malformed_nonce_without_panicking() {
+        assert!(matches!(
+            decrypt_private_key(&[], &[0u8; 32], &[0u8; 11], "password"),
+            Err(WalletError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn rejects_wallet_address_tampering() {
+        let mut wallet = Wallet::new("password").unwrap();
+        wallet.address = Address::new([9u8; 20]).to_string();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        wallet.save(path.path()).unwrap();
+        assert!(matches!(
+            Wallet::load(path.path(), "password"),
+            Err(WalletError::AddressMismatch)
+        ));
+    }
+
+    #[test]
+    fn address_is_derived_from_public_key() {
+        // The RPC `eth_sendTransaction` gate binds `from` to the ed25519 public
+        // key; the wallet must derive the same address or real accounts can never
+        // authenticate. Lock that invariant here.
+        let pk = PrivateKey([42u8; 32]);
+        let addr = derive_address(&pk.0);
+        assert_eq!(addr, Address::from_public_key(&pk.public_key()));
+    }
 }

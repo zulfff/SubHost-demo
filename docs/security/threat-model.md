@@ -2,6 +2,16 @@
 
 This document outlines the security assumptions, potential threats, and mitigations for the Subhost protocol. It is a living document that evolves as the protocol matures and new threats are identified.
 
+> **IMPORTANT — implementation status.** A security *threat model* describes the
+> full surface we intend to defend. Many listed artifacts in this document are
+> **design goals, not current features**. Today the codebase implements: BLS12-381
+> & ed25519 signatures with BLS proof-of-possession, ChaCha20-Poly1305/X25519, an
+> in-memory mempool and state, a JSON-RPC server, and a libp2p scaffold. It does
+> **not** yet implement: an encrypted mempool, Dandelion++ routing, threshold
+> encryption / going, a production consensus loop, oracle / MEV defenses, an HSM
+> program, or a payout-bearing bug bounty. Mitigations below should be read as the
+> roadmap, not as an assurance that they are live today.
+
 ## Security Objectives
 
 Subhost aims to provide the following security guarantees:
@@ -234,16 +244,12 @@ Malicious code in dependencies or build process.
 - Additional monitoring
 - Documentation updates
 
-## Bug Bounty Program
+## Reporting Security Issues
 
-We run an active bug bounty with the following rewards:
-
-- **Critical**: Up to 500,000 SUB
-- **High**: Up to 200,000 SUB
-- **Medium**: Up to 50,000 SUB
-- **Low**: Up to 10,000 SUB
-
-Report via security@subhost.xyz or through the bug bounty platform.
+There is **no bug bounty program** and no reward pool. If you find a suspected
+vulnerability, report it privately to `security@subhost.xyz` — include the affected
+commit, exact file and line, impact, and reproduction steps. Please do not open a
+public issue for an undisclosed vulnerability.
 
 ## Audit History
 

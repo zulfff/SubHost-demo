@@ -17,6 +17,7 @@ subhost-core = { path = "../subhost-core" }
 subhost-crypto = { path = "../subhost-crypto" }
 subhost-wallet = { path = "../subhost-wallet" }
 subhost-rpc = { path = "../subhost-rpc" }
+subhost-mempool = { path = "../subhost-mempool" }
 clap = { version = "4.4", features = ["derive"] }
 tokio = { workspace = true }
 serde = { workspace = true }
