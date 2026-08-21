@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/zulfff/SubHost/main/assets/logo.svg" width="200" alt="Subhost Web3">
+  <img src="https://raw.githubusercontent.com/zulfff/SubHost-demo/main/assets/logo.svg" width="200" alt="Subhost Web3">
 </p>
 
 <h1 align="center">Subhost Web3</h1>
