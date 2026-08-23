@@ -7,8 +7,8 @@ Hey, thanks for wanting to help out! Really appreciate it.
 First things first, fork the repo and clone it:
 
 ```bash
-git clone https://github.com/zulfff/SubHost.git
-cd SubHost
+git clone https://github.com/zulfff/SubHost-demo.git
+cd SubHost-demo
 ```
 
 Make sure you got Rust installed (need 1.75+):
@@ -17,7 +17,12 @@ Make sure you got Rust installed (need 1.75+):
 rustc --version
 ```
 
-If not, grab it from [rustup.rs](https://rustup.rs).
+If not, grab it from [rustup.rs](https://rustup.rs). The formatting and lint
+commands also need the `rustfmt` and `clippy` components:
+
+```bash
+rustup component add rustfmt clippy
+```
 
 ## How to Contribute
 
@@ -31,16 +36,22 @@ git checkout -b my-awesome-feature
 
 Write code, break things, fix them, you know the drill.
 
-Before you commit, run these:
+Before you commit, run one heavy Cargo command at a time. On a machine with about
+4 GB RAM, use one compiler job:
 
 ```bash
-cargo check    # catch errors early
-cargo test     # make sure tests pass
-cargo fmt      # keep it pretty
-cargo clippy   # catch silly mistakes
+cargo fmt --all -- --check
+cargo check --workspace -j 1
+
+# Test and lint the package you changed; subhost-cli is an example.
+cargo test -p subhost-cli -j 1
+cargo clippy -p subhost-cli --all-targets -j 1 -- -D warnings
 ```
 
-Tests gotta pass. No exceptions.
+Replace `subhost-cli` with each package affected by your change. Do not run
+`cargo test --workspace` blindly on a low-memory machine: some test targets pull
+large EVM/WASM dependency graphs. The CI workflow shows the current safe
+multi-package test set.
 
 ### 3. Commit it
 
@@ -61,7 +72,7 @@ Go to GitHub, hit "New Pull Request", and tell us:
 
 We try to keep it simple:
 
-- Run `cargo fmt` before committing
+- Run `cargo fmt --all -- --check` before committing
 - Fix clippy warnings, don't ignore them
 - Document your public functions with `///` comments
 - Use `thiserror` or `anyhow` for errors

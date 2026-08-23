@@ -8,7 +8,7 @@ This document outlines the security assumptions, potential threats, and mitigati
 > & ed25519 signatures with BLS proof-of-possession, ChaCha20-Poly1305/X25519, an
 > in-memory mempool and state, a JSON-RPC server, and a libp2p scaffold. It does
 > **not** yet implement: an encrypted mempool, Dandelion++ routing, threshold
-> encryption / going, a production consensus loop, oracle / MEV defenses, an HSM
+> encryption / governance, a production consensus loop, oracle / MEV defenses, an HSM
 > program, or a bug bounty (there is none). Mitigations below should be read as the
 > roadmap, not as an assurance that they are live today.
 
@@ -215,7 +215,10 @@ Malicious code in dependencies or build process.
 | Reentrancy | Low | High | Medium |
 | Key compromise | Medium | Critical | High |
 
-## Monitoring and Response
+## Planned Monitoring and Response
+
+The repository does not deploy a production monitoring or incident-response
+system. The items below are operational goals for a future network.
 
 ### What We Monitor
 
@@ -251,19 +254,11 @@ vulnerability, report it privately to `security@subhost.xyz` — include the aff
 commit, exact file and line, impact, and reproduction steps. Please do not open a
 public issue for an undisclosed vulnerability.
 
-## Audit History
+## Audit Status
 
-| Auditor | Scope | Date | Status |
-|---------|-------|------|--------|
-| Trail of Bits | Consensus, Crypto | Q1 2026 | Scheduled |
-| OpenZeppelin | Smart Contracts, IBC | Q1 2026 | Scheduled |
-| Least Authority | ZK Circuits | Q2 2026 | Scheduled |
-
-## Acknowledgments
-
-Security research is ongoing. We thank the following researchers for responsible disclosures:
-
-- [List to be updated as reports come in]
+No completed third-party audit report is checked into this repository. Do not
+interpret previously proposed auditor names or dates as evidence of an engagement
+or completed review.
 
 ---
 

@@ -21,7 +21,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     Init {
-        #[arg(short, long)]
+        #[arg(long)]
         chain_id: Option<u64>,
         
         #[arg(short, long)]
@@ -84,7 +84,7 @@ enum WalletCommands {
     },
     
     Import {
-        #[arg(short, long)]
+        #[arg(long)]
         private_key: String,
         
         #[arg(short, long)]
@@ -123,10 +123,10 @@ enum QueryCommands {
     },
     
     Block {
-        #[arg(short, long)]
+        #[arg(long)]
         height: Option<u64>,
         
-        #[arg(short, long)]
+        #[arg(long)]
         hash: Option<String>,
     },
     
@@ -440,5 +440,47 @@ fn parse_address(s: &str) -> Result<Address, Box<dyn std::error::Error>> {
 mod dirs {
     pub fn home_dir() -> Option<std::path::PathBuf> {
         std::env::var("HOME").ok().map(std::path::PathBuf::from)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_has_no_argument_collisions() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn documented_commands_parse() {
+        assert!(Cli::try_parse_from([
+            "subhost",
+            "init",
+            "--chain-id",
+            "1",
+            "--data-dir",
+            "./data",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "subhost",
+            "query",
+            "block",
+            "--height",
+            "12345",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "subhost",
+            "wallet",
+            "import",
+            "--private-key",
+            "00",
+            "--password",
+            "test",
+        ])
+        .is_ok());
     }
 }

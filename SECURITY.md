@@ -16,8 +16,9 @@ keys, credentials, or production data.
 We will acknowledge reports within five business days and coordinate disclosure
 after a fix or mitigation is available.
 
-## Scope
+## Review Scope
 
-The production scope is limited to packages under `crates/`. The legacy
-`omnichain-*` and `explorer/` directories are not members of the root workspace
-and are not production artifacts.
+The maintained root-workspace scope is limited to packages under `crates/`. The
+legacy `omnichain-*` and `explorer/` directories are not members of the root
+workspace. No package in this repository should currently be treated as a
+production network deployment.

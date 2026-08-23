@@ -4,7 +4,7 @@ The SUB token is the design for the Subhost network.
 
 > **Status: this is a design specification, not a description of what is deployed.**
 > There is no live SUB token, and most of the mechanics below (staking rewards,
-> inflation, going, fee burn, governance voting) are **not implemented in the code**
+> inflation, fee burn, and governance voting) are **not implemented in the code**
 > in this repository. Numbers are planning targets and may change. Anything that
 > *is* partially implemented is called out inline.
 
@@ -19,7 +19,7 @@ The SUB token is the design for the Subhost network.
 | Treasury | 20% of inflation |
 | Burn Mechanism | 50% of fees burned |
 
-> The "aliquots" below allocate 100% of total supply; "initial circulation" of 15%
+> The allocations below assign 100% of total supply; "initial circulation" of 15%
 > refers to the portion unlocked at genesis. The rest is vested/locked and enters
 > circulation over time, which is why both figures can be consistent.
 
@@ -37,43 +37,48 @@ Allocation splits the **total** 1B supply (vested over time, not all circulating
 
 ### Vesting Schedule
 
-Team and investor tokens vest over 4 years. This means they can't dump everything at once and crash the price. Community tokens have shorter lockups or none at all.
+The design proposes four-year vesting for team and investor allocations, with
+shorter or no lockups for some community allocations. No vesting contract or
+live token distribution is implemented here.
 
 ## How Inflation Works
 
-Every year, new SUB tokens get created at 5% of the total supply. But this rate slowly drops over time. The idea is to bootstrap the network early when we need to incentivize validators and users, then taper off as the ecosystem matures.
+The design target starts annual issuance at 5% of total supply and tapers it over
+time. No issuance mechanism is implemented in this repository.
 
 ### Where Inflation Goes
 
-Most of it (70%) goes to validators and stakers as rewards for securing the network. The remaining 30% funds the treasury for ongoing development.
+The proposed split sends 70% of issuance to validators/stakers and 30% to the
+treasury. Reward and treasury distribution are not implemented.
 
 ## Staking Mechanics
 
-You can stake your SUB tokens to help secure the network and earn rewards. Here's how it works:
+The design proposes the following staking parameters:
 
 - **Minimum Validator Self-Stake**: 10,000,000 SUB (matches `subhost-consensus/src/staking.rs`)
-- **Minimum Delegation**: 1,000 SUB
+- **Minimum Delegation**: 1,000 SUB (design target; not enforced)
 - **Unbonding Period**: 14 days (design target; not yet enforced in code)
 - **Reward Distribution**: Per block (design target; no reward issuance implemented)
-- **Slashing**: You can lose part of your stake if your validator misbehaves
+- **Slashing**: a minimal in-memory module applies penalties for modeled evidence
 
 > Note: `subhost-consensus` has a minimal `StakingModule` (add validator / delegate /
 > slash) but **no** delegation-bonding, reward distribution, or unbonding is wired.
 
 ### Validator Economics
 
-Running a validator requires technical expertise and capital. Validators need to:
+The envisioned validator role would require operators to:
 
 - Maintain high uptime (99.9%+)
 - Stay synced with the network
 - Vote on proposals
 - Not get slashed for double-signing or downtime
 
-In return, validators earn commission on delegator rewards, typically 5-10%.
+The 5-10% validator commission range is a planning assumption, not implemented
+protocol behavior.
 
 ## Transaction Fees
 
-Every transaction costs a small fee paid in SUB. The fee depends on:
+The proposed fee model would charge SUB based on:
 
 - **Base Fee**: Fixed cost for including the transaction
 - **Compute Units**: How much processing power the tx needs
@@ -81,11 +86,12 @@ Every transaction costs a small fee paid in SUB. The fee depends on:
 
 ### Fee Burn
 
-Half of all transaction fees get burned (destroyed forever). This creates deflationary pressure that offsets some of the inflation. As network usage grows, more fees get burned, potentially making SUB deflationary overall.
+The design target burns half of transaction fees. No fee-burn accounting is
+implemented.
 
 ## Governance
 
-SUB holders can vote on protocol changes. Your voting power equals your staked balance. Things you can vote on:
+The governance design proposes stake-weighted voting for:
 
 - Protocol upgrades
 - Parameter changes (fees, inflation rate, etc.)
@@ -94,16 +100,20 @@ SUB holders can vote on protocol changes. Your voting power equals your staked b
 
 ### Proposal Process
 
-1. Anyone can submit a proposal (costs 100 SUB, refunded if passed)
-2. Community discusses for 2 weeks
-3. Voting period lasts 1 week
-4. If 50%+ of staked tokens vote and majority approves, it passes
+1. Anyone can submit a proposal (proposed deposit: 100 SUB, refunded if passed)
+2. Community discussion lasts two weeks
+3. Voting lasts one week
+4. A proposal passes if the proposed quorum and majority thresholds are met
+
+These timings, deposits, and stake-weighted rules are not enforced by the current
+governance scaffold.
 
 ## Economic Attacks and Defenses
 
 ### Nothing at Stake
 
-In pure PoS, validators could theoretically validate multiple conflicting chains without cost. We prevent this with:
+In a future PoS network, validators could validate multiple conflicting chains
+without cost. Planned mitigations include:
 
 - Slashing for double-signing
 - Inactivity leaks for offline validators
@@ -111,7 +121,8 @@ In pure PoS, validators could theoretically validate multiple conflicting chains
 
 ### Long Range Attacks
 
-An attacker could buy old private keys and rewrite history. We defend against this with:
+An attacker could buy old private keys and rewrite history. Planned mitigations
+include:
 
 - Weak subjectivity (social consensus on checkpoints)
 - Validator set rotation
@@ -119,19 +130,16 @@ An attacker could buy old private keys and rewrite history. We defend against th
 
 ### Sybil Resistance
 
-Creating fake identities is cheap. We require stake to participate, making Sybil attacks economically prohibitive.
+Creating fake identities is cheap. Requiring stake is the planned Sybil-resistance
+mechanism; it is not enforced by a running network here.
 
 ## Token Utility
 
-### Current Uses
+### Proposed Uses
 
-- Pay for transaction fees
-- Stake to earn rewards
-- Vote on governance
-- Collateral for DeFi apps
-
-### Future Uses
-
+- Pay transaction fees
+- Stake for rewards and governance weight
+- Serve as collateral in future applications
 - Pay for storage on the network
 - Tip validators for priority inclusion
 - Access premium features
