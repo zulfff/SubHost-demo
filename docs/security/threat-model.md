@@ -6,7 +6,8 @@ This document outlines the security assumptions, potential threats, and mitigati
 > full surface we intend to defend. Many listed artifacts in this document are
 > **design goals, not current features**. Today the codebase implements: BLS12-381
 > & ed25519 signatures with BLS proof-of-possession, ChaCha20-Poly1305/X25519, an
-> in-memory mempool and state, a JSON-RPC server, and a libp2p scaffold. It does
+> a bounded mempool, persistent single-node state/blocks, a JSON-RPC server, and a
+> libp2p scaffold. It does
 > **not** yet implement: an encrypted mempool, Dandelion++ routing, threshold
 > encryption / governance, a production consensus loop, oracle / MEV defenses, an HSM
 > program, or a bug bounty (there is none). Mitigations below should be read as the

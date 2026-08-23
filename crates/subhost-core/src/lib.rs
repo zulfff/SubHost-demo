@@ -225,9 +225,25 @@ pub mod hex {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn hex_decode_rejects_non_ascii_without_panicking() {
         assert!(super::hex::decode("aéb").is_err());
+    }
+
+    #[test]
+    fn genesis_allocations_round_trip_full_u128_range() {
+        let mut genesis = GenesisConfig::default();
+        genesis
+            .allocations
+            .insert(Address::new([1; ADDRESS_SIZE]), u128::MAX);
+        let encoded = serde_json::to_string(&genesis).unwrap();
+        let decoded: GenesisConfig = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.allocations.get(&Address::new([1; ADDRESS_SIZE])),
+            Some(&u128::MAX)
+        );
     }
 }
 
@@ -235,10 +251,62 @@ mod tests {
 pub struct GenesisConfig {
     pub chain_id: u64,
     pub initial_validators: Vec<ValidatorInfo>,
+    #[serde(with = "genesis_allocations")]
     pub allocations: std::collections::HashMap<Address, u128>,
     pub block_time_ms: u64,
     pub gas_limit: u64,
     pub genesis_time: u64,
+}
+
+mod genesis_allocations {
+    use super::{Address, ADDRESS_SIZE};
+    use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::HashMap;
+
+    #[derive(Serialize, Deserialize)]
+    struct Allocation {
+        address: String,
+        balance: String,
+    }
+
+    pub fn serialize<S>(allocations: &HashMap<Address, u128>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut values: Vec<_> = allocations
+            .iter()
+            .map(|(address, balance)| Allocation {
+                address: address.to_string(),
+                balance: balance.to_string(),
+            })
+            .collect();
+        values.sort_by(|left, right| left.address.cmp(&right.address));
+        values.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<Address, u128>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let values = Vec::<Allocation>::deserialize(deserializer)?;
+        let mut allocations = HashMap::with_capacity(values.len());
+        for value in values {
+            let raw = value
+                .address
+                .strip_prefix("0x")
+                .ok_or_else(|| D::Error::custom("allocation address must start with 0x"))?;
+            let bytes = hex::decode(raw).map_err(D::Error::custom)?;
+            let bytes: [u8; ADDRESS_SIZE] = bytes
+                .try_into()
+                .map_err(|_| D::Error::custom("allocation address must be 20 bytes"))?;
+            let address = Address::new(bytes);
+            let balance = value.balance.parse::<u128>().map_err(D::Error::custom)?;
+            if allocations.insert(address, balance).is_some() {
+                return Err(D::Error::custom("duplicate genesis allocation"));
+            }
+        }
+        Ok(allocations)
+    }
 }
 
 impl Default for GenesisConfig {

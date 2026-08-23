@@ -27,6 +27,7 @@ hex = { workspace = true }
 primitive-types = { workspace = true }
 bincode = { workspace = true }
 ed25519-dalek = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

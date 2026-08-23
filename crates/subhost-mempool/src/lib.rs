@@ -55,23 +55,32 @@ impl Mempool {
         }
     }
 
-    fn tx_hash(tx: &Transaction) -> Hash {
+    pub fn transaction_hash(tx: &Transaction) -> Hash {
         let encoded = bincode::serialize(tx).expect("transaction serialization cannot fail");
         Hash::from_data(&encoded)
     }
 
     pub fn add(&mut self, tx: Transaction) -> Result<Hash, MempoolError> {
+        Ok(self.add_with_eviction(tx)?.0)
+    }
+
+    /// Add a transaction and return any transaction displaced by replacement or
+    /// capacity eviction so callers can roll back a failed higher-level commit.
+    pub fn add_with_eviction(
+        &mut self,
+        tx: Transaction,
+    ) -> Result<(Hash, Option<Transaction>), MempoolError> {
         if tx.data.len() > self.config.max_tx_data_bytes {
             return Err(MempoolError::DataTooLarge {
                 provided: tx.data.len(),
                 max: self.config.max_tx_data_bytes,
             });
         }
-        let hash = Self::tx_hash(&tx);
+        let hash = Self::transaction_hash(&tx);
 
         // Idempotent: an identical tx already in the pool.
         if self.txs.contains_key(&hash) {
-            return Ok(hash);
+            return Ok((hash, None));
         }
 
         if tx.gas_limit == 0 {
@@ -88,6 +97,7 @@ impl Mempool {
 
         let sender = tx.from;
         let nonce = tx.nonce;
+        let mut displaced = None;
 
         // (1) If a tx already occupies (sender, nonce), only a strictly higher
         // gas price may replace it. Peek at it without holding a borrow across mutation.
@@ -100,10 +110,10 @@ impl Mempool {
             let existing_price = self.txs.get(&existing_hash).map(|t| t.gas_price).unwrap_or(0);
             if tx.gas_price <= existing_price {
                 // Keep the existing, higher-or-equal priority tx.
-                return Ok(existing_hash);
+                return Ok((existing_hash, None));
             }
             // New tx outbids: drop the old tx for this (sender, nonce).
-            self.txs.remove(&existing_hash);
+            displaced = self.txs.remove(&existing_hash);
             if let Some(m) = self.by_sender.get_mut(&sender) {
                 m.remove(&nonce);
             }
@@ -119,7 +129,10 @@ impl Mempool {
 
         // (3) Global capacity: evict the globally lowest-priority tx before inserting.
         if self.txs.len() >= self.config.max_pending {
-            self.evict_lowest_priority()?;
+            let evicted = self.evict_lowest_priority()?;
+            if displaced.is_none() {
+                displaced = evicted;
+            }
         }
 
         // (4) Insert.
@@ -127,7 +140,7 @@ impl Mempool {
         self.txs.insert(hash, tx);
         debug!("Mempool add: sender={} nonce={} pool_size={}", sender, nonce, self.txs.len());
 
-        Ok(hash)
+        Ok((hash, displaced))
     }
 
     /// Called by the block producer once a tx is included on-chain (or expires).
@@ -146,6 +159,11 @@ impl Mempool {
 
     pub fn get(&self, tx_hash: &Hash) -> Option<&Transaction> {
         self.txs.get(tx_hash)
+    }
+
+    pub fn get_by_sender_nonce(&self, sender: &Address, nonce: Nonce) -> Option<(Hash, Transaction)> {
+        let hash = self.by_sender.get(sender)?.get(&nonce).copied()?;
+        self.txs.get(&hash).cloned().map(|tx| (hash, tx))
     }
 
     pub fn len(&self) -> usize {
@@ -179,7 +197,7 @@ impl Mempool {
             .and_then(|max| max.checked_add(1))
     }
 
-    fn evict_lowest_priority(&mut self) -> Result<(), MempoolError> {
+    fn evict_lowest_priority(&mut self) -> Result<Option<Transaction>, MempoolError> {
         // Lowest gas price; tie-break to keep the chain clean (drop the highest
         // nonce among the cheapest) so a proposer can keep continuity.
         let victim = self
@@ -194,8 +212,9 @@ impl Mempool {
 
         match victim {
             Some(hash) => {
+                let transaction = self.txs.get(&hash).cloned();
                 self.remove(&hash);
-                Ok(())
+                Ok(transaction)
             }
             None => Err(MempoolError::Full),
         }
@@ -283,6 +302,18 @@ mod tests {
         assert_eq!(pool.len(), 3);
         // The high-priority tx must survive eviction.
         assert!(pool.pending().iter().any(|t| t.gas_price == 100));
+    }
+
+    #[test]
+    fn add_with_eviction_returns_displaced_transaction() {
+        let mut pool = Mempool::new(MempoolConfig {
+            max_pending: 1,
+            ..Default::default()
+        });
+        let low = tx(1, 0, 1);
+        pool.add(low.clone()).unwrap();
+        let (_, displaced) = pool.add_with_eviction(tx(2, 0, 100)).unwrap();
+        assert_eq!(displaced.unwrap().gas_price, low.gas_price);
     }
 
     #[test]

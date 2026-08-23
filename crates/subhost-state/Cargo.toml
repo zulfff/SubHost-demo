@@ -17,3 +17,4 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }
+bincode = { workspace = true }

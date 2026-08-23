@@ -26,6 +26,9 @@ enum Commands {
         
         #[arg(short, long)]
         data_dir: Option<PathBuf>,
+
+        #[arg(long = "alloc", value_name = "ADDRESS=BALANCE")]
+        allocations: Vec<String>,
     },
     
     Node {
@@ -37,6 +40,9 @@ enum Commands {
         
         #[arg(short, long, default_value = "0.0.0.0:30333")]
         listen: String,
+
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
     },
     
     Wallet {
@@ -173,12 +179,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     
     match cli.command {
-        Commands::Init { chain_id, data_dir } => {
-            init_genesis(chain_id, data_dir).await?;
+        Commands::Init { chain_id, data_dir, allocations } => {
+            init_genesis(chain_id, data_dir, allocations).await?;
         }
         
-        Commands::Node { validator, bootnodes, listen } => {
-            run_node(validator, bootnodes, listen).await?;
+        Commands::Node { validator, bootnodes, listen, data_dir } => {
+            run_node(validator, bootnodes, listen, data_dir).await?;
         }
         
         Commands::Wallet { cmd } => {
@@ -204,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn init_genesis(
     chain_id: Option<u64>,
     data_dir: Option<PathBuf>,
+    allocations: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let data_dir = data_dir.unwrap_or_else(|| {
         dirs::home_dir()
@@ -214,10 +221,22 @@ async fn init_genesis(
     
     std::fs::create_dir_all(&data_dir)?;
     
+    let mut parsed_allocations = std::collections::HashMap::new();
+    for allocation in allocations {
+        let (address, balance) = allocation
+            .split_once('=')
+            .ok_or("allocation must use ADDRESS=BALANCE")?;
+        let address = parse_address(address)?;
+        let balance = balance.parse::<u128>()?;
+        if parsed_allocations.insert(address, balance).is_some() {
+            return Err("duplicate genesis allocation".into());
+        }
+    }
+
     let genesis = subhost_core::GenesisConfig {
         chain_id: chain_id.unwrap_or(1),
         initial_validators: vec![],
-        allocations: std::collections::HashMap::new(),
+        allocations: parsed_allocations,
         block_time_ms: 1000,
         gas_limit: 30_000_000,
         genesis_time: std::time::SystemTime::now()
@@ -249,6 +268,7 @@ async fn run_node(
     validator: bool,
     bootnodes: Vec<String>,
     listen: String,
+    data_dir: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         "Starting Subhost node (validator={}, bootnodes={:?}). Exposing JSON-RPC on {}",
@@ -257,11 +277,35 @@ async fn run_node(
         listen
     );
 
-    // Honest scope: this starts the JSON-RPC endpoint on `--listen`, wired to a
-    // real in-memory mempool + state. P2P/consensus block production are not yet
-    // wired into the CLI, so no real network module is spawned here.
+    let data_dir = data_dir.unwrap_or_else(|| {
+        dirs::home_dir()
+            .expect("home directory")
+            .join(".subhost")
+            .join("data")
+    });
+    let genesis = {
+        let genesis_path = data_dir.join("genesis.json");
+        if genesis_path.is_file() {
+            let content = std::fs::read_to_string(genesis_path)?;
+            Some(serde_json::from_str::<subhost_core::GenesisConfig>(&content)?)
+        } else {
+            None
+        }
+    };
+    let chain_id = genesis.as_ref().map(|genesis| genesis.chain_id).unwrap_or(1);
     let addr: std::net::SocketAddr = listen.parse()?;
-    let state = subhost_rpc::RpcState::new(1);
+    let state = subhost_rpc::RpcState::with_data_dir(chain_id, &data_dir)?;
+    if state.block_height() == 0 && !state.has_persisted_state() {
+        if let Some(genesis) = &genesis {
+            state.seed_accounts(
+                genesis
+                    .allocations
+                    .iter()
+                    .map(|(address, balance)| (*address, *balance)),
+            )?;
+        }
+    }
+    tracing::info!("Using chain {} and persistent data directory {}", chain_id, data_dir.display());
     let server = subhost_rpc::RpcServer::new(state);
     server.run(addr).await?;
 
@@ -462,6 +506,8 @@ mod tests {
             "1",
             "--data-dir",
             "./data",
+            "--alloc",
+            "0x1111111111111111111111111111111111111111=1000000",
         ])
         .is_ok());
         assert!(Cli::try_parse_from([
@@ -480,6 +526,15 @@ mod tests {
             "00",
             "--password",
             "test",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "subhost",
+            "node",
+            "--listen",
+            "127.0.0.1:8545",
+            "--data-dir",
+            "./data",
         ])
         .is_ok());
     }

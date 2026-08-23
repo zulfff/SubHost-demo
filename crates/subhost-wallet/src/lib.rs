@@ -6,6 +6,11 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use std::io::Write;
+use tempfile::NamedTempFile;
+
+const WALLET_VERSION: u32 = 1;
+const MAX_WALLET_FILE_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum WalletError {
@@ -32,6 +37,15 @@ pub enum WalletError {
 
     #[error("Wallet address does not match the decrypted private key")]
     AddressMismatch,
+
+    #[error("Password must contain at least 8 characters")]
+    WeakPassword,
+
+    #[error("Unsupported wallet version: {0}")]
+    UnsupportedVersion(u32),
+
+    #[error("Wallet file exceeds the maximum size")]
+    FileTooLarge,
 }
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
@@ -59,6 +73,7 @@ pub struct Wallet {
 
 impl Wallet {
     pub fn new(password: &str) -> Result<Self, WalletError> {
+        validate_password(password)?;
         let mut rng = rand::thread_rng();
         let mut private_key = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rng, &mut private_key);
@@ -73,11 +88,12 @@ impl Wallet {
             encrypted_key,
             salt,
             nonce,
-            version: 1,
+            version: WALLET_VERSION,
         })
     }
     
     pub fn from_private_key(private_key_hex: &str, password: &str) -> Result<Self, WalletError> {
+        validate_password(password)?;
         let private_key_hex = private_key_hex.trim_start_matches("0x");
         let bytes = subhost_core::hex::decode(private_key_hex)
             .map_err(|_| WalletError::InvalidPrivateKey)?;
@@ -99,19 +115,40 @@ impl Wallet {
             encrypted_key,
             salt,
             nonce,
-            version: 1,
+            version: WALLET_VERSION,
         })
     }
     
     pub fn save(&self, path: &Path) -> Result<(), WalletError> {
+        if self.version != WALLET_VERSION {
+            return Err(WalletError::UnsupportedVersion(self.version));
+        }
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
         let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
+        let mut temp = NamedTempFile::new_in(parent)?;
+        temp.write_all(json.as_bytes())?;
+        temp.as_file().sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            temp.as_file().set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        temp.persist(path).map_err(|error| error.error)?;
+        std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     }
     
     pub fn load(path: &Path, password: &str) -> Result<(Self, PrivateKey), WalletError> {
+        validate_password(password)?;
+        if std::fs::metadata(path)?.len() > MAX_WALLET_FILE_BYTES {
+            return Err(WalletError::FileTooLarge);
+        }
         let json = std::fs::read_to_string(path)?;
         let wallet: Wallet = serde_json::from_str(&json)?;
+        if wallet.version != WALLET_VERSION {
+            return Err(WalletError::UnsupportedVersion(wallet.version));
+        }
         let private_key = decrypt_private_key(
             &wallet.encrypted_key,
             &wallet.salt,
@@ -127,6 +164,13 @@ impl Wallet {
     pub fn address(&self) -> &str {
         &self.address
     }
+}
+
+fn validate_password(password: &str) -> Result<(), WalletError> {
+    if password.chars().count() < 8 {
+        return Err(WalletError::WeakPassword);
+    }
+    Ok(())
 }
 
 fn derive_address(private_key: &[u8; 32]) -> Address {
@@ -243,5 +287,26 @@ mod tests {
         let pk = PrivateKey([42u8; 32]);
         let addr = derive_address(&pk.0);
         assert_eq!(addr, Address::from_public_key(&pk.public_key()));
+    }
+
+    #[test]
+    fn rejects_weak_passwords() {
+        assert!(matches!(Wallet::new("short"), Err(WalletError::WeakPassword)));
+        assert!(matches!(
+            Wallet::from_private_key(&"11".repeat(32), "short"),
+            Err(WalletError::WeakPassword)
+        ));
+    }
+
+    #[test]
+    fn round_trip_uses_atomic_wallet_file() {
+        let wallet = Wallet::new("correct horse").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        wallet.save(&path).unwrap();
+        let (loaded, key) = Wallet::load(&path, "correct horse").unwrap();
+        assert_eq!(loaded.address(), wallet.address());
+        assert_eq!(loaded.version, WALLET_VERSION);
+        assert_eq!(loaded.address(), derive_address(&key.0).to_string());
     }
 }

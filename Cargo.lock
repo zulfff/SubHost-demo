@@ -5616,6 +5616,7 @@ dependencies = [
  "subhost-crypto",
  "subhost-mempool",
  "subhost-state",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-test",
@@ -5628,6 +5629,7 @@ dependencies = [
 name = "subhost-state"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "serde",
  "subhost-core",
  "thiserror 1.0.69",

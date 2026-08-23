@@ -29,7 +29,7 @@ impl Account {
 /// Previously this crate was an empty template that kept a requests counter and
 /// never held any state, so RPC `eth_getBalance` could only return a fabricated
 /// `0x0`. This is a real (if not yet disk-persisted) state store.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct State {
     accounts: HashMap<Address, Account>,
     chain_id: ChainId,
@@ -79,6 +79,39 @@ impl State {
 
     pub fn account_count(&self) -> usize {
         self.accounts.len()
+    }
+
+    pub fn snapshot(&self) -> StateSnapshot {
+        let mut accounts: Vec<_> = self
+            .accounts
+            .iter()
+            .map(|(address, account)| (*address, account.clone()))
+            .collect();
+        accounts.sort_by(|(left, _), (right, _)| left.as_bytes().cmp(right.as_bytes()));
+        StateSnapshot {
+            chain_id: self.chain_id,
+            accounts,
+        }
+    }
+
+    pub fn from_snapshot(snapshot: StateSnapshot) -> Result<Self, StateError> {
+        if snapshot.chain_id == 0 {
+            return Err(StateError::InvalidTransaction(
+                "chain ID cannot be zero".to_string(),
+            ));
+        }
+        let mut accounts = HashMap::with_capacity(snapshot.accounts.len());
+        for (address, account) in snapshot.accounts {
+            if accounts.insert(address, account).is_some() {
+                return Err(StateError::InvalidTransaction(
+                    "state snapshot contains duplicate accounts".to_string(),
+                ));
+            }
+        }
+        Ok(Self {
+            accounts,
+            chain_id: snapshot.chain_id,
+        })
     }
 
     /// Fund `to` debiting `from`. Returns an error if `from` has insufficient funds.
@@ -141,10 +174,7 @@ impl State {
                 self.debit_balance(tx.from, fee)?;
             }
             TransactionType::ContractCall | TransactionType::ContractCreation => {
-                // Require enough balance for the gas fee only; bytecode execution is
-                // handled by the EVM/WASM engines (not wired here yet).
-                self.ensure_balance(&tx.from, fee)?;
-                self.debit_balance(tx.from, fee)?;
+                return Err(StateError::UnsupportedTransactionType(tx.tx_type));
             }
             _ => {
                 return Err(StateError::UnsupportedTransactionType(tx.tx_type));
@@ -172,6 +202,12 @@ impl State {
         self.accounts.entry(address).or_default().balance = balance - amount;
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSnapshot {
+    pub chain_id: ChainId,
+    pub accounts: Vec<(Address, Account)>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -319,5 +355,25 @@ mod tests {
             state.add_account(addr(1), 1),
             Err(StateError::BalanceOverflow { address }) if address == addr(1)
         ));
+    }
+
+    #[test]
+    fn snapshot_is_deterministic_and_rejects_duplicate_accounts() {
+        let mut first = State::new();
+        first.set_balance(addr(2), 20);
+        first.set_balance(addr(1), 10);
+        let mut second = State::new();
+        second.set_balance(addr(1), 10);
+        second.set_balance(addr(2), 20);
+        assert_eq!(
+            bincode::serialize(&first.snapshot()).unwrap(),
+            bincode::serialize(&second.snapshot()).unwrap()
+        );
+
+        let snapshot = StateSnapshot {
+            chain_id: 1,
+            accounts: vec![(addr(1), Account::new(10)), (addr(1), Account::new(20))],
+        };
+        assert!(State::from_snapshot(snapshot).is_err());
     }
 }

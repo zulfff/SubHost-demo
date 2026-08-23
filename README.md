@@ -30,8 +30,8 @@
 | **Consensus** (`subhost-consensus`) | Scaffold: DAG + HotStuff structs, staking sets, quorum checks. **No full consensus loop / block production yet** |
 | **Networking** (`subhost-network`) | Scaffold: libp2p swarm (gossipsub/kad/mdns/ping) wired for publish. **Message dispatch is minimal** |
 | **Mempool** (`subhost-mempool`) | Real: per-sender nonce pool, gas-price ordering, capacity eviction, replace-by-nonce, dedupe |
-| **State** (`subhost-state`) | Real (in-memory): accounts, balances, nonce/replay enforcement, transfer execution |
-| **JSON-RPC** (`subhost-rpc`) | Real subset: `eth_chainId`, `eth_blockNumber`, `eth_getBalance` (reads state), `eth_sendTransaction` (inserts into mempool), `eth_gasPrice`, `net_version`; `eth_getTransactionReceipt` returns `null` (no confirmation backend yet) |
+| **State** (`subhost-state`) | Real account rules: balances, nonce/replay enforcement, transfer execution; node snapshots it to disk |
+| **JSON-RPC** (`subhost-rpc`) | Real single-node subset: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, signed `eth_sendTransaction`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`, `eth_gasPrice`, `net_version`; transfers execute into local blocks |
 | **WASM / EVM / zk** | **Not implemented** — crates are placeholders |
 | **IBC / Governance / Storage / P2P / Metrics / Faucet** | Partial / scaffolded; not production-ready |
 
@@ -112,8 +112,9 @@ The examples below use the binaries produced by that debug build:
 ./target/debug/subhost query validators
 
 # Node operations
-./target/debug/subhost init --chain-id 1 --data-dir ./data
-./target/debug/subhost node --listen 127.0.0.1:8545
+./target/debug/subhost init --chain-id 1 --data-dir ./data \
+  --alloc 0x1111111111111111111111111111111111111111=1000000
+./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
 ```
 
 `wallet` writes encrypted files under `~/.subhost/wallets`. The transaction,
@@ -125,8 +126,12 @@ table before treating their output as an on-chain action.
 
 - Ethereum-shaped JSON-RPC subset on the address passed to `node --listen`
   (the quick start below uses `127.0.0.1:8545`)
-- Methods: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`, `eth_gasPrice`, `net_version`
-- `eth_getTransactionReceipt` returns `null` (no confirmation backend yet)
+- Methods: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`,
+  `eth_getTransactionReceipt`, `eth_getBlockByNumber`, `eth_gasPrice`, `net_version`
+- `eth_sendTransaction` validates the signature, balance, chain ID, and nonce, then
+  executes the transfer into the next local block and returns its transaction hash
+- `eth_getTransactionReceipt` returns a real receipt after local block inclusion;
+  unknown hashes return `null`
 - `eth_sendTransaction` is **not** standard Ethereum: it requires an extra
   `"publicKey"` (32-byte hex ed25519 public key) and `"signature"` (64-byte hex
   ed25519 signature over the bincode-serialized unsigned transaction). Unsigned or
@@ -135,6 +140,8 @@ table before treating their output as an on-chain action.
 
 ### Wallet & Key Management
 - AES-256-GCM encryption with **scrypt** key derivation _(implemented in `subhost-wallet`)_
+- Wallet files are written atomically, capped at 1 MiB, and use `0600` permissions on Unix
+- Passwords must contain at least 8 characters
 - Note: "PBKDF2" and HD/BIP-39/BIP-44 derivation are **not implemented** — private keys are raw 32-byte values, encrypted at rest.
 
 ### Docker Compose Reference
@@ -196,10 +203,11 @@ cd SubHost-demo
 cargo build -p subhost-cli -j 1
 
 # Initialize genesis state (writes ./data/genesis.json)
-./target/debug/subhost init --chain-id 1 --data-dir ./data
+./target/debug/subhost init --chain-id 1 --data-dir ./data \
+  --alloc 0x1111111111111111111111111111111111111111=1000000
 
-# Run a node (currently: exposes the JSON-RPC endpoint; no P2P/consensus yet)
-./target/debug/subhost node --listen 127.0.0.1:8545
+# Run a persistent single-node producer (no P2P/consensus yet)
+./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
 ```
 
 In another terminal, verify the RPC server:
@@ -213,9 +221,11 @@ curl -s http://127.0.0.1:8545 \
 Expected result: a JSON-RPC response whose `result` is `"0x1"`.
 
 The generated genesis currently has no validators and fails the core validator
-check; the running CLI node does not load that file yet. `init` is therefore a
-file-generation demo, not network bootstrap. The `--validator`, `--bootnodes`,
-and global `--config` flags are parsed but do not activate those systems yet.
+check, so it is not valid bootstrap data for a multi-node consensus network.
+The current single-node CLI still reads its chain ID and allocations from this
+file before starting the local producer. `init` plus `node` is therefore a
+single-node demo, not network bootstrap. The `--validator`, `--bootnodes`, and
+global `--config` flags are parsed but do not activate those systems yet.
 
 For an optimized CLI binary, use the narrower release build below. The workspace
 release profile uses fat LTO and one codegen unit, so it is slower and more

@@ -75,8 +75,9 @@ Contoh menjalankan demo:
 
 ```bash
 cargo build -p subhost-cli -j 1
-./target/debug/subhost init --chain-id 1 --data-dir ./data
-./target/debug/subhost node --listen 127.0.0.1:8545
+./target/debug/subhost init --chain-id 1 --data-dir ./data \
+  --alloc 0x1111111111111111111111111111111111111111=1000000
+./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
 ```
 
 Lalu dari terminal lain:
@@ -91,9 +92,9 @@ Respons yang diharapkan adalah `"0x1"`. Ini membuktikan endpoint hidup dan
 memproses request. Ini belum membuktikan bahwa jaringan blockchain sudah
 memproduksi blok.
 
-Catatan penting untuk demo: aturan `apply_transaction` memang ada di crate state,
-tetapi saat ini belum dipanggil oleh block producer. Alur node yang aktif berhenti
-di mempool; eksekusi state masih diuji sebagai komponen terpisah.
+Catatan penting untuk demo: ini adalah single-node producer, bukan konsensus
+antar-node. Setelah transaksi lolos validasi, node langsung membuat blok lokal,
+mengubah state, membuat receipt, dan menulis ledger ke `node-state.bin`.
 
 ## Slide 5 - Implementasi yang Sudah Ada
 
@@ -112,24 +113,24 @@ transaksi yang terlalu besar. Ia juga menangani nonce per pengirim, penggantian
 transaksi dengan nonce sama jika gas price lebih tinggi, deduplikasi, batas per
 pengirim, dan eviksi transaksi dengan prioritas paling rendah ketika penuh.
 
-**State.** State saat ini berada di memori. Untuk transfer, state memeriksa chain
-ID, nonce yang tepat, saldo yang cukup untuk nilai transfer dan gas, lalu menaikkan
-nonce agar transaksi yang sama tidak dapat dipakai ulang.
+**State.** State menjalankan transfer dengan memeriksa chain ID, nonce yang tepat,
+saldo yang cukup untuk nilai transfer dan gas, lalu menaikkan nonce agar transaksi
+yang sama tidak dapat dipakai ulang. Node menyimpan snapshot state dan blok ke disk
+secara atomic agar bisa dipulihkan setelah restart.
 
 **JSON-RPC.** Subset method yang tersedia antara lain `eth_chainId`,
 `eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`, `eth_gasPrice`, dan
-`net_version`. `eth_sendTransaction` memeriksa signature Ed25519 dan memasukkan
-transaksi valid ke mempool.
+`net_version`. `eth_sendTransaction` memeriksa signature Ed25519, memasukkan
+transaksi valid ke mempool, lalu producer single-node mengeksekusinya ke blok
+lokal jika state dan persistence berhasil ditulis.
 
 ## Slide 6 - Bagian yang Belum Boleh Disebut Selesai
 
 Di sini batasannya penting.
 
-Perintah `node` saat ini menyalakan JSON-RPC dengan state dan mempool in-memory.
-CLI belum menyalakan jaringan P2P dan belum menjalankan loop produksi blok.
-Artinya transaksi bisa diterima sebagai transaksi pending, tetapi belum ada
-proses yang mengonfirmasi transaksi itu menjadi blok. Karena itu,
-`eth_getTransactionReceipt` mengembalikan `null`.
+Perintah `node` saat ini menyalakan JSON-RPC dengan single-node block producer.
+Transaksi valid diproses menjadi blok lokal dan bisa dicari receipt-nya. Namun,
+CLI belum menyalakan jaringan P2P dan belum menjalankan loop konsensus antar-node.
 
 Modul konsensus sudah punya struktur DAG, HotStuff, quorum, dan staking, tetapi
 belum menjadi loop konsensus produksi yang berjalan antar-node.
@@ -149,6 +150,8 @@ Untuk keamanan, kami memulai dari validasi yang paling dekat dengan data dan
 transaksi.
 
 - Private key wallet dienkripsi saat disimpan, bukan ditulis sebagai teks biasa.
+- File wallet ditulis secara atomic, dibatasi ukurannya, dan di Unix memakai permission `0600`.
+- Password wallet minimal delapan karakter.
 - RPC menolak signature yang tidak cocok dengan public key atau alamat pengirim.
 - RPC menolak chain ID yang salah dan nonce yang tidak sesuai state.
 - Mempool memberi batas pada ukuran data, gas, kapasitas antrean, dan prioritas.
@@ -180,13 +183,11 @@ tetapi mengurangi risiko proses compiler berebut memori dan terkena OOM.
 Prioritas berikutnya kami susun berdasarkan urutan dependensi, bukan berdasarkan
 jumlah fitur di slide.
 
-1. Menyambungkan transaksi dari wallet atau client sampai ke node dengan signature
-   dan nonce yang benar.
-2. Menambahkan penyimpanan state yang persisten, sehingga data tidak hilang saat
-   proses berhenti.
-3. Menghubungkan mempool ke producer dan eksekutor blok.
-4. Menjalankan loop konsensus dan komunikasi antar-node secara nyata.
-5. Setelah alur dasar stabil, baru mengembangkan eksekusi EVM/WASM, metrics,
+1. Menyambungkan wallet atau client agar dapat membentuk signature dan nonce yang
+   benar tanpa payload manual.
+2. Menambah validasi dan recovery ledger untuk crash, disk penuh, dan korupsi file.
+3. Menjalankan loop konsensus dan komunikasi antar-node secara nyata.
+4. Setelah alur dasar stabil, baru mengembangkan eksekusi EVM/WASM, metrics,
    governance, dan fitur lintas-chain.
 
 Urutan ini penting. Smart contract dan benchmark tidak banyak artinya kalau
@@ -195,10 +196,10 @@ transaksi belum bisa masuk blok dan state belum bisa dipulihkan setelah restart.
 ## Slide 10 - Penutup
 
 SubHost adalah project yang sedang membangun fondasi blockchain node dengan Rust.
-Saat ini kami sudah memiliki tipe data inti, kriptografi, mempool, state in-memory,
-dan JSON-RPC yang bisa dijalankan serta diuji.
+Saat ini kami sudah memiliki tipe data inti, kriptografi, mempool, state, single-node
+block producer, persistence dasar, dan JSON-RPC yang bisa dijalankan serta diuji.
 
-Di sisi lain, produksi blok, P2P, konsensus antar-node, persistence, dan eksekusi
+Di sisi lain, P2P, konsensus antar-node, persistence yang tahan crash, dan eksekusi
 smart contract belum selesai. Kami memilih menyampaikan batasan ini secara jelas
 supaya hasil project dapat dinilai dari kode dan pengujian yang benar-benar ada.
 
@@ -211,13 +212,15 @@ Wassalamualaikum warahmatullahi wabarakatuh.
 
 **"Apakah ini sudah blockchain yang berjalan penuh?"**
 
-Belum. Yang sudah berjalan adalah node JSON-RPC dengan mempool dan state in-memory.
-Loop P2P, produksi blok, dan finalisasi konsensus belum tersambung ke CLI.
+Belum. Yang sudah berjalan adalah single-node JSON-RPC dengan mempool, block
+producer lokal, state, receipt, dan persistence dasar. P2P dan finalisasi konsensus
+antar-node belum tersambung ke CLI.
 
-**"Kenapa receipt masih `null`?"**
+**"Kapan receipt masih `null`?"**
 
-Karena belum ada block producer dan confirmation pipeline. Transaksi bisa masuk
-ke mempool, tetapi belum ada proses yang memasukkannya ke blok dan membuat receipt.
+Untuk hash yang belum ditemukan, receipt memang `null`. Untuk transaksi valid yang
+sudah diproses oleh single-node producer, receipt berisi hash blok, tinggi blok,
+gas, status, dan daftar log.
 
 **"Kenapa tidak memakai Docker untuk demo?"**
 
