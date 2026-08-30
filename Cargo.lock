@@ -892,7 +892,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3698,7 +3698,7 @@ dependencies = [
  "serde",
  "subhost-core",
  "subhost-crypto",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -3712,7 +3712,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3727,7 +3727,7 @@ dependencies = [
  "ed25519-dalek 3.0.0",
  "rand 0.8.8",
  "sha3",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "x25519-dalek",
  "zeroize",
 ]
@@ -3748,7 +3748,7 @@ dependencies = [
  "subhost-telemetry",
  "subhost-wallet",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -3769,7 +3769,7 @@ dependencies = [
  "subhost-telemetry",
  "subhost-wallet",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tower-http",
  "tracing",
@@ -3782,7 +3782,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subhost-core",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -3791,7 +3791,7 @@ name = "subhost-mempool"
 version = "0.1.0"
 dependencies = [
  "subhost-core",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -3801,7 +3801,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "prometheus",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -3814,7 +3814,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subhost-core",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -3828,7 +3828,7 @@ dependencies = [
  "subhost-rpc",
  "subhost-storage",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -3847,7 +3847,7 @@ dependencies = [
  "subhost-state",
  "subhost-storage",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
 ]
@@ -3859,7 +3859,7 @@ dependencies = [
  "bincode",
  "serde",
  "subhost-core",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3872,7 +3872,7 @@ dependencies = [
  "subhost-core",
  "subhost-state",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tracing",
 ]
 
@@ -3880,7 +3880,7 @@ dependencies = [
 name = "subhost-telemetry"
 version = "0.1.0"
 dependencies = [
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3898,7 +3898,7 @@ dependencies = [
  "serde_json",
  "subhost-core",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "zeroize",
 ]
 
