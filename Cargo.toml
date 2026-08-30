@@ -90,7 +90,7 @@ prometheus = { version = "0.13", default-features = false }
 
 # Utilities
 clap = { version = "4.4", features = ["derive"] }
-dashmap = "5.5"
+dashmap = "6.2"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 hdrhistogram = "7.5"
