@@ -1,19 +1,22 @@
 [package]
 name = "subhost-storage"
-version = "0.1.0"
-edition = "2021"
-authors = ["Subhost Labs <dev@subhost.io>"]
-license = "Apache-2.0"
-description = "subhost-storage component of Subhost Web3 protocol"
-repository = "https://github.com/subhost-labs/subhost-web3"
-rust-version = "1.75"
+description = "Crash-safe ledger persistence for Subhost Web3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-subhost-core = { path = "../subhost-core" }
+subhost-core = { workspace = true }
+subhost-state = { workspace = true }
+bincode = { workspace = true }
+blake3 = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-tokio-test = { workspace = true }
+tracing = { workspace = true }

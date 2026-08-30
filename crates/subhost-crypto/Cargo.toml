@@ -1,29 +1,25 @@
 [package]
 name = "subhost-crypto"
-version = "0.1.0"
-edition = "2021"
-authors = ["Subhost Labs <dev@subhost.io>"]
-license = "Apache-2.0"
-description = "subhost-crypto component of Subhost Web3 protocol"
-repository = "https://github.com/subhost-labs/subhost-web3"
-rust-version = "1.75"
+description = "BLS12-381, ed25519, X25519 and AEAD primitives for Subhost Web3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-subhost-core = { path = "../subhost-core" }
-serde = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-thiserror = { workspace = true }
 ark-bls12-381 = { workspace = true }
 ark-ec = { workspace = true }
 ark-ff = { workspace = true }
 ark-serialize = { workspace = true }
-rand = { workspace = true }
 chacha20poly1305 = { workspace = true }
-zeroize = { workspace = true }
-sha3 = { workspace = true }
 ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+sha3 = { workspace = true }
+thiserror = { workspace = true }
 x25519-dalek = { workspace = true }
-
-[dev-dependencies]
-tokio-test = { workspace = true }
+zeroize = { workspace = true }

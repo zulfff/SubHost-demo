@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SubHost Monitor</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101214;
+      --panel: #181b1f;
+      --panel-raised: #20252a;
+      --line: #30363d;
+      --text: #f0f2f4;
+      --muted: #9ca5ad;
+      --green: #55d187;
+      --amber: #f2b861;
+      --red: #ff7d72;
+      --cyan: #6fc8d9;
+      --shadow: 0 12px 30px rgba(0, 0, 0, .2);
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 Inter, ui-sans-serif, system-ui, sans-serif; }
+    button, input { font: inherit; }
+    .shell { max-width: 1440px; margin: 0 auto; padding: 28px 24px 48px; }
+    .topbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 26px; }
+    .eyebrow { color: var(--cyan); font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+    h1, h2, p { margin: 0; }
+    h1 { margin-top: 5px; font-size: clamp(28px, 4vw, 44px); line-height: 1.05; letter-spacing: 0; }
+    h2 { font-size: 15px; letter-spacing: 0; }
+    .subtitle { color: var(--muted); margin-top: 9px; max-width: 670px; }
+    .connection { display: flex; align-items: center; gap: 9px; color: var(--muted); white-space: nowrap; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 4px rgba(242,184,97,.12); }
+    .dot.ok { background: var(--green); box-shadow: 0 0 0 4px rgba(85,209,135,.12); }
+    .dot.bad { background: var(--red); box-shadow: 0 0 0 4px rgba(255,125,114,.12); }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 18px; }
+    .stat, .panel { border: 1px solid var(--line); background: var(--panel); box-shadow: var(--shadow); }
+    .stat { padding: 17px 18px; min-height: 100px; }
+    .stat-label { color: var(--muted); font-size: 12px; }
+    .stat-value { display: block; margin-top: 8px; font-size: 25px; font-weight: 700; }
+    .stat-note { color: var(--muted); font-size: 11px; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(330px, .85fr); gap: 18px; }
+    .panel { min-width: 0; }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 17px 18px; border-bottom: 1px solid var(--line); }
+    .panel-head span { color: var(--muted); font-size: 12px; }
+    .panel-body { padding: 0; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 680px; }
+    th, td { padding: 13px 18px; border-bottom: 1px solid rgba(48,54,61,.72); text-align: left; vertical-align: middle; }
+    th { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; }
+    td { font-size: 13px; }
+    tr:last-child td { border-bottom: 0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .hash { color: var(--cyan); cursor: pointer; }
+    .hash:hover { text-decoration: underline; }
+    .badge { display: inline-flex; align-items: center; gap: 6px; border: 1px solid rgba(85,209,135,.3); color: var(--green); padding: 3px 7px; font-size: 11px; }
+    .badge::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+    .empty, .error { padding: 30px 18px; color: var(--muted); }
+    .error { color: var(--red); }
+    .blocks { display: grid; gap: 1px; background: var(--line); }
+    .block-row { display: grid; grid-template-columns: 72px minmax(0, 1fr) 88px; gap: 12px; align-items: center; padding: 14px 18px; background: var(--panel); }
+    .block-number { color: var(--amber); font-weight: 700; }
+    .block-meta { min-width: 0; }
+    .block-meta .mono { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .block-time { color: var(--muted); font-size: 11px; text-align: right; }
+    .detail { margin-top: 18px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; padding: 18px; }
+    .detail-item { border: 1px solid var(--line); background: var(--panel-raised); padding: 12px; min-width: 0; }
+    .detail-label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 5px; }
+    .detail-value { overflow-wrap: anywhere; }
+    .refresh { border: 1px solid var(--line); background: transparent; color: var(--text); padding: 7px 10px; cursor: pointer; }
+    .refresh:hover { border-color: var(--cyan); color: var(--cyan); }
+    .transfer-panel { margin-bottom: 18px; }
+    .transfer-form { padding: 18px; }
+    .transfer-grid { display: grid; grid-template-columns: 1fr 1fr 150px 180px auto; gap: 10px; align-items: end; }
+    .field { display: grid; gap: 6px; min-width: 0; }
+    .field label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+    select, input { width: 100%; min-height: 38px; border: 1px solid var(--line); background: var(--panel-raised); color: var(--text); padding: 8px 10px; outline: none; }
+    select:focus, input:focus { border-color: var(--cyan); }
+    .send-button { min-height: 38px; border: 1px solid var(--green); background: var(--green); color: #07120b; padding: 8px 14px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+    .send-button:disabled { cursor: wait; opacity: .65; }
+    .transfer-help { margin-top: 12px; color: var(--muted); font-size: 11px; }
+    .account-status { color: var(--muted); font-size: 12px; }
+    .success { color: var(--green); }
+    .footnote { color: var(--muted); font-size: 11px; margin-top: 18px; }
+    @media (max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+    @media (max-width: 1100px) { .transfer-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .send-button { width: 100%; } }
+    @media (max-width: 680px) { .shell { padding: 22px 14px 36px; } .topbar { flex-direction: column; } .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); } .stat { min-height: 86px; padding: 14px; } .stat-value { font-size: 21px; } .panel-head { padding: 14px; } th, td { padding-left: 14px; padding-right: 14px; } }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">SubHost / Live Network Monitor</div>
+        <h1 id="chain-name">Connecting...</h1>
+        <p class="subtitle">Pantau block terbaru, transfer antar-wallet, dan hash transaksi dari node lokal secara langsung.</p>
+      </div>
+      <div class="connection"><span id="status-dot" class="dot"></span><span id="status-text">Menghubungkan</span></div>
+    </header>
+
+    <section class="stats" aria-label="Network statistics">
+      <div class="stat"><span class="stat-label">Block terbaru</span><strong id="height" class="stat-value">-</strong><span class="stat-note">local producer</span></div>
+      <div class="stat"><span class="stat-label">Transaksi terpantau</span><strong id="tx-count" class="stat-value">-</strong><span class="stat-note">12 block terakhir</span></div>
+      <div class="stat"><span class="stat-label">Transfer native</span><strong id="transfer-count" class="stat-value">-</strong><span class="stat-note">masuk ke block</span></div>
+      <div class="stat"><span class="stat-label">Polling</span><strong id="last-update" class="stat-value">-</strong><span class="stat-note">refresh tiap 2 detik</span></div>
+    </section>
+
+    <section class="panel transfer-panel">
+      <div class="panel-head"><h2>Transfer antar akun</h2><span id="transfer-status">Demo lokal</span></div>
+      <form id="transfer-form" class="transfer-form">
+        <div class="transfer-grid">
+          <div class="field"><label for="from-account">Dari</label><select id="from-account" required><option value="">Memuat akun...</option></select></div>
+          <div class="field"><label for="to-account">Ke</label><select id="to-account" required><option value="">Memuat akun...</option></select></div>
+          <div class="field"><label for="amount">Jumlah</label><input id="amount" inputmode="numeric" pattern="[0-9]+" value="100" required></div>
+          <div class="field"><label for="password">Password demo</label><input id="password" type="password" autocomplete="off" placeholder="alice-pass-123" required></div>
+          <button id="send-button" class="send-button" type="submit">Kirim transfer</button>
+        </div>
+        <p id="account-status" class="transfer-help">Akun demo akan muncul setelah wallet setup terbaca.</p>
+      </form>
+    </section>
+
+    <section class="layout">
+      <div>
+        <section class="panel">
+          <div class="panel-head"><h2>Aktivitas transaksi</h2><span id="activity-note">Menunggu data</span></div>
+          <div class="panel-body table-wrap">
+            <table>
+              <thead><tr><th>Hash</th><th>From</th><th>To</th><th>Value</th><th>Block</th><th>Status</th></tr></thead>
+              <tbody id="tx-body"><tr><td colspan="6" class="empty">Belum ada transaksi.</td></tr></tbody>
+            </table>
+          </div>
+        </section>
+        <section class="panel detail">
+          <div class="panel-head"><h2>Detail transaksi</h2><span id="detail-note">Klik hash di tabel</span></div>
+          <div id="detail-grid" class="detail-grid"><div class="empty">Pilih transaksi untuk melihat receipt.</div></div>
+        </section>
+      </div>
+      <aside class="panel">
+        <div class="panel-head"><h2>Block terbaru</h2><button id="refresh" class="refresh" type="button">Refresh</button></div>
+        <div id="blocks" class="blocks"><div class="empty">Belum ada block.</div></div>
+        <p class="footnote">Dashboard ini membaca JSON-RPC node. Contract event ERC-20 dan swap DEX belum tersedia di node demo.</p>
+      </aside>
+    </section>
+  </main>
+
+  <script>
+    const state = { snapshot: null, accounts: [], seen: new Set(), selected: null };
+    const $ = (id) => document.getElementById(id);
+    const short = (value, left = 8, right = 6) => value && value.length > left + right ? `${value.slice(0, left)}...${value.slice(-right)}` : (value || "-");
+    const hexToNumber = (value) => typeof value === "string" && value.startsWith("0x") ? parseInt(value, 16) : Number(value || 0);
+    const formatValue = (value) => `${Number(value || 0).toLocaleString("id-ID")} unit`;
+    const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[char]));
+
+    function setConnection(ok, message) {
+      $("status-dot").className = `dot ${ok ? "ok" : "bad"}`;
+      $("status-text").textContent = message;
+    }
+
+    function renderBlocks(blocks) {
+      $("blocks").innerHTML = blocks.length ? blocks.map((block) => `
+        <div class="block-row">
+          <div class="block-number">#${block.number}</div>
+          <div class="block-meta"><span class="mono hash" data-hash="${escapeHtml(block.hash)}">${escapeHtml(short(block.hash, 12, 8))}</span><span class="stat-note">${block.transaction_count} transaksi · gas ${escapeHtml(block.gas_used)}</span></div>
+          <div class="block-time">${escapeHtml(hexToNumber(block.timestamp))}</div>
+        </div>`).join("") : `<div class="empty">Belum ada block.</div>`;
+    }
+
+    function renderTransactions(transactions) {
+      $("tx-body").innerHTML = transactions.length ? transactions.map((tx) => `
+        <tr>
+          <td><span class="mono hash tx-link" data-hash="${escapeHtml(tx.hash)}">${escapeHtml(short(tx.hash))}</span></td>
+          <td class="mono">${escapeHtml(short(tx.from))}</td>
+          <td class="mono">${escapeHtml(short(tx.to))}</td>
+          <td>${escapeHtml(formatValue(tx.value))}</td>
+          <td class="mono">#${tx.block_number}</td>
+          <td><span class="badge">confirmed</span></td>
+        </tr>`).join("") : `<tr><td colspan="6" class="empty">Belum ada transaksi.</td></tr>`;
+      $("activity-note").textContent = transactions.length ? `${transactions.length} transaksi` : "Belum ada data";
+      document.querySelectorAll(".tx-link").forEach((element) => element.addEventListener("click", () => selectTransaction(element.dataset.hash)));
+    }
+
+    function setDemoPassword() {
+      const selected = $("from-account").selectedOptions[0];
+      const label = selected?.dataset.label || "";
+      const defaults = { alice: "alice-pass-123", bob: "bob-pass-123" };
+      $("password").value = defaults[label] || "";
+    }
+
+    function renderAccounts(accounts) {
+      state.accounts = accounts;
+      const options = accounts.map((account) => `<option value="${escapeHtml(account.address)}" data-label="${escapeHtml(account.label)}">${escapeHtml(account.label)} · ${escapeHtml(formatValue(account.balance))}</option>`).join("");
+      $("from-account").innerHTML = options || `<option value="">Tidak ada akun demo</option>`;
+      $("to-account").innerHTML = options || `<option value="">Tidak ada akun demo</option>`;
+      if (accounts.length > 1) $("to-account").selectedIndex = 1;
+      $("account-status").textContent = accounts.length ? `${accounts.length} akun demo siap dipakai · saldo otomatis diperbarui` : "Wallet demo belum ditemukan";
+      $("from-account").disabled = !accounts.length;
+      $("to-account").disabled = !accounts.length;
+      $("send-button").disabled = accounts.length < 2;
+      setDemoPassword();
+    }
+
+    async function loadAccounts() {
+      try {
+        const response = await fetch("/api/accounts", { cache: "no-store" });
+        const accounts = await response.json();
+        if (!response.ok) throw new Error(accounts.error || "Wallet demo tidak tersedia");
+        renderAccounts(accounts);
+      } catch (error) {
+        $("account-status").textContent = error.message;
+        $("send-button").disabled = true;
+      }
+    }
+
+    async function selectTransaction(hash) {
+      $("detail-note").textContent = "Memuat receipt...";
+      try {
+        const response = await fetch(`/api/tx/${encodeURIComponent(hash)}`);
+        const receipt = await response.json();
+        if (!response.ok || receipt === null) throw new Error(receipt.error || "Receipt tidak ditemukan");
+        $("detail-grid").innerHTML = [["Transaction hash", receipt.transactionHash], ["Block", hexToNumber(receipt.blockNumber)], ["Block hash", receipt.blockHash], ["Status", receipt.status === "0x1" ? "Success" : receipt.status], ["Gas used", hexToNumber(receipt.gasUsed)], ["Index", hexToNumber(receipt.transactionIndex)]].map(([label, value]) => `<div class="detail-item"><span class="detail-label">${escapeHtml(label)}</span><span class="detail-value mono">${escapeHtml(value)}</span></div>`).join("");
+        $("detail-note").textContent = "Receipt ditemukan";
+      } catch (error) {
+        $("detail-grid").innerHTML = `<div class="error">${escapeHtml(error.message)}</div>`;
+        $("detail-note").textContent = "Gagal memuat";
+      }
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/snapshot", { cache: "no-store" });
+        const snapshot = await response.json();
+        if (!response.ok) throw new Error(snapshot.error || "Node tidak merespons");
+        const isNewBlock = state.snapshot && snapshot.height > state.snapshot.height;
+        state.snapshot = snapshot;
+        $("chain-name").textContent = snapshot.chain_name;
+        $("height").textContent = snapshot.height;
+        $("tx-count").textContent = snapshot.transactions.length;
+        $("transfer-count").textContent = snapshot.transactions.filter((tx) => tx.kind === "transfer").length;
+        $("last-update").textContent = new Date(snapshot.updated_at).toLocaleTimeString("id-ID");
+        setConnection(true, isNewBlock ? "Block baru masuk" : "Node tersambung");
+        renderBlocks(snapshot.blocks);
+        renderTransactions(snapshot.transactions);
+        await loadAccounts();
+      } catch (error) {
+        setConnection(false, "Node tidak tersambung");
+        $("activity-note").textContent = error.message;
+      }
+    }
+
+    $("from-account").addEventListener("change", setDemoPassword);
+    $("transfer-form").addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = $("send-button");
+      button.disabled = true;
+      $("transfer-status").textContent = "Mengirim...";
+      try {
+        const response = await fetch("/api/transfer", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ from: $("from-account").value, to: $("to-account").value, amount: $("amount").value, password: $("password").value }) });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || "Transfer gagal");
+        $("transfer-status").innerHTML = `<span class="success">Berhasil · ${escapeHtml(short(result.hash, 12, 8))}</span>`;
+        await refresh();
+        await selectTransaction(result.hash);
+      } catch (error) {
+        $("transfer-status").textContent = error.message;
+      } finally {
+        button.disabled = state.accounts.length < 2;
+      }
+    });
+
+    $("refresh").addEventListener("click", refresh);
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>

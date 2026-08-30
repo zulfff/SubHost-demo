@@ -45,19 +45,26 @@ Bahasa utama yang kami gunakan adalah **Rust**. Alasannya praktis: Rust punya
 kontrol memori yang kuat, performanya baik, dan banyak kesalahan bisa ditangkap
 saat compile sebelum program dijalankan.
 
-Project ini memakai satu Cargo workspace dengan 23 crate. Setiap crate punya
-tanggung jawab yang lebih sempit, misalnya:
+Project ini memakai satu Cargo workspace dengan 17 crate. Setiap crate punya
+tanggung jawab yang sempit:
 
 - `subhost-core` menyimpan tipe inti seperti address, hash, transaksi, dan blok;
 - `subhost-crypto` menangani tanda tangan dan komponen dasar kriptografi;
+- `subhost-wallet` mengenkripsi dan membuka private key;
 - `subhost-mempool` mengatur antrean transaksi yang belum masuk blok;
 - `subhost-state` mengatur saldo dan nonce akun;
-- `subhost-rpc` menyediakan endpoint JSON-RPC;
+- `subhost-storage` menulis ledger ke disk secara aman terhadap crash;
+- `subhost-rpc` menyediakan endpoint JSON-RPC dan block producer single-node;
+- `subhost-node` merangkai genesis, ledger, RPC, dan metrics menjadi satu node;
 - `subhost-cli` menjadi pintu masuk perintah dari terminal.
 
+Jumlah crate-nya pernah 23. Tujuh di antaranya ternyata hanya salinan template
+yang sama dengan nama tipe berbeda, tidak dipakai crate mana pun, dan tidak
+mengerjakan apa pun. Ketujuh crate itu kami hapus. Menyisakannya hanya akan
+membuat workspace terlihat lebih besar daripada isinya.
+
 Pemisahan ini bukan sekadar supaya struktur folder terlihat rapi. Kalau aturan
-mempool berubah, kami bisa menguji perubahan itu tanpa harus mengubah seluruh
-node. Batas antarbagian juga lebih mudah diperiksa saat code review.
+mempool berubah, kami bisa menguji perubahan itu tanpa mengubah seluruh node.
 
 ## Slide 4 - Alur Sistem yang Saat Ini Bisa Didemokan
 
@@ -74,7 +81,7 @@ Alur yang benar-benar sudah tersambung sekarang adalah sebagai berikut:
 Contoh menjalankan demo:
 
 ```bash
-cargo build -p subhost-cli -j 1
+cargo build -p subhost-cli
 ./target/debug/subhost init --chain-id 1 --data-dir ./data \
   --alloc 0x1111111111111111111111111111111111111111=1000000
 ./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
@@ -83,14 +90,12 @@ cargo build -p subhost-cli -j 1
 Lalu dari terminal lain:
 
 ```bash
-curl -s http://127.0.0.1:8545 \
-  -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+./target/debug/subhost query chain
 ```
 
-Respons yang diharapkan adalah `"0x1"`. Ini membuktikan endpoint hidup dan
-memproses request. Ini belum membuktikan bahwa jaringan blockchain sudah
-memproduksi blok.
+Hasilnya menampilkan `chain_id` dan `height`. Ini membuktikan endpoint hidup dan
+memproses request. Ini belum membuktikan ada kesepakatan antar-node, karena
+memang hanya ada satu node.
 
 Catatan penting untuk demo: ini adalah single-node producer, bukan konsensus
 antar-node. Setelah transaksi lolos validasi, node langsung membuat blok lokal,
@@ -118,11 +123,21 @@ saldo yang cukup untuk nilai transfer dan gas, lalu menaikkan nonce agar transak
 yang sama tidak dapat dipakai ulang. Node menyimpan snapshot state dan blok ke disk
 secara atomic agar bisa dipulihkan setelah restart.
 
-**JSON-RPC.** Subset method yang tersedia antara lain `eth_chainId`,
-`eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`, `eth_gasPrice`, dan
-`net_version`. `eth_sendTransaction` memeriksa signature Ed25519, memasukkan
-transaksi valid ke mempool, lalu producer single-node mengeksekusinya ke blok
-lokal jika state dan persistence berhasil ditulis.
+**Storage.** Ledger ditulis ke file sementara, di-fsync, di-rename secara atomic,
+lalu direktorinya juga di-fsync. Saat dibaca ulang, file diperiksa ukuran, magic,
+versi, checksum BLAKE3, dan chain ID-nya, kemudian seluruh commitment blok dan
+receipt dihitung ulang terhadap state yang dipulihkan. File yang rusak ditolak,
+bukan dimuat setengah-setengah.
+
+**JSON-RPC.** Tersedia sepuluh method: `eth_chainId`, `net_version`,
+`eth_blockNumber`, `eth_gasPrice`, `eth_getBalance`, `eth_getTransactionCount`,
+`eth_sendTransaction`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`, dan
+`eth_getTransactionByHash`. `eth_sendTransaction` memeriksa signature Ed25519 dan
+mengikat public key ke alamat pengirim, lalu producer single-node mengeksekusi dan
+menulis ledger sebelum state di memori diubah.
+
+**Metrics.** `subhost node --metrics-addr` menyalakan exporter Prometheus dengan
+`/metrics` dan `/health`, dan melaporkan tinggi blok serta kedalaman mempool.
 
 ## Slide 6 - Bagian yang Belum Boleh Disebut Selesai
 
@@ -135,28 +150,45 @@ CLI belum menyalakan jaringan P2P dan belum menjalankan loop konsensus antar-nod
 Modul konsensus sudah punya struktur DAG, HotStuff, quorum, dan staking, tetapi
 belum menjadi loop konsensus produksi yang berjalan antar-node.
 
-Crate EVM, WASM, dan zero-knowledge masih berupa kerangka atau modul terpisah.
-Perintah `contract deploy` dan `contract call` di CLI belum mengeksekusi bytecode.
-Modul network, storage, metrics, faucet, IBC, dan governance juga masih parsial
-dan belum bisa dianggap sebagai layanan production-ready.
+EVM, WASM, zero-knowledge, dan governance tidak ada di repository ini. Sebelumnya
+ada crate dengan nama itu, tetapi isinya template kosong, jadi kami hapus dan
+sekarang README menyebutkan terus terang bahwa keempatnya belum dikerjakan.
+Perintah `contract deploy` dan `contract call` juga kami hapus dari CLI: keduanya
+hanya mencetak satu baris log lalu melaporkan sukses.
 
-Jadi kesimpulan teknisnya: SubHost sekarang adalah **fondasi node dan API yang
-memiliki beberapa komponen nyata**, bukan testnet publik dan bukan cloud
-terdesentralisasi yang sudah siap dipakai.
+`subhost-network` sudah bisa mengirim dan menerima pesan gossip, tetapi belum ada
+node yang memakainya untuk menyebarkan blok. `subhost-ibc` menjalankan state
+machine paket secara lokal, tetapi belum memverifikasi proof dari chain lain.
+
+Semua endpoint jaringan juga belum punya autentikasi maupun TLS, jadi harus
+dijalankan di loopback atau di belakang proxy.
+
+Jadi kesimpulan teknisnya: SubHost sekarang adalah **blockchain single-node yang
+benar-benar berjalan**, bukan jaringan terdistribusi dan bukan cloud
+terdesentralisasi yang siap dipakai.
 
 ## Slide 7 - Keamanan yang Sudah Diperhatikan
 
 Untuk keamanan, kami memulai dari validasi yang paling dekat dengan data dan
 transaksi.
 
-- Private key wallet dienkripsi saat disimpan, bukan ditulis sebagai teks biasa.
-- File wallet ditulis secara atomic, dibatasi ukurannya, dan di Unix memakai permission `0600`.
-- Password wallet minimal delapan karakter.
+- Private key wallet dienkripsi dengan scrypt dan AES-256-GCM, bukan teks biasa.
+- File wallet ditulis atomic, dibatasi ukurannya, dan permission `0600` di-set
+  sebelum key ditulis, bukan sesudahnya.
+- Saat dibuka, alamat di file harus cocok dengan private key hasil dekripsi.
 - RPC menolak signature yang tidak cocok dengan public key atau alamat pengirim.
 - RPC menolak chain ID yang salah dan nonce yang tidak sesuai state.
-- Mempool memberi batas pada ukuran data, gas, kapasitas antrean, dan prioritas.
-- BLS menyediakan proof of possession agar agregasi signature tidak menerima
-  kunci yang tidak terbukti dimiliki.
+- Semua aritmetika saldo dan nonce memakai `checked_*`; overflow jadi error.
+- Mempool membatasi ukuran data, gas, kapasitas antrean, dan prioritas.
+- Registrasi validator wajib menyertakan proof of possession, supaya agregasi BLS
+  tidak bisa diserang dengan rogue key.
+- Quorum certificate hanya diterima kalau cukup banyak validator berbeda yang
+  sudah terdaftar masing-masing memberi signature yang valid. Sebelumnya fungsi
+  ini selalu mengembalikan `false`, jadi tidak pernah bisa dipakai.
+- Slashing sekarang benar-benar memotong stake. Sebelumnya jumlah potongan
+  dihitung lalu dikembalikan tanpa pernah dikurangkan.
+- Faucet sekarang menandatangani dan mengirim transfer sungguhan. Sebelumnya ia
+  mengembalikan hash palsu hasil hash alamat dan waktu, tanpa transaksi apa pun.
 
 Kami juga menulis test untuk aturan-aturan tersebut. Tetapi ini perlu disebut
 jelas: test internal bukan pengganti audit keamanan pihak ketiga. Threat model
@@ -167,41 +199,59 @@ mitigasinya sudah aktif di jaringan produksi.
 
 Pengujian kami dibagi menjadi beberapa tingkat.
 
-Pertama, compile check untuk memastikan seluruh workspace lolos pemeriksaan
-compiler.
-Kedua, unit test pada crate seperti CLI, mempool, state, dan crypto.
-Ketiga, smoke test: jalankan node, kirim request JSON-RPC, dan cek responsnya.
-Keempat, kami cek kondisi repository dengan build package yang memang punya
-binary, bukan menganggap semua contoh di dokumentasi pasti sudah aktif.
+Pertama, `cargo fmt` dan `cargo clippy` untuk seluruh workspace dengan
+`-D warnings`. Satu peringatan saja membuat build gagal.
+Kedua, unit test di setiap crate: 202 test yang menguji jalur gagal, bukan hanya
+jalur sukses. Ada test untuk file ledger yang di-bit-flip, replay nonce, overflow
+saldo, signature dari kunci lain, dan input yang tidak valid.
+Ketiga, smoke test end-to-end: jalankan node, buat wallet, kirim transfer, cek
+receipt, restart node, dan pastikan saldo tetap.
+Keempat, `cargo deny` untuk memeriksa advisory keamanan, lisensi, dan sumber
+dependency.
 
-Karena mesin pengembangan hanya memiliki sekitar 4 GB RAM, build dijalankan
-dengan satu job Cargo, misalnya `cargo build ... -j 1`. Ini memang lebih lambat,
-tetapi mengurangi risiko proses compiler berebut memori dan terkena OOM.
+Semua itu dijalankan otomatis di CI sebagai tujuh job wajib, termasuk pemeriksaan
+versi Rust minimum dan release build.
+
+Karena mesin pengembangan hanya sekitar 4 GB RAM, `.cargo/config.toml` membatasi
+build ke dua job. Lebih lambat, tetapi tidak kena OOM.
 
 ## Slide 9 - Rencana Pengembangan
 
 Prioritas berikutnya kami susun berdasarkan urutan dependensi, bukan berdasarkan
 jumlah fitur di slide.
 
-1. Menyambungkan wallet atau client agar dapat membentuk signature dan nonce yang
-   benar tanpa payload manual.
-2. Menambah validasi dan recovery ledger untuk crash, disk penuh, dan korupsi file.
-3. Menjalankan loop konsensus dan komunikasi antar-node secara nyata.
-4. Setelah alur dasar stabil, baru mengembangkan eksekusi EVM/WASM, metrics,
-   governance, dan fitur lintas-chain.
+Dua hal pertama di rencana sebelumnya sudah selesai: CLI kini membentuk signature
+dan mengambil nonce sendiri dari node, dan ledger sudah punya checksum, penulisan
+atomic, serta validasi penuh saat dibaca ulang.
 
-Urutan ini penting. Smart contract dan benchmark tidak banyak artinya kalau
-transaksi belum bisa masuk blok dan state belum bisa dipulihkan setelah restart.
+Yang berikutnya:
+
+1. Menjalankan loop konsensus dan menyambungkan gossip antar-node, memakai
+   primitif quorum yang sudah ada dan sudah diuji.
+2. Membuat satu blok bisa memuat lebih dari satu transaksi.
+3. Mengganti state root dengan struktur Merkle supaya bisa membuat proof.
+4. Memverifikasi proof light client untuk IBC.
+5. Setelah alur dasar stabil, baru eksekusi smart contract.
+
+Urutan ini penting. Smart contract tidak banyak artinya kalau blok belum bisa
+disepakati antar-node.
 
 ## Slide 10 - Penutup
 
-SubHost adalah project yang sedang membangun fondasi blockchain node dengan Rust.
-Saat ini kami sudah memiliki tipe data inti, kriptografi, mempool, state, single-node
-block producer, persistence dasar, dan JSON-RPC yang bisa dijalankan serta diuji.
+SubHost adalah blockchain single-node yang berjalan, ditulis dengan Rust. Yang
+sudah ada dan bisa diuji: tipe data inti, kriptografi, wallet terenkripsi,
+mempool, aturan state, block producer, ledger yang tahan crash, JSON-RPC dengan
+signature wajib, exporter metrics, CLI, faucet, dan explorer.
 
-Di sisi lain, P2P, konsensus antar-node, persistence yang tahan crash, dan eksekusi
-smart contract belum selesai. Kami memilih menyampaikan batasan ini secara jelas
-supaya hasil project dapat dinilai dari kode dan pengujian yang benar-benar ada.
+Yang belum: konsensus antar-node, penyebaran blok, dan eksekusi smart contract.
+
+Selama pengerjaan ini kami juga menghapus 51 file yang tidak pernah ter-compile
+dan memperbaiki empat fungsi yang terlihat bekerja tetapi sebenarnya tidak: quorum
+certificate yang selalu ditolak, quorum DAG yang mengukur hal yang salah, slashing
+yang tidak memotong apa pun, dan faucet yang mengembalikan hash palsu.
+
+Kami memilih menyampaikan batasan ini secara jelas supaya hasil project dinilai
+dari kode dan pengujian yang benar-benar ada.
 
 Terima kasih atas perhatian Bapak/Ibu dan teman-teman. Kami siap menerima
 pertanyaan dan masukan.
@@ -212,9 +262,9 @@ Wassalamualaikum warahmatullahi wabarakatuh.
 
 **"Apakah ini sudah blockchain yang berjalan penuh?"**
 
-Belum. Yang sudah berjalan adalah single-node JSON-RPC dengan mempool, block
-producer lokal, state, receipt, dan persistence dasar. P2P dan finalisasi konsensus
-antar-node belum tersambung ke CLI.
+Sebagai satu node, ya: transaksi ditandatangani, diverifikasi, dieksekusi, masuk
+blok, dan ledger-nya bertahan setelah restart. Sebagai jaringan, belum: belum ada
+konsensus antar-node dan belum ada penyebaran blok.
 
 **"Kapan receipt masih `null`?"**
 
@@ -222,11 +272,13 @@ Untuk hash yang belum ditemukan, receipt memang `null`. Untuk transaksi valid ya
 sudah diproses oleh single-node producer, receipt berisi hash blok, tinggi blok,
 gas, status, dan daftar log.
 
-**"Kenapa tidak memakai Docker untuk demo?"**
+**"Apakah Docker-nya bisa dipakai?"**
 
-Docker di repository masih berupa referensi arsitektur dan belum menjadi testnet
-yang bisa langsung dijalankan. Untuk demo, binary CLI dengan `-j 1` lebih jelas dan
-lebih ringan untuk mesin RAM 4 GB.
+Bisa. `docker compose up --build` menyalakan satu node, explorer, dan Prometheus.
+Semua port hanya dibuka di loopback dan container berjalan sebagai user biasa
+dengan filesystem read-only. Tetap satu node, bukan testnet multi-node, karena
+block producer-nya memang single-node. Untuk demo di kelas, binary CLI lebih
+ringan di mesin 4 GB.
 
 **"Apa bukti fitur ini sudah ada?"**
 

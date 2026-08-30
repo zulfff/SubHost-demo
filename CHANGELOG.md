@@ -1,185 +1,220 @@
 # Changelog
 
-This file records the concrete changes made during the audit-and-hardening pass on
-this repository. Every entry below was actually applied and verified with
-`cargo check --workspace` and targeted `cargo test`. Anything **not** listed was
-left as-is.
+All notable changes to this repository. Every entry below was applied and
+verified; nothing is aspirational.
 
-Verification at the end of the pass: `cargo check --workspace` is clean (0
-errors, 0 warnings) and the following test suites pass:
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
+this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-- `subhost-crypto`: 7 tests
-- `subhost-consensus`: 5 tests
-- `subhost-mempool`: 7 tests
-- `subhost-state`: 8 tests
-- `subhost-rpc`: 2 tests
-- `subhost-ibc`: 5 tests
+## [Unreleased]
 
----
+Full-repository audit and hardening pass. Verified with `cargo fmt --all
+--check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+(clean), and `cargo test --workspace --all-features` (all suites green).
 
-## 1. Crypto (`subhost-crypto`)
+### Removed
 
-- **Implemented `key_exchange` (X25519).** It was a stub returning all-zero keys
-  and all-zero shared secrets. Now generates real X25519 keypairs and computes
-  real Diffie-Hellman shared secrets via `x25519-dalek`.
-- **Added `shared_secret_checked`** (contributory-behavior enforcement): rejects
-  all-zero/low-order peer public keys and all-zero shared secrets with
-  `CryptoError::InvalidPublicKey`. The plain `shared_secret` is kept for
-  compatibility and documented as unsafe for untrusted peers.
-- **Added BLS proof-of-possession** (`proof_of_possession` / `verify_possession`)
-  to prevent the classic rogue-key attack when aggregating public keys.
-- **Added domain separation** in `hash_to_g2` (now SHA3-384 with a fixed domain
-  tag instead of SHA3-256 with none).
-- New `CryptoError::InvalidPublicKey` variant.
-- `Cargo.toml`: added `x25519-dalek` dependency.
+- **10 orphan `omnichain-*` directories.** Duplicated the `subhost-*` crates,
+  were not workspace members, and were compiled by nothing.
+- **34 dead files in `subhost-core`.** `module1.rs` through `module10.rs` and the
+  `constants/`, `primitives/`, `types/`, `utils/` trees were never declared as
+  modules and never compiled. Each was a copy of the same `{ id, value }` struct.
+- **7 placeholder crates.** `subhost-types`, `subhost-utils`, `subhost-p2p`,
+  `subhost-evm`, `subhost-wasm`, `subhost-zk`, and `subhost-governance` were
+  byte-identical copies of one `Config`/`Module`/`Error` template with a renamed
+  type, had no consumer anywhere in the workspace, and implemented nothing. The
+  README no longer claims they are in progress.
+- **Unused workspace dependencies.** `wasmtime`, `wasmer`, `revm`, `rocksdb`,
+  `redb`, `quinn`, `rustls`, `rayon`, `criterion`, `alloy-primitives`,
+  `alloy-sol-types`, `primitive-types`, `ethereum-types`, `fixed-hash`, `uint`,
+  `num_cpus`, `parking_lot`, `dashmap` (workspace-level), `proptest`,
+  `tokio-test`, and `sha3` where unused. None were referenced by any source file;
+  several pulled multi-hundred-crate graphs that made a workspace test run OOM on
+  a 4 GB machine.
+- **Dead template items** carried by every rewritten crate: `Subhost*Module`,
+  `Subhost*Config`, `Subhost*Error`, and `Metrics { requests, errors, latency_ms }`
+  structs that were constructed, incremented, and never read.
+- **CLI commands with no backend.** `contract deploy`, `contract call`,
+  `query account`, and `query validators` printed a log line and returned
+  success. They are gone rather than pretending to act.
+- **Unused CLI flags.** Global `--config` was parsed and ignored;
+  `node --bootnodes` implied peer connectivity that does not exist.
 
-## 2. Wallet (`subhost-wallet`)
+### Fixed
 
-- **Zeroize the plaintext private-key buffer** after decryption (both the success
-  copy and the error path), so the raw key no longer lingers on the heap.
-- Note: `scrypt::Params::new(15, 8, 1, 32)` was checked against the crate's
-  `Params::recommended()` and matches it — not weakened.
+- **Faucet returned a fabricated transaction hash.** `handle_drip` hashed the
+  address and the current time and returned that as `tx_hash`; no transfer was
+  ever submitted and no balance changed. The faucet now loads an encrypted
+  wallet, signs a real transfer, submits it over JSON-RPC, and returns the hash
+  the node accepted.
+- **`HotStuff::validate_qc` could never return true.** The function looped over
+  signers and returned `false` unconditionally on the first iteration, then
+  returned `false` again. Quorum certificates are now verified for real: every
+  signature is checked against a registered BLS public key over a payload binding
+  the view and the block hash, and a quorum of distinct registered signers is
+  required. `clippy::never_loop` was firing on this as a hard error.
+- **`DAG::has_quorum_support` measured the wrong thing.** It counted distinct
+  authors among a vertex's own parents — its ancestry — which any vertex can
+  satisfy with unrelated history. It now counts distinct next-round authors that
+  reference the vertex as a parent, which is what support means.
+- **`StakingModule::slash` was a no-op.** It computed a penalty and returned it
+  without deducting anything. It now deducts the stake, ejects a fully slashed
+  validator, burns delegations to an ejected validator, and records the evidence
+  before mutating anything. Slashing now requires a non-empty proof.
+- **`StakingModule::delegate` credited a delegation to a non-existent validator**
+  and used unchecked `+=` on both the delegation and the stake. It now requires a
+  registered validator and uses checked arithmetic.
+- **Inbound gossip was dropped.** `subhost-network` created a channel, kept the
+  sender, and discarded every received message, so the transport could publish
+  but never deliver. Received messages are now decoded, validated, and forwarded
+  to the application over an inbound channel.
+- **`DAGVertex::hash` committed to a `Debug` string.** The identity of a vertex
+  changed whenever an unrelated `Debug` implementation was reformatted, and
+  parent order changed the hash. It now hashes a canonical encoding of the author,
+  round, block hash, and sorted parents.
+- **Transaction hashing was duplicated and divergent.** `Mempool::transaction_hash`
+  and the RPC's inline hashing could disagree. There is now one
+  `Transaction::hash`, and one `Transaction::signing_payload` used by every signer
+  and verifier.
+- **A poisoned lock could crash every later request.** The RPC used
+  `unwrap_or_else(into_inner)` inline at 20 call sites; it is now three documented
+  helpers, applied consistently.
+- **`eth_getBlockByNumber` required the second parameter.** It now defaults to
+  `false` as the spec allows, and accepts `safe` and `finalized` tags.
+- **`eth_sendTransaction` accepted only `gasLimit`.** It now accepts the spec's
+  `gas` as well, and `input` alongside `data`.
+- **Contract creation reached the mempool before failing.** A transaction with no
+  `to` was admitted, then rejected during execution. It is now refused during
+  parameter parsing.
+- **`eth_gasPrice` returned a hardcoded `0x1`.** It now reports the mempool's
+  actual minimum accepted gas price.
+- **Mempool replacement consumed the per-sender budget.** Replacing a transaction
+  at an existing nonce counted against `max_per_sender`, so a sender at its limit
+  could not raise a fee. Replacement no longer charges the budget.
+- **Capacity eviction was non-deterministic.** Ties among equal gas prices were
+  broken by `HashMap` iteration order. The tie-break now falls through to the
+  transaction hash.
+- **`GenesisConfig::validate` rejected every single-node genesis.** It required a
+  validator, so `subhost init` produced a file that `GenesisConfig::load` refused.
+  Validator requirements moved to `requires_validators`, which
+  `node --validator` calls; the CLI no longer emits a genesis it cannot load.
+- **`GenesisConfig::default` could panic** on a clock set before 1970
+  (`duration_since(UNIX_EPOCH).unwrap()`). Timestamps now saturate at 0.
+- **`subhost init` silently overwrote an existing genesis**, orphaning the ledger
+  beside it. It now refuses unless `--force` is given.
+- **Wallet permissions were set after the key was written.** `set_permissions`
+  ran after `write_all`, leaving a window where the file was world-readable. The
+  mode is now set before any key material is written.
+- **`SymmetricEncryption::encrypt` panicked on AEAD failure.** It returns a
+  `Result`.
+- **`Metrics::record_request` accepted NaN and negative durations** into the
+  histogram. They are now counted as requests but excluded from the distribution.
+- **Faucet cooldown could be bypassed and could lock a caller out.** The cooldown
+  key is now the lowercased address, and a failed drip releases the slot so a node
+  outage does not impose a full-day penalty.
+- **CLI `--nonce` and `--chain-id` were mandatory and hand-maintained**, so a
+  stale value produced a silently rejected transaction. Both are now queried from
+  the node when omitted.
+- **CLI wallet names were used as file names unchecked**, allowing `../` and path
+  separators, and silently overwrote an existing wallet. Both are now rejected.
+- **`Dockerfile` could not build.** It copied only `crates/` while the workspace
+  included `explorer/`, and referenced binaries that did not exist. It now builds
+  the four real binaries with `--locked`, runs as an unprivileged user under
+  `tini`, and ships no toolchain in the runtime image.
+- **`docker-compose.yml` described a network that cannot exist.** It ran four
+  validators of a single-node producer, mounted a `monitoring/` directory that was
+  absent, published every port on all interfaces, and set a default Grafana
+  password. It is now one node plus the explorer and Prometheus, all on loopback,
+  with the monitoring configuration present.
 
-## 3. Consensus (`subhost-consensus`)
+### Added
 
-- **Wired the staking module**: `staking.rs` existed but was never declared in
-  `lib.rs`, so it was never compiled or tested. Added `pub mod staking;`.
-- **Fixed `slash()`** so it actually deducts stake and removes the validator when
-  fully slashed (previously it only computed and returned an amount without any
-  effect).
-- **Fixed integer-underflow panic** in `ConsensusConfig::new` for
-  `validator_count == 0` (now guarded).
-- **Fixed `has_quorum_support` semantics**: it now counts distinct validators in
-  the *next* round that reference the vertex (Narwhal-style support), instead of
-  counting the vertex's own parents (fan-in).
-- Added tests for slash deduction and full-slash removal.
+- **`subhost-storage` is a real crate.** The ledger format was inline in
+  `subhost-rpc`. It is now a documented, separately tested crate: versioned
+  magic-and-checksum envelope, atomic write with directory fsync, `0600`
+  permissions, size bound, and full replay of every block and receipt commitment
+  against the restored state on load. Nine tests, including bit-flip, truncation,
+  wrong-magic, wrong-chain, and eight distinct tampering cases.
+- **`subhost-node` is a real crate.** Node bootstrap — genesis load, ledger
+  restore, one-time allocation application, RPC and metrics wiring, and graceful
+  SIGTERM/Ctrl-C shutdown — lived in the CLI's `main.rs`. Eight tests.
+- **`subhost-telemetry` is a real crate.** Three binaries each initialized
+  `tracing_subscriber` differently and ignored `RUST_LOG`. One
+  `RUST_LOG`-aware initializer now serves all of them, with optional JSON output
+  for containers and a non-fatal double-initialization path.
+- **`subhost-metrics` exposes metrics a node actually reports.** The registry was
+  never started by any binary. `subhost node --metrics-addr` now serves
+  `/metrics` and `/health`, and block height and mempool depth are updated while
+  the node runs.
+- **New RPC methods.** `eth_getTransactionByHash` and `eth_getTransactionCount`.
+- **New CLI commands.** `query nonce`, `query chain`, `wallet show`,
+  `init --validator`, `init --force`, `node --metrics-addr`,
+  `node --max-connections`, and `--verbose`/`--quiet`.
+- **Mempool nonce-continuity helpers.** `ready_for` returns the gap-free prefix a
+  proposer can include; `prune_below_nonce` drops transactions state has already
+  executed.
+- **IBC channel lifecycle.** Channels opened in `Init` must be confirmed before
+  they carry packets; transitions are validated and only move forward. Added
+  `timeout_packet`, and receive sequences are tracked per channel instead of
+  globally.
+- **`ValidatorRegistry`** binding validator addresses to BLS public keys, with
+  mandatory proof-of-possession verification at registration.
+- **HotStuff safety rule.** `locked_view` and `is_safe_proposal` are now enforced
+  rather than being dead fields.
+- **Wallet KDF parameters are recorded in the file**, so the work factor can be
+  raised later without invalidating existing wallets. Parameters below N = 2^14
+  are rejected.
+- **Test coverage is now 202 passing tests across all 17 workspace members.**
+  The previous workflow ran the suites of six crates, 45 tests in total; the
+  other crates had tests that CI never executed, or none at all. Every crate now
+  covers its failure paths, not only its happy path: tampering, overflow, replay,
+  malformed input, and end-to-end HTTP round trips against a live server.
 
-## 4. Mempool (`subhost-mempool`) — rewritten from a stub
+### Changed
 
-The crate previously contained only an empty `Config/Module/Metrics/Error`
-template. It is now a real transaction pool with:
-
-- per-sender nonce map and dedupe by tx hash
-- replace-by-nonce (only a strictly higher gas price replaces)
-- global capacity cap with lowest-priority eviction
-- per-sender queue cap
-- gas-price/length validation and ordering for a proposer
-- `remove`, `get`, `len`, `pending`, `next_nonce_for`
-- `Cargo.toml`: added `bincode` for deterministic tx hashing.
-
-## 5. State (`subhost-state`) — rewritten from a stub
-
-Now a real in-memory account store with:
-
-- `Account { nonce, balance }`, seeding, balance/nonce queries
-- `apply_transfer` with overdraft protection
-- `apply_transaction` with nonce/replay enforcement and fee accounting
-- explicit unsupported-type errors (not silent coercion).
-
-## 6. JSON-RPC (`subhost-rpc`)
-
-- Replaced `tokio::sync::RwLock` + `blocking_read` (which panics inside the tokio
-  worker) with `std::sync::RwLock`.
-- `eth_getBalance` now reads the real `subhost-state` balance and accepts the
-  spec's optional 2nd `block` parameter.
-- `eth_sendTransaction` now parses hex fields (address/value/nonce/gas/data/chain
-  id) and inserts a real `Transaction` into the mempool, returning a real hash.
-- `eth_blockNumber` reads a real atomic height counter (start 0), not a hardcoded
-  value.
-- `eth_getTransactionReceipt` returns `null` (not fabricated `status: 0x1`) since
-  there is no confirmation/block-production backend.
-- Removed the `block_in_place` + nested `block_on` antipattern.
-
-## 7. Faucet (`subhost-faucet`)
-
-- Fixed a rate-limit bypass: the cooldown was keyed on the case-sensitive address,
-  so flipping hex-case reset the limit. Now normalized to lowercase.
-- (Still returns a placeholder `tx_hash`; it does not credit a live chain — noted
-  in README.)
-
-## 8. Networking (`subhost-network`)
-
-- Fixed the dropped receiver: `NetworkManager::new` used to create the channel
-  and immediately drop the receive half, making every `send()` fail. The receiver
-  is now stored and inbound `NetworkMessage`s are broadcast on a gossip topic.
-- Switched to `IdentTopic` (the `Topic` type is generic in libp2p 0.53).
-- `NetworkMessage` now derives `Serialize`/`Deserialize`.
-- `Cargo.toml`: added `serde_json`.
-
-## 9. Benchmark tool (`subhost-bench`)
-
-- `--endpoint` is now actually used by the TPS/latency/load commands (previously
-  hardcoded to `http://localhost:8545`).
-- Removed an unneeded `mut`.
-
-## 10. CLI (`subhost-cli`)
-
-- Fixed a clap panic: `node --validator` short `-v` collided with global
-  `--verbose` `-v`.
-- `run_node` now actually starts the JSON-RPC server on `--listen`.
-- `tx send` now builds a real `Transaction` and prints its hash (consistent with
-  the RPC mempool hashing).
-- `wallet export` now really decrypts and prints the private key.
-- `query balance` no longer fabricates `0` — it warns that it needs a running node.
-- `init` now warns when it writes a genesis with zero validators (which
-  `GenesisConfig::validate()` rejects).
-- Removed unused imports.
-
-## 11. IBC (`subhost-ibc`)
-
-- Removed an unused `Hash` import.
-- Rejects packets from the wrong counterparty channel/port.
-- Rejects expired or zero-timeout packets, replayed acknowledgements, invalid
-  ordered sequences, oversized payloads, and sequence overflow.
-
-## 12. Repository guardrails
-
-- Added a tracked `Cargo.lock` workflow (the lockfile is no longer ignored).
-- CI now enforces formatting, workspace type-checking, safe targeted tests,
-  clippy with `-D warnings`, and `cargo audit`.
-- Added Dependabot, CODEOWNERS, a security disclosure policy, and a two-job
-  Cargo concurrency default for the constrained build environment.
-
-## 13. Documentation (de-hallucination)
-
-- `README.md`: corrected the license badge (MIT -> Apache-2.0), marked audits as
-  planned/scheduled (none completed), corrected the install binary name
-  (`subhost-web3` -> `subhost`), and replaced inflated marketing claims (50k TPS,
-  parallel EVM, zk-rollups, encrypted mempool, etc.) with an honest "Current
-  Status" table.
-- `docs/tokenomics.md`: added a "design spec, not deployed" banner; reconciled
-  contradictory numbers (minimum stake 1,000 vs 10,000 vs 10,000,000; circulation
-  15% vs allocation 100%).
-- `docs/security/threat-model.md`: added an implementation-status disclaimer
-  (many mitigations are design goals, not live); removed the bug-bounty section
-  entirely (there is no bug bounty program).
-
----
-
-## Known limitations left intentionally (documented, not hidden)
-
-1. `subhost-consensus` `HotStuff::validate_qc` fails closed until a validator
-   public-key registry is wired. It does not accept arbitrary signature bytes.
-2. RPC transaction submission requires an Ed25519 signature and exact account
-   nonce, but there is no server-side keystore or client-side signing helper.
-3. `subhost-faucet` returns a placeholder tx hash and does not credit real state.
-4. `subhost-network` builds a libp2p swarm with `with_async_std()` while the rest
-   of the app runs on tokio (latent runtime mismatch; not exercised by the CLI).
-5. `subhost-evm`, `subhost-wasm`, `subhost-zk` are placeholders (not implemented).
-
-## Follow-up fixes (second pass — reconciling GPT 5.6's changes)
-
-- Reverted an inert `revm` workspace-dependency change (`default-features = false`,
-  `secp256k1`): `revm` is not referenced by any workspace crate, so the change had
-  no effect and was reverted to `features = ["std", "serde"]`.
-- Aligned wallet address derivation with the RPC signature gate: the wallet now
-  derives an address from the ed25519 **public** key
-  (`Address::from_public_key(ed25519 verifying key)`) instead of hashing the raw
-  32-byte secret. Added `PrivateKey::public_key()`. This removes the mismatch where
-  a wallet address (`blake3(secret)`) could never satisfy the RPC check
-  (`blake3(public_key)`). Wallet's unused `blake3` dependency was removed.
-- Normalized the security contact email to `security@subhost.xyz` (SECURITY.md
-  previously used `.io`; README and threat-model use `.xyz`).
-- Documented in README that `eth_sendTransaction` is non-standard (requires
-  `publicKey` + `signature` fields).
-- Added a wallet regression test locking the address/public-key invariant.
+- **Workspace lints.** `unsafe_code = "forbid"`, `rust_2018_idioms`,
+  `unreachable_pub`, `unused_qualifications`, `clippy::all`, and denied
+  `todo!`/`unimplemented!`/`dbg!` across every crate.
+- **CI covers the whole workspace.** The previous workflow ran clippy and tests
+  on a hand-picked subset of six crates. There are now seven required jobs:
+  format, clippy with `-D warnings` over all targets and features, the full test
+  suite, the 1.89 MSRV, a release build, `cargo deny`, and warning-free rustdoc.
+- **`cargo deny` gates the supply chain** through `deny.toml`: denied advisories
+  and yanked crates, a permissive-licence allow-list, banned `openssl`, and a
+  registry allow-list. Four advisories are ignored, each with a written reason and
+  an exit condition: `bincode` unmaintained (internal encoding only, the ledger is
+  separately checksum- and commitment-verified), and three
+  `hickory-proto`/`paste` advisories that arrive only through `libp2p 0.56`, which
+  pins the unfixed version. `cargo tree -i libp2p` confirms `subhost-network` is
+  its only dependant and no binary depends on `subhost-network`, so that code is
+  unreachable in a shipped artifact.
+- **`rust-toolchain.toml` pins the compiler** so every developer, CI runner, and
+  container build uses one version.
+- **MSRV corrected from 1.75 to 1.89.** The manifest claimed 1.75, but the locked
+  dependency graph contains 39 edition-2024 crates that Cargo 1.75 cannot even
+  parse, so the declared MSRV was never achievable. 1.89 is the true floor:
+  `enum-ordinalize 4.4.2`, reached through `educe` -> `ark-ec`, declares
+  `rust-version = 1.89`, so `cargo +1.88.0 check` refuses to build the workspace.
+  Verified by running both `cargo +1.88.0 check` (fails) and `cargo +1.89.0 check`
+  (clean) rather than by reading the manifests. CI verifies 1.89.
+- **`reqwest` uses rustls** instead of the default system OpenSSL, so no build
+  needs OpenSSL headers.
+- **Internal crate dependencies are declared once** in
+  `[workspace.dependencies]`.
+- **Dependabot runs weekly**, groups minor and patch updates into one pull
+  request, and covers Docker as well as Cargo and Actions.
+- **`.gitignore` excludes key material and ledgers** (`wallets/`,
+  `node-state.bin`, `genesis.json`, `faucet-wallet.json`) and no longer contains
+  the four duplicated `website/` lines.
+- **Added `.dockerignore`, `.editorconfig`, issue templates, a pull request
+  template, and `monitoring/prometheus.yml`.**
+- **`CODEOWNERS` names the security-critical paths** rather than assigning one
+  global owner.
+- **Demo scripts use `SUBHOST_HOME`** instead of overriding `HOME`, let the CLI
+  resolve the nonce so a rerun does not need a hand-edited counter, and poll node
+  readiness through `subhost query chain` instead of a raw `curl`.
+- **README, SECURITY.md, and CONTRIBUTING.md rewritten** to match the code. The
+  status table states what each crate does and does not do; the security policy
+  separates the deliberate posture (no auth on any listener, no consensus,
+  non-standard hash-to-curve, unverified IBC proofs) from the properties that are
+  enforced and whose regression would be a real vulnerability.

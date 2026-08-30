@@ -1,168 +1,98 @@
-version: "3.8"
+# Single-node development stack: one node, the explorer, and Prometheus.
+#
+# This is not a multi-validator network. Block production is single-node
+# (see crates/subhost-rpc), so running several `subhost node` services would
+# produce independent chains rather than one consensus network.
+#
+# Every port is published on 127.0.0.1 only. The explorer signs with a local
+# wallet and the JSON-RPC surface is unauthenticated, so neither may be exposed
+# to a network without an authenticating proxy in front.
 
 services:
-  validator-1:
+  node:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: subhost-validator-1
+    container_name: subhost-node
+    command:
+      - subhost
+      - node
+      - --listen
+      - 0.0.0.0:8545
+      - --metrics-addr
+      - 0.0.0.0:9090
+      - --data-dir
+      - /data
     ports:
-      - "30333:30333"
-      - "8545:8545"
+      - "127.0.0.1:8545:8545"
+      - "127.0.0.1:9090:9090"
     volumes:
-      - validator1-data:/data
+      - node-data:/data
     environment:
-      - NODE_ROLE=validator
-      - CHAIN_ID=1
-      - BOOTNODES=
-    command: ["subhost", "node", "--validator", "--listen", "0.0.0.0:30333"]
-    networks:
-      - subhost-net
+      RUST_LOG: info
+      SUBHOST_LOG_FORMAT: json
     restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - subhost
+        - query
+        - chain
+        - --rpc-url
+        - http://127.0.0.1:8545
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
 
-  validator-2:
+  explorer:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: subhost-validator-2
+    container_name: subhost-explorer
+    command: ["subhost-explorer"]
     ports:
-      - "30334:30333"
-      - "8546:8545"
-    volumes:
-      - validator2-data:/data
+      - "127.0.0.1:3000:3000"
     environment:
-      - NODE_ROLE=validator
-      - CHAIN_ID=1
-      - BOOTNODES=/dns4/validator-1/tcp/30333
-    command: ["subhost", "node", "--validator", "--listen", "0.0.0.0:30333", "--bootnodes", "/dns4/validator-1/tcp/30333"]
+      # The explorer refuses any non-loopback bind, so it listens inside the
+      # container on loopback and is reached through the published port.
+      EXPLORER_LISTEN_ADDR: 127.0.0.1:3000
+      SUBHOST_RPC_URL: http://node:8545
+      SUBHOST_CHAIN_NAME: SubHost
+      RUST_LOG: info
     depends_on:
-      - validator-1
-    networks:
-      - subhost-net
+      node:
+        condition: service_healthy
     restart: unless-stopped
-
-  validator-3:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: subhost-validator-3
-    ports:
-      - "30335:30333"
-      - "8547:8545"
-    volumes:
-      - validator3-data:/data
-    environment:
-      - NODE_ROLE=validator
-      - CHAIN_ID=1
-      - BOOTNODES=/dns4/validator-1/tcp/30333
-    command: ["subhost", "node", "--validator", "--listen", "0.0.0.0:30333", "--bootnodes", "/dns4/validator-1/tcp/30333"]
-    depends_on:
-      - validator-1
-    networks:
-      - subhost-net
-    restart: unless-stopped
-
-  validator-4:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: subhost-validator-4
-    ports:
-      - "30336:30333"
-      - "8548:8545"
-    volumes:
-      - validator4-data:/data
-    environment:
-      - NODE_ROLE=validator
-      - CHAIN_ID=1
-      - BOOTNODES=/dns4/validator-1/tcp/30333
-    command: ["subhost", "node", "--validator", "--listen", "0.0.0.0:30333", "--bootnodes", "/dns4/validator-1/tcp/30333"]
-    depends_on:
-      - validator-1
-    networks:
-      - subhost-net
-    restart: unless-stopped
-
-  rpc-node:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: subhost-rpc
-    ports:
-      - "8549:8545"
-    volumes:
-      - rpc-data:/data
-    environment:
-      - NODE_ROLE=rpc
-      - CHAIN_ID=1
-      - BOOTNODES=/dns4/validator-1/tcp/30333
-    command: ["subhost", "node", "--listen", "0.0.0.0:30333", "--bootnodes", "/dns4/validator-1/tcp/30333"]
-    depends_on:
-      - validator-1
-    networks:
-      - subhost-net
-    restart: unless-stopped
-
-  faucet:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: subhost-faucet
-    ports:
-      - "8090:8080"
-    environment:
-      - DRIP_AMOUNT=1000000000000000000
-      - COOLDOWN_SECS=86400
-    command: ["subhost-faucet"]
-    depends_on:
-      - validator-1
-    networks:
-      - subhost-net
-    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v3.1.0
     container_name: subhost-prometheus
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9091:9090"
     volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
-    networks:
-      - subhost-net
-    restart: unless-stopped
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: subhost-grafana
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
-      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
-    environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
     depends_on:
-      - prometheus
-    networks:
-      - subhost-net
+      node:
+        condition: service_healthy
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
 
 volumes:
-  validator1-data:
-  validator2-data:
-  validator3-data:
-  validator4-data:
-  rpc-data:
+  node-data:
   prometheus-data:
-  grafana-data:
-
-networks:
-  subhost-net:
-    driver: bridge

@@ -1,22 +1,22 @@
 [package]
 name = "subhost-metrics"
-version = "0.1.0"
-edition = "2021"
-authors = ["Subhost Labs <dev@subhost.io>"]
-license = "Apache-2.0"
-description = "subhost-metrics component of Subhost Web3 protocol"
-repository = "https://github.com/subhost-labs/subhost-web3"
-rust-version = "1.75"
+description = "Prometheus metrics registry and exporter for Subhost Web3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-subhost-core = { path = "../subhost-core" }
-serde = { workspace = true }
+axum = { workspace = true }
+prometheus = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-prometheus = "0.13"
-axum = "0.7"
 
 [dev-dependencies]
-tokio-test = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros"] }

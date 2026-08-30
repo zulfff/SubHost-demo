@@ -1,23 +1,19 @@
 [package]
 name = "subhost-ibc"
-version = "0.1.0"
-edition = "2021"
-authors = ["Subhost Labs <dev@subhost.io>"]
-license = "Apache-2.0"
-description = "subhost-ibc component of Subhost Web3 protocol"
-repository = "https://github.com/subhost-labs/subhost-web3"
-rust-version = "1.75"
+description = "IBC channel and packet handling for Subhost Web3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-subhost-core = { path = "../subhost-core" }
-subhost-crypto = { path = "../subhost-crypto" }
+subhost-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
 thiserror = { workspace = true }
-chrono = { workspace = true }
-reqwest = { workspace = true }
-
-[dev-dependencies]
-tokio-test = { workspace = true }
+tracing = { workspace = true }

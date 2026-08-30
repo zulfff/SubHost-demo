@@ -1,35 +1,55 @@
+%% The transaction flow as implemented today: a single node, one transaction per
+%% block, with the ledger written before any in-memory state changes.
+%% For the target multi-node flow, see the Consensus Layer notes in architecture.mmd.
 sequenceDiagram
     participant User
+    participant CLI as CLI / Explorer
     participant Wallet
-    participant Node
+    participant RPC as JSON-RPC
     participant Mempool
-    participant Consensus
-    participant Network
-    participant Block
+    participant State
+    participant Storage as Ledger
 
-    User->>Wallet: Create transaction
-    Wallet->>Wallet: Sign with BLS
-    Wallet->>Node: Submit signed tx
-    
-    Node->>Node: Validate signature
-    Node->>Mempool: Check nonce & balance
-    
-    alt Valid Transaction
-        Mempool->>Network: Dandelion++ stem phase
-        Network->>Network: 2-4 hops anonymization
-        Network->>Mempool: Fluff phase broadcast
-        
-        Mempool->>Consensus: Include in DAG vertex
-        Consensus->>Consensus: BLS aggregate signatures
-        Consensus->>Consensus: HotStuff finality
-        
-        Consensus->>Block: Commit block
-        Block->>Network: Propagate to peers
-        Network->>Node: Receive block
-        Node->>Wallet: Confirm inclusion
-        Wallet->>User: Transaction confirmed
-    else Invalid Transaction
-        Node-->>Wallet: Reject with error
-        Wallet-->>User: Show error
+    User->>CLI: subhost tx send
+    CLI->>Wallet: decrypt key (scrypt + AES-256-GCM)
+    Wallet-->>CLI: ed25519 signing key
+    CLI->>RPC: eth_chainId, eth_getTransactionCount
+    RPC-->>CLI: chain ID, next nonce
+    CLI->>CLI: sign the unsigned encoding (ed25519)
+    CLI->>RPC: eth_sendTransaction + publicKey + signature
+
+    RPC->>RPC: verify signature; public key must hash to `from`
+    RPC->>RPC: check chain ID and gas limit
+
+    alt Signature or parameters invalid
+        RPC-->>CLI: JSON-RPC error -32602
+        CLI-->>User: rejected, nothing changed
+    else Accepted into the pool
+        RPC->>Mempool: admit (replace-by-fee, capacity, budget)
+        RPC->>State: apply_transaction on a state clone
+
+        alt Nonce, balance, or type rejected
+            State-->>RPC: StateError
+            RPC->>Mempool: roll back, restoring any displaced tx
+            RPC-->>CLI: JSON-RPC error -32000
+            CLI-->>User: rejected, nothing changed
+        else Executed
+            RPC->>RPC: seal a one-tx block (tx_root, receipt_root, state_root)
+            RPC->>Storage: persist state + blocks + receipts atomically
+
+            alt Persist failed
+                Storage-->>RPC: StorageError
+                RPC->>Mempool: roll back
+                RPC-->>CLI: JSON-RPC error -32603
+                CLI-->>User: rejected, disk and memory still agree
+            else Committed
+                Storage-->>RPC: fsynced
+                RPC->>State: swap in the new state
+                RPC->>Mempool: remove the mined tx
+                RPC-->>CLI: transaction hash
+                CLI-->>User: hash of a committed block
+            end
+        end
     end
-EOF
+
+    Note over RPC,Storage: No peer propagation and no consensus.<br/>Production is single-node.

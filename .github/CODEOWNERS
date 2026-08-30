@@ -1,1 +1,23 @@
-* @zulfff
+# Default owner for everything.
+*                       @zulfff
+
+# Security-critical paths: key handling, signature verification, consensus rules,
+# and durable state. These must not be changed without an explicit review.
+/crates/subhost-crypto/    @zulfff
+/crates/subhost-wallet/    @zulfff
+/crates/subhost-consensus/ @zulfff
+/crates/subhost-state/     @zulfff
+/crates/subhost-storage/   @zulfff
+/crates/subhost-rpc/       @zulfff
+
+# Build, CI, and supply-chain configuration.
+/.github/               @zulfff
+/Cargo.toml             @zulfff
+/Cargo.lock             @zulfff
+/deny.toml              @zulfff
+/rust-toolchain.toml    @zulfff
+/Dockerfile             @zulfff
+
+# Security documentation.
+/SECURITY.md            @zulfff
+/docs/security/         @zulfff

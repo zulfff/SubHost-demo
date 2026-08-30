@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned so every developer, CI runner, and container build uses one compiler.
+# The minimum supported version is 1.89 (see `rust-version` in Cargo.toml); CI
+# verifies that separately.
+channel = "1.93.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

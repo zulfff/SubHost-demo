@@ -1,5 +1,12 @@
+# Constrained to 2 parallel jobs: an LTO release build of this workspace exceeds
+# the memory available to a 4 GiB machine at higher parallelism. Override with
+# `--jobs` or CARGO_BUILD_JOBS on a larger host.
 [build]
 jobs = 2
 
 [term]
 verbose = false
+
+[alias]
+# Gates mirrored by CI, so `cargo lint` locally means the same thing as a green build.
+lint = "clippy --workspace --all-targets --all-features -- -D warnings"

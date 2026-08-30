@@ -1,33 +1,30 @@
 [package]
 name = "subhost-rpc"
-version = "0.1.0"
-edition = "2021"
-authors = ["Subhost Labs <dev@subhost.io>"]
-license = "Apache-2.0"
-description = "subhost-rpc component of Subhost Web3 protocol"
-repository = "https://github.com/subhost-labs/subhost-web3"
-rust-version = "1.75"
+description = "JSON-RPC server and single-node block producer for Subhost Web3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [dependencies]
-subhost-core = { path = "../subhost-core" }
-subhost-state = { path = "../subhost-state" }
-subhost-mempool = { path = "../subhost-mempool" }
-subhost-crypto = { path = "../subhost-crypto" }
-tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-anyhow = { workspace = true }
-blake3 = { workspace = true }
-jsonrpsee = { version = "0.21", features = ["server", "macros"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
-hex = { workspace = true }
-primitive-types = { workspace = true }
-bincode = { workspace = true }
+subhost-core = { workspace = true }
+subhost-mempool = { workspace = true }
+subhost-state = { workspace = true }
+subhost-storage = { workspace = true }
 ed25519-dalek = { workspace = true }
-tempfile = { workspace = true }
+jsonrpsee = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio-test = { workspace = true }
+serde = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros"] }

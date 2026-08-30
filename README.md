@@ -5,319 +5,279 @@
 <h1 align="center">Subhost Web3</h1>
 
 <p align="center">
-  <strong>The Next-Generation Decentralized Cloud Infrastructure</strong>
+  <strong>A Rust workspace exploring decentralized cloud infrastructure</strong>
 </p>
 
 <p align="center">
-  <a href="https://subhost-web3.vercel.app/docs"><img src="https://img.shields.io/badge/Docs-Live-green.svg" alt="Documentation"></a>
-  <a href="https://github.com/zulfff/SubHost-demo/actions/workflows/rust.yml"><img src="https://github.com/zulfff/SubHost-demo/actions/workflows/rust.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/zulfff/SubHost-demo/actions/workflows/ci.yml"><img src="https://github.com/zulfff/SubHost-demo/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
-  <a href="https://subhost-web3.vercel.app"><img src="https://img.shields.io/badge/Website-subhost--web3.vercel.app-6366f1.svg" alt="Website"></a>
+  <img src="https://img.shields.io/badge/rustc-1.89%2B-orange.svg" alt="MSRV">
 </p>
 
 ---
 
-## What is Subhost?
+## What this is
 
-**Subhost Web3** is a Rust workspace exploring a high-performance, decentralized cloud infrastructure (consensus + distributed storage + edge compute). It is an active codebase, **not yet a production network** — the sections below state exactly what is implemented today.
+Subhost Web3 is a Rust workspace containing a working **single-node blockchain**:
+an Ethereum-shaped JSON-RPC endpoint, signed transfers, deterministic block
+production, and a crash-safe ledger on disk.
 
-### Current Status (honest, verified against the code)
+It is **not a distributed network**. There is no consensus loop and no block
+propagation between peers. The table below is the authoritative statement of what
+is implemented; nothing in this repository should be treated as production ready.
 
-| Area | Status |
-|------|--------|
-| **Core types** (`subhost-core`) | Real: `Hash`/`Address` (blake3), `BlockHeader`/`Block`/`Transaction`/`Receipt`, genesis config |
-| **Crypto** (`subhost-crypto`) | Real: BLS12-381 sign/verify/aggregate + proof-of-possession, ChaCha20-Poly1305 AEAD, ed25519, X25519 key-exchange, scrypt/AES-GCM wallets |
-| **Consensus** (`subhost-consensus`) | Scaffold: DAG + HotStuff structs, staking sets, quorum checks. **No full consensus loop / block production yet** |
-| **Networking** (`subhost-network`) | Scaffold: libp2p swarm (gossipsub/kad/mdns/ping) wired for publish. **Message dispatch is minimal** |
-| **Mempool** (`subhost-mempool`) | Real: per-sender nonce pool, gas-price ordering, capacity eviction, replace-by-nonce, dedupe |
-| **State** (`subhost-state`) | Real account rules: balances, nonce/replay enforcement, transfer execution; node snapshots it to disk |
-| **JSON-RPC** (`subhost-rpc`) | Real single-node subset: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, signed `eth_sendTransaction`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`, `eth_gasPrice`, `net_version`; transfers execute into local blocks |
-| **WASM / EVM / zk** | **Not implemented** — crates are placeholders |
-| **IBC / Governance / Storage / P2P / Metrics / Faucet** | Partial / scaffolded; not production-ready |
+### Implementation status
 
-The README's older marketing claims (50k TPS, 800ms finality, parallel EVM, zk-rollups, threshold-encrypted mempool, Dandelion++, MPT, erasure-coded store) describe the **design vision**, not verified measurements — no benchmark currently reproduces them.
+| Crate | Status |
+|-------|--------|
+| `subhost-core` | **Complete.** Hash/Address (BLAKE3), block, transaction, receipt, genesis document, canonical encoding. |
+| `subhost-crypto` | **Complete.** BLS12-381 sign/verify/aggregate with proof of possession, ed25519, X25519 (contributory-checked), ChaCha20-Poly1305. |
+| `subhost-wallet` | **Complete.** scrypt + AES-256-GCM keystore, atomic `0600` writes, address verified against the decrypted key. |
+| `subhost-state` | **Complete.** Balances, nonce ordering, replay rejection, checked arithmetic, deterministic state root. |
+| `subhost-mempool` | **Complete.** Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
+| `subhost-storage` | **Complete.** Versioned, checksummed, atomically written ledger; every block and receipt commitment is replayed on load. |
+| `subhost-rpc` | **Working subset.** 10 JSON-RPC methods, mandatory signature verification, one transaction per block, persist-before-commit. |
+| `subhost-node` | **Complete.** Genesis load, ledger restore, RPC and metrics wiring, graceful shutdown. |
+| `subhost-telemetry` | **Complete.** One `RUST_LOG`-aware subscriber, optional JSON output. |
+| `subhost-metrics` | **Complete.** Prometheus registry and `/metrics` + `/health` exporter. |
+| `subhost-consensus` | **Verifiable primitives only.** DAG admission and quorum support, BLS-verified quorum certificates, staking and slashing. **No consensus loop, no block production.** |
+| `subhost-network` | **Transport only.** libp2p gossip publish and receive, connection limits. No Dandelion++ relay, no peer scoring. |
+| `subhost-ibc` | **Local state machine only.** Channel handshake, sequencing, timeouts, replay rejection. **No light-client or commitment proof verification.** |
+| `subhost-faucet` | **Complete.** Signs and submits real transfers from an encrypted wallet, per-address cooldown. |
+| `subhost-cli` | **Complete.** Every command performs a real operation. |
+| `subhost-explorer` | **Complete.** Read-only dashboard plus a loopback-only demo signing endpoint. |
+| `subhost-bench` | **Complete.** Load and latency measurement, reporting successes and failures separately. |
 
----
-
-## Target Architecture
-
-The diagram below is the design direction, not the current runtime topology.
-The status table above is the source of truth for what is wired today.
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        APPLICATION LAYER                         │
-├─────────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────────┐  │
-│  │  Smart      │ │  WASM       │ │  Cross-Chain            │  │
-│  │  Contracts  │ │  Runtime    │ │  IBC Bridge             │  │
-│  └─────────────┘ └─────────────┘ └─────────────────────────┘  │
-├─────────────────────────────────────────────────────────────────┤
-│                        EXECUTION LAYER                           │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │         Parallel EVM with Optimistic OCC                │    │
-│  │         ┌─────────┐ ┌─────────┐ ┌─────────┐            │    │
-│  │         │ Thread  │ │ Thread  │ │ Thread  │            │    │
-│  │         │   1     │ │   2     │ │   N     │            │    │
-│  │         └─────────┘ └─────────┘ └─────────┘            │    │
-│  └─────────────────────────────────────────────────────────┘    │
-├─────────────────────────────────────────────────────────────────┤
-│                      CONSENSUS LAYER                           │
-│  ┌─────────────────────────┐    ┌──────────────────────────┐  │
-│  │   Narwhal DAG Mempool   │───▶│   HotStuff Finality      │  │
-│  │   (Tx Dissemination)    │    │   (Deterministic Final)  │  │
-│  └─────────────────────────┘    └──────────────────────────┘  │
-├─────────────────────────────────────────────────────────────────┤
-│                       NETWORK LAYER                            │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────────────────┐   │
-│  │  Libp2p     │ │  Dandelion++│ │  Threshold Encryption   │   │
-│  │  Transport  │ │  Privacy    │ │  MEV Resistance         │   │
-│  └─────────────┘ └─────────────┘ └─────────────────────────┘   │
-├─────────────────────────────────────────────────────────────────┤
-│                       STORAGE LAYER                            │
-│  ┌─────────────────────────────────────────────────────────┐   │
-│  │  Merkle Patricia Trie + Erasure Coded Distributed Store │   │
-│  │  State Rent + Auto-Expiry + Archival Incentives         │   │
-│  └─────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-```
+Not implemented anywhere in this repository: EVM execution, WASM contracts, zk
+proofs, on-chain governance, a Merkle Patricia Trie, erasure-coded storage, or a
+threshold-encrypted mempool.
 
 ---
 
-## Features
+## Quick start
 
-### CLI Tool
-
-Build the two executable packages first:
-
-```bash
-cargo build -p subhost-cli -p subhost-bench -j 1
-```
-
-The examples below use the binaries produced by that debug build:
-
-```bash
-# Wallet management
-./target/debug/subhost wallet new --password change-me --name mywallet
-./target/debug/subhost wallet list
-./target/debug/subhost wallet import --private-key <32-byte-hex-key> --password change-me
-
-# Transactions
-./target/debug/subhost tx send --from <address> --to <address> --amount 1000
-./target/debug/subhost tx status <tx-hash>
-
-# Queries
-./target/debug/subhost query balance <address>
-./target/debug/subhost query block --height 12345
-./target/debug/subhost query validators
-
-# Node operations
-./target/debug/subhost init --chain-id 1 --data-dir ./data \
-  --alloc 0x1111111111111111111111111111111111111111=1000000
-./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
-```
-
-`wallet` writes encrypted files under `~/.subhost/wallets`. The transaction,
-query, contract, `--validator`, and `--bootnodes` commands are not wired to a
-remote node or a live consensus network yet; consult `--help` and the status
-table before treating their output as an on-chain action.
-
-### JSON-RPC API
-
-- Ethereum-shaped JSON-RPC subset on the address passed to `node --listen`
-  (the quick start below uses `127.0.0.1:8545`)
-- Methods: `eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_sendTransaction`,
-  `eth_getTransactionReceipt`, `eth_getBlockByNumber`, `eth_gasPrice`, `net_version`
-- `eth_sendTransaction` validates the signature, balance, chain ID, and nonce, then
-  executes the transfer into the next local block and returns its transaction hash
-- `eth_getTransactionReceipt` returns a real receipt after local block inclusion;
-  unknown hashes return `null`
-- `eth_sendTransaction` is **not** standard Ethereum: it requires an extra
-  `"publicKey"` (32-byte hex ed25519 public key) and `"signature"` (64-byte hex
-  ed25519 signature over the bincode-serialized unsigned transaction). Unsigned or
-  wrongly-signed payloads are rejected. It also requires the configured chain ID
-  and the account's exact current nonce.
-
-### Wallet & Key Management
-- AES-256-GCM encryption with **scrypt** key derivation _(implemented in `subhost-wallet`)_
-- Wallet files are written atomically, capped at 1 MiB, and use `0600` permissions on Unix
-- Passwords must contain at least 8 characters
-- Note: "PBKDF2" and HD/BIP-39/BIP-44 derivation are **not implemented** — private keys are raw 32-byte values, encrypted at rest.
-
-### Docker Compose Reference
-
-Do not use `docker-compose.yml` as the quick start. It is an architecture
-reference, not a working testnet: consensus/block production is not wired, the
-current Dockerfile expects a `subhost-faucet` executable that the workspace does
-not provide, and several published ports do not match the CLI listen address.
-
-### Testnet Faucet
-
-- `subhost-faucet` currently provides a library server, not a standalone binary
-- When embedded and started, its default API address is `0.0.0.0:8080`
-- Rate limited (1 request per day per address, case-insensitive)
-- Request test tokens: `POST /drip { "address": "0x..." }`
-- Caveat: currently returns a fabricated `tx_hash`; it does **not** actually credit
-  a live chain state.
-
-### Benchmark Tool
-```bash
-./target/debug/subhost-bench --endpoint http://127.0.0.1:8545 --duration-secs 60 --concurrency 100 tps
-./target/debug/subhost-bench --endpoint http://127.0.0.1:8545 --duration-secs 60 latency
-./target/debug/subhost-bench --endpoint http://127.0.0.1:8545 --duration-secs 300 load
-```
-The tool generates requests against a JSON-RPC endpoint. TPS currently counts
-attempts even when a request fails and the tool does not validate response
-payloads, so its output is a load-generator measurement, not proof of successful
-transactions or consensus throughput.
-
-### Block Explorer
-- An `explorer/` project is scaffolded (Rust) but is **not part of the workspace** and not confirmed to run as "Web UI at port 3000".
-
-### Prometheus Metrics
-
-- `subhost-metrics` is a library crate with a `/metrics` exporter and defaults to
-  `0.0.0.0:9090`; the main CLI does not start it
-- The Grafana/Prometheus compose configuration is unverified
-
-### IBC Bridge
-- `subhost-ibc` implements in-memory channel/transfer/ack **bookkeeping only**.
-- It does **not** perform real cross-chain transfers to Cosmos SDK chains yet.
-
----
-
-### Prerequisites
-
-- Rust 1.75+
-- About 4 GB RAM is enough for the debug quick start when build parallelism is
-  kept low
-- Docker is optional and the included compose stack is not a working testnet
-
-### Quick Start
+Requires Rust 1.89 or newer (`rust-toolchain.toml` pins 1.93.0 for development).
+About 4 GB of RAM is enough; `.cargo/config.toml` caps build parallelism at two
+jobs for that reason.
 
 ```bash
 git clone https://github.com/zulfff/SubHost-demo.git
 cd SubHost-demo
+cargo build -p subhost-cli
 
-# Build only the CLI with one compiler job (recommended on a 4 GB machine)
-cargo build -p subhost-cli -j 1
-
-# Initialize genesis state (writes ./data/genesis.json)
+# Write a genesis file that funds one account.
 ./target/debug/subhost init --chain-id 1 --data-dir ./data \
   --alloc 0x1111111111111111111111111111111111111111=1000000
 
-# Run a persistent single-node producer (no P2P/consensus yet)
+# Run the node.
 ./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
 ```
 
-In another terminal, verify the RPC server:
+In another terminal:
 
 ```bash
-curl -s http://127.0.0.1:8545 \
-  -H 'content-type: application/json' \
-  --data '{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}'
+./target/debug/subhost query chain --rpc-url http://127.0.0.1:8545
+# chain_id  1
+# height    0
 ```
 
-Expected result: a JSON-RPC response whose `result` is `"0x1"`.
+### Two-wallet transfer
 
-The generated genesis currently has no validators and fails the core validator
-check, so it is not valid bootstrap data for a multi-node consensus network.
-The current single-node CLI still reads its chain ID and allocations from this
-file before starting the local producer. `init` plus `node` is therefore a
-single-node demo, not network bootstrap. The `--validator`, `--bootnodes`, and
-global `--config` flags are parsed but do not activate those systems yet.
-
-For an optimized CLI binary, use the narrower release build below. The workspace
-release profile uses fat LTO and one codegen unit, so it is slower and more
-memory-intensive than the debug quick start:
+The scripts under `scripts/` do the whole flow with throwaway directories, so
+your real `~/.subhost` is never touched:
 
 ```bash
-cargo build -p subhost-cli --release -j 1
-./target/release/subhost --help
+cargo build -p subhost-cli
+scripts/two-user-setup.sh          # creates Alice and Bob, writes genesis
+# then, following the printed instructions:
+./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir /tmp/subhost-demo-data.XXXX
+source /tmp/subhost-two-users-current.env && scripts/user1-alice.sh
+source /tmp/subhost-two-users-current.env && scripts/user2-bob.sh
 ```
 
-### Docker
+The environment file holds addresses only, never private keys. Amounts,
+passwords, and the RPC URL are overridable through environment variables, for
+example `ALICE_AMOUNT=50 scripts/user1-alice.sh`.
 
-The repo ships a `Dockerfile` and `docker-compose.yml`, but they are not currently
-an executable deployment path. See **Docker Compose Reference** above.
+### Web dashboard
+
+```bash
+cargo build -p subhost-cli -p subhost-explorer
+scripts/start-web-demo.sh          # node + explorer on 127.0.0.1:3000
+```
+
+The explorer polls the node and shows the last 12 blocks with their transfers. It
+also exposes `POST /api/transfer`, which decrypts a local wallet using a password
+from the request body. That is only acceptable on a single-operator machine, so
+the explorer **refuses to bind to anything but a loopback address**.
+
+---
+
+## CLI
+
+```bash
+subhost init --chain-id 1 --data-dir ./data \
+  --alloc ADDRESS=BALANCE \
+  --validator ADDRESS=PUBKEY_HEX:POWER
+
+subhost node --listen 127.0.0.1:8545 --data-dir ./data \
+  [--validator] [--metrics-addr 127.0.0.1:9090] [--max-connections 1000]
+
+subhost wallet new --password <password> [--name alice]
+subhost wallet import --private-key <32-byte-hex> --password <password>
+subhost wallet list
+subhost wallet show <address>
+subhost wallet export <address> --password <password>
+
+subhost tx send --from <address> --to <address> --amount <units> \
+  --password <password> [--nonce N] [--chain-id N] [--gas-price N]
+subhost tx status <tx-hash>
+
+subhost query balance <address>
+subhost query nonce <address>
+subhost query block [--height N] [--full]
+subhost query chain
+```
+
+Wallets live in `$SUBHOST_HOME/wallets` (default `~/.subhost/wallets`). `--nonce`
+and `--chain-id` are queried from the node when omitted. `--verbose` and
+`--quiet` control log level; `RUST_LOG` overrides both.
+
+---
+
+## JSON-RPC
+
+Served on the address given to `node --listen`.
+
+| Method | Notes |
+|--------|-------|
+| `eth_chainId` | Configured chain ID. |
+| `net_version` | Chain ID as a decimal string. |
+| `eth_blockNumber` | Height of the newest committed block. |
+| `eth_gasPrice` | The mempool's minimum accepted gas price. |
+| `eth_getBalance` | Real account balance. |
+| `eth_getTransactionCount` | Next expected nonce. |
+| `eth_sendTransaction` | Signed transfers only — see below. |
+| `eth_getTransactionReceipt` | Real receipt, or `null`. |
+| `eth_getBlockByNumber` | Accepts `latest`, `earliest`, `pending`, or a hex height. |
+| `eth_getTransactionByHash` | Committed transactions only. |
+
+`eth_sendTransaction` **deviates from standard Ethereum**. The node never holds a
+user key, so the caller must sign and supply:
+
+- `publicKey` — 32-byte hex ed25519 public key, which must hash to `from`
+- `signature` — 64-byte hex ed25519 signature over the bincode encoding of the
+  transaction with a cleared signature field
+
+The request is rejected unless the signature verifies, the chain ID matches, the
+nonce is exactly the account's current nonce, and the balance covers
+`value + gas_price * gas_limit`. Only transfers execute; contract creation and
+every other transaction type are refused explicitly.
+
+Each accepted transaction is executed and sealed into its own block, and the
+ledger is written to disk before the in-memory state is updated. A call therefore
+returns either the hash of a committed block or an error — there is no pending
+limbo.
+
+### Security posture
+
+The JSON-RPC and metrics endpoints have **no authentication and no TLS**. Bind
+them to loopback, or put an authenticating reverse proxy in front. The node logs
+a warning when it binds a non-loopback address.
+
+---
+
+## Faucet
+
+```bash
+export SUBHOST_FAUCET_PASSWORD='...'
+FAUCET_WALLET_PATH=./faucet-wallet.json \
+SUBHOST_RPC_URL=http://127.0.0.1:8545 \
+  ./target/debug/subhost-faucet
+```
+
+`POST /drip {"address":"0x..."}` signs a real transfer from the faucet wallet and
+returns the hash the node accepted. `GET /status` reports the faucet address,
+balance, and drip parameters. Rate limiting is per lowercased address, so letter
+case cannot bypass the cooldown, and a failed drip releases the slot so a node
+outage does not lock a caller out.
+
+The faucet is unauthenticated by design. Put IP-level rate limiting and TLS in
+front of it before exposing it.
+
+---
+
+## Benchmarks
+
+```bash
+cargo build -p subhost-bench --release
+./target/release/subhost-bench --endpoint http://127.0.0.1:8545 -d 60 -c 100 tps
+./target/release/subhost-bench --endpoint http://127.0.0.1:8545 -d 60 latency
+./target/release/subhost-bench --endpoint http://127.0.0.1:8545 -d 300 load
+```
+
+The tool probes the endpoint before measuring and fails fast if it is
+unreachable. Successes and failures are reported separately, and only successful
+requests enter the latency histogram, so a timing run cannot be inflated by
+errors. These are RPC-level measurements of a single node, not consensus
+throughput.
+
+No performance figure is published here. Anything you may have seen elsewhere
+about 50k TPS or sub-second finality describes a design target, not a measurement
+of this code.
+
+---
+
+## Docker
+
+```bash
+docker compose up --build
+```
+
+Starts one node (`127.0.0.1:8545`, metrics on `127.0.0.1:9090`), the explorer
+(`127.0.0.1:3000`), and Prometheus (`127.0.0.1:9091`). Every port is published on
+loopback only, containers run as an unprivileged user with a read-only root
+filesystem, and the build uses `--locked` so an image cannot be produced from an
+unreviewed dependency set.
+
+The stack is a single node. Because block production is single-node, running
+several `subhost node` services would produce independent chains, not one
+network.
+
+---
+
+## Development
+
+```bash
+cargo fmt --all
+cargo lint                        # clippy over the whole workspace, warnings denied
+cargo test --workspace --all-features
+cargo deny --all-features check   # advisories, licences, banned crates, sources
+```
+
+CI enforces formatting, clippy with `-D warnings` across all targets and
+features, the full test suite, the 1.89 MSRV, a release build, `cargo deny`, and
+warning-free rustdoc. The workspace forbids `unsafe_code` and denies `todo!`,
+`unimplemented!`, and `dbg!`.
 
 ---
 
 ## Documentation
 
-- **[Tokenomics](docs/tokenomics.md)** - undeployed SUB economic design
-- **[Security](docs/security/threat-model.md)** - threat model and mitigation roadmap
-- **[Hosted documentation](https://subhost-web3.vercel.app/docs)** - generated project documentation
+- [Threat model](docs/security/threat-model.md)
+- [Manual testing guide](docs/manual-testing.md)
+- [Tokenomics design](docs/tokenomics.md) — an undeployed economic proposal, not a live token
+- [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
 
-### Documentation Website
-
-Hosted documentation is available at:
-
-- **Main site**: [subhost-web3.vercel.app](https://subhost-web3.vercel.app)
-- **Documentation**: [Overview](https://subhost-web3.vercel.app/docs)
-- **Guides**: [Getting Started](https://subhost-web3.vercel.app/docs/getting-started), [Features](https://subhost-web3.vercel.app/docs/features), [Smart Contracts](https://subhost-web3.vercel.app/docs/contracts), [Staking](https://subhost-web3.vercel.app/docs/staking)
-
-The hosted site is maintained separately and can lag behind this repository.
-For commands, package names, and implementation status, this README and the
-checked-in source are authoritative.
-
----
-
-## Security
-
-### Audits
-
-No completed third-party audit report is checked into this repository. Previously
-listed auditor names and target dates were proposals only and are not evidence of
-an engagement or completed review.
-
-### Changelog & Pentest Plan
-
-- **[CHANGELOG.md](CHANGELOG.md)** — exact list of every change made during the
-  audit/hardening pass (kept accurate; no un-verified claims).
-- **[PENTEST.md](PENTEST.md)** — a drop-in prompt for an LLM security audit with
-  a strict fix → test → repeat loop and anti-hallucination rules.
-
-### Reporting Security Issues
-
-There is **no bug bounty program**. Report vulnerabilities privately via:
-- Email: **security@subhost.xyz**
-- GitHub: [Security Advisories](https://github.com/zulfff/SubHost-demo/security/advisories)
-
-### Known Limitations (By Design)
-
-All architectural limitations are documented with mitigation strategies. See [Threat Model](docs/security/threat-model.md).
-
----
-
-## Tokenomics
-
-### SUB Token
-
-| Parameter | Value |
-|-----------|-------|
-| Total Supply | 1,000,000,000 SUB |
-| Initial Circulation | 150,000,000 SUB (15%) |
-| Inflation | 5% annually, decaying |
-| Staking Rewards | 70% of inflation |
-| Treasury | 20% of inflation |
-| Burn Mechanism | 50% of fees burned |
-
-See [detailed tokenomics](docs/tokenomics.md).
-
----
-
-## Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md).
+No third-party audit of this codebase has been completed.
 
 ---
 
 ## License
 
-Licensed under the Apache License, Version 2.0.
-
----
+Apache License 2.0. See [LICENSE](LICENSE).
 
 <p align="center">
   <sub>Built by the Subhost Labs team</sub>

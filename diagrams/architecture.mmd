@@ -1,56 +1,75 @@
+%% TARGET architecture, not the current runtime topology.
+%% See the status table in README.md for what is implemented today.
+%% Solid borders are implemented; dashed borders are not.
 graph TB
     subgraph "Application Layer"
-        SC[Smart Contracts]
-        WR[WASM Runtime]
-        IBC[IBC Bridge]
-        GOV[Governance]
+        SC[Smart Contracts]:::planned
+        WR[WASM Runtime]:::planned
+        IBC[IBC Bridge<br/>local packet state machine only]:::partial
+        GOV[Governance]:::planned
     end
 
     subgraph "Execution Layer"
-        EVM[Parallel EVM]
-        SM[State Manager]
-        GM[Gas Meter]
-        RM[Resource Monitor]
+        EVM[Parallel EVM]:::planned
+        SM[State Manager<br/>balances, nonces, fees]:::done
+        GM[Gas Meter<br/>flat per-tx gas]:::partial
     end
 
     subgraph "Consensus Layer"
-        DAG[Narwhal DAG]
-        HS[HotStuff Finality]
-        BLS[BLS Aggregation]
-        SL[Slashing Module]
+        DAG[Narwhal DAG<br/>vertex admission + quorum support]:::partial
+        HS[HotStuff<br/>QC validation + safety rule]:::partial
+        BLS[BLS Aggregation<br/>sign, verify, aggregate, PoP]:::done
+        SL[Slashing Module]:::done
+        LOOP[Consensus Driver]:::planned
     end
 
     subgraph "Network Layer"
-        P2P[Libp2p Transport]
-        DP[Dandelion++]
-        TE[Threshold Encryption]
-        MS[MEV Shield]
+        P2P[libp2p Transport<br/>gossip publish + receive]:::done
+        DP[Dandelion++ Relay]:::planned
+        TE[Threshold Encryption]:::planned
+        MS[MEV Shield]:::planned
     end
 
     subgraph "Storage Layer"
-        MPT[Merkle Patricia Trie]
-        EC[Erasure Coding]
-        SR[State Rent]
-        AR[Archival Nodes]
+        LEDGER[Checksummed Ledger<br/>atomic write + full replay]:::done
+        MPT[Merkle Patricia Trie]:::planned
+        EC[Erasure Coding]:::planned
+        SR[State Rent]:::planned
     end
 
-    SC --> EVM
-    WR --> EVM
+    subgraph "Interface Layer"
+        RPC[JSON-RPC<br/>signed writes]:::done
+        CLI[CLI]:::done
+        EXP[Explorer]:::done
+        MET[Prometheus Metrics]:::done
+    end
+
+    CLI --> RPC
+    EXP --> RPC
+    RPC --> SM
+    RPC --> LEDGER
+    RPC --> MET
+
+    SC -.-> EVM
+    WR -.-> EVM
     IBC --> SM
-    GOV --> SM
-    
-    EVM --> DAG
-    SM --> MPT
-    GM --> HS
-    
-    DAG --> P2P
+    GOV -.-> SM
+    EVM -.-> SM
+
+    SM --> LEDGER
+    LEDGER -.-> MPT
+    MPT -.-> EC
+    EC -.-> SR
+
+    LOOP -.-> DAG
+    LOOP -.-> HS
+    DAG -.-> P2P
     HS --> BLS
     BLS --> SL
-    
-    P2P --> DP
-    DP --> TE
-    TE --> MS
-    
-    MPT --> EC
-    EC --> SR
-    SR --> AR
+    P2P -.-> DP
+    DP -.-> TE
+    TE -.-> MS
+
+    classDef done fill:#1b4332,stroke:#2d6a4f,color:#fff
+    classDef partial fill:#5a4000,stroke:#8a6d00,color:#fff
+    classDef planned fill:#3a3a3a,stroke:#666,color:#bbb,stroke-dasharray: 5 5

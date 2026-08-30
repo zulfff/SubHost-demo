@@ -1,0 +1,45 @@
+name: Bug report
+description: Report incorrect behaviour in the codebase.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report suspected vulnerabilities here. Follow SECURITY.md instead.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: Output of `git rev-parse HEAD`.
+    validations:
+      required: true
+  - type: input
+    id: toolchain
+    attributes:
+      label: Toolchain
+      description: Output of `rustc --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include the exact error output.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: The exact commands that reproduce the problem.
+      placeholder: |
+        1. cargo run -p subhost-cli -- init --data-dir ./data
+        2. ...
+    validations:
+      required: true

@@ -1,0 +1,21 @@
+# Keep the build context small and free of local state.
+target/
+.git/
+.github/
+data/
+docs/
+diagrams/
+scripts/
+*.md
+.gitignore
+.editorconfig
+deny.toml
+docker-compose.yml
+
+# Never ship secrets or local ledgers into an image.
+.env
+.env.*
+wallets/
+node-state.bin
+genesis.json
+faucet-wallet.json

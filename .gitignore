@@ -1,40 +1,31 @@
 # Rust build artifacts
-target/
+/target/
 **/*.rs.bk
 
-# IDE files
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Website build artifacts
-website/node_modules/
-website/dist/
-website/.next/
-website/.cache/
-
-# Logs
-*.log
-npm-debug.log*
+# Local node and wallet data — never commit key material or ledgers
+/data/
+*.node-state.bin
+node-state.bin
+genesis.json
+faucet-wallet.json
+wallets/
 
 # Environment files
 .env
 .env.local
 .env.*.local
 
-# Large binaries
-*.a
-*.so
-*.dylib
-*.dll
-*.exe
-website/
-website/
-website/
-website/
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Logs and coverage
+*.log
+npm-debug.log*
+/coverage/
+*.profraw

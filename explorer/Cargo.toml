@@ -1,24 +1,36 @@
 [package]
 name = "subhost-explorer"
-version = "0.1.0"
-edition = "2021"
-authors = ["Subhost Labs <dev@subhost.io>"]
-license = "Apache-2.0"
-description = "Block explorer web UI for Subhost Web3"
-repository = "https://github.com/subhost-labs/subhost-web3"
-rust-version = "1.75"
+description = "Read-only block explorer and demo signing UI for Subhost Web3"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "subhost-explorer"
+path = "src/main.rs"
 
 [dependencies]
-subhost-core = { path = "../subhost-core" }
-subhost-rpc = { path = "../subhost-rpc" }
-tokio = { workspace = true }
-axum = "0.7"
-tower = "0.4"
-tower-http = { version = "0.5", features = ["fs", "cors"] }
+subhost-core = { workspace = true }
+subhost-telemetry = { workspace = true }
+subhost-wallet = { workspace = true }
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
-askama = "0.12"
-reqwest = { version = "0.11", features = ["json"] }
-chrono = "0.4"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "rt-multi-thread", "macros"] }

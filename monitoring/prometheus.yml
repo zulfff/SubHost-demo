@@ -1,0 +1,11 @@
+# Scrapes the metrics exporter served by `subhost node --metrics-addr`.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: subhost-node
+    static_configs:
+      - targets: ["node:9090"]
+        labels:
+          service: subhost-node

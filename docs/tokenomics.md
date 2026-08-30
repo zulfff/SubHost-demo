@@ -55,14 +55,22 @@ treasury. Reward and treasury distribution are not implemented.
 
 The design proposes the following staking parameters:
 
-- **Minimum Validator Self-Stake**: 10,000,000 SUB (matches `subhost-consensus/src/staking.rs`)
-- **Minimum Delegation**: 1,000 SUB (design target; not enforced)
-- **Unbonding Period**: 14 days (design target; not yet enforced in code)
-- **Reward Distribution**: Per block (design target; no reward issuance implemented)
-- **Slashing**: a minimal in-memory module applies penalties for modeled evidence
+- **Minimum Validator Self-Stake**: 10,000,000 SUB — enforced as
+  `MIN_VALIDATOR_STAKE` in `crates/subhost-consensus/src/staking.rs`
+- **Maximum Commission**: 10,000 basis points — enforced by `Validator::validate`
+- **Minimum Delegation**: 1,000 SUB (design target; only a non-zero amount is enforced)
+- **Unbonding Period**: 14 days (design target; not enforced)
+- **Reward Distribution**: Per block (design target; no issuance implemented)
+- **Slashing**: implemented in memory. Double-signing burns the whole stake and
+  ejects the validator along with its delegations, malicious behaviour takes 50%,
+  and downtime takes 1%. Evidence must carry a proof and is recorded before any
+  mutation.
 
-> Note: `subhost-consensus` has a minimal `StakingModule` (add validator / delegate /
-> slash) but **no** delegation-bonding, reward distribution, or unbonding is wired.
+> `StakingModule` implements registration, delegation, undelegation, the validator
+> set with its quorum sizing, and slashing, all with checked arithmetic. It does
+> **not** implement bonding periods, reward distribution, or unbonding, and it
+> holds no on-chain state — nothing in this repository connects it to a running
+> chain.
 
 ### Validator Economics
 

@@ -2,16 +2,27 @@
 
 This document outlines the security assumptions, potential threats, and mitigations for the Subhost protocol. It is a living document that evolves as the protocol matures and new threats are identified.
 
-> **IMPORTANT — implementation status.** A security *threat model* describes the
-> full surface we intend to defend. Many listed artifacts in this document are
-> **design goals, not current features**. Today the codebase implements: BLS12-381
-> & ed25519 signatures with BLS proof-of-possession, ChaCha20-Poly1305/X25519, an
-> a bounded mempool, persistent single-node state/blocks, a JSON-RPC server, and a
-> libp2p scaffold. It does
-> **not** yet implement: an encrypted mempool, Dandelion++ routing, threshold
-> encryption / governance, a production consensus loop, oracle / MEV defenses, an HSM
-> program, or a bug bounty (there is none). Mitigations below should be read as the
-> roadmap, not as an assurance that they are live today.
+> **Implementation status.** A threat model describes the surface we intend to
+> defend, so most mitigations below are a roadmap rather than a live control. Read
+> them as intent, not as assurance.
+>
+> **Implemented today:** BLS12-381 and ed25519 signatures with mandatory
+> proof-of-possession for validator registration; ChaCha20-Poly1305 AEAD and
+> contributory-checked X25519; scrypt + AES-256-GCM wallets; a bounded mempool with
+> replace-by-fee and deterministic ordering; account rules with nonce ordering,
+> replay rejection, and checked arithmetic; a checksummed, atomically written
+> ledger whose every block and receipt commitment is replayed on load; a JSON-RPC
+> subset that requires a valid signature bound to the sender; BLS-verified quorum
+> certificates; stake-deducting slashing; and a libp2p gossip transport.
+>
+> **Not implemented:** a consensus loop or block propagation, an encrypted mempool,
+> Dandelion++ routing, threshold encryption, on-chain governance, EVM or WASM
+> execution, zk proofs, a Merkle Patricia Trie, oracle or MEV defences, an HSM
+> program, and any authentication on the JSON-RPC, metrics, or faucet surfaces.
+> There is no bug bounty.
+>
+> `SECURITY.md` is the authoritative, code-verified statement of the current
+> posture. Where this document and `SECURITY.md` disagree, `SECURITY.md` wins.
 
 ## Security Objectives
 

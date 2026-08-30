@@ -1,125 +1,104 @@
-# Contributing to SubHost
+# Contributing
 
-Hey, thanks for wanting to help out! Really appreciate it.
+Thanks for wanting to help. This document is the short version of what a
+reviewable change looks like here.
 
-## Getting Started
-
-First things first, fork the repo and clone it:
+## Setup
 
 ```bash
 git clone https://github.com/zulfff/SubHost-demo.git
 cd SubHost-demo
 ```
 
-Make sure you got Rust installed (need 1.75+):
+`rust-toolchain.toml` pins the toolchain, so `rustup` installs the right compiler
+and components (`rustfmt`, `clippy`) automatically on first build. The minimum
+supported Rust version is 1.89, and CI checks it separately. It is not 1.75:
+transitive dependencies in `Cargo.lock` require edition 2024, which 1.75 cannot
+parse, and `enum-ordinalize` (reached through `educe` -> `ark-ec`) requires 1.89.
+
+`.cargo/config.toml` caps build parallelism at two jobs, which keeps a release
+build inside about 4 GB of RAM. On a larger machine, override it with `--jobs` or
+`CARGO_BUILD_JOBS`.
+
+## Before you open a pull request
+
+Run the same gates CI runs:
 
 ```bash
-rustc --version
+cargo fmt --all
+cargo lint                        # clippy over the whole workspace, warnings denied
+cargo test --workspace --all-features
 ```
 
-If not, grab it from [rustup.rs](https://rustup.rs). The formatting and lint
-commands also need the `rustfmt` and `clippy` components:
+CI additionally runs `cargo deny --all-features check`, a 1.89 MSRV check, a
+release build, and `cargo doc` with warnings denied. All of them are required.
 
-```bash
-rustup component add rustfmt clippy
-```
+## What the code must satisfy
 
-## How to Contribute
+- **No warnings.** Clippy runs with `-D warnings` over every target and feature.
+- **No `unsafe`.** The workspace sets `unsafe_code = "forbid"`.
+- **No placeholders.** `todo!`, `unimplemented!`, and `dbg!` are denied. A function
+  that cannot do its job must return an error, not pretend to succeed.
+- **Checked arithmetic on anything that represents value.** Balances, nonces, and
+  gas are `checked_*`, not wrapping. An overflow is an error.
+- **Tests for behaviour, including the failure paths.** A new validation rule needs
+  a test proving the invalid input is rejected, not only that valid input passes.
+- **Document why, not what.** Comments should explain a non-obvious decision or a
+  security property. Do not narrate the code.
 
-### 1. Create a branch
+## Honesty about scope
 
-```bash
-git checkout -b my-awesome-feature
-```
+The README's status table is authoritative about what is implemented. If your
+change makes something work, update that table. If it does not, do not describe it
+as if it does — an aspirational comment or doc line is treated as a defect here.
 
-### 2. Do your thing
+Naming a module after a technique does not implement it. `subhost-network` carries
+a `TransactionStem` message type but implements no Dandelion++ relay, and the
+module documentation says so. Keep that pattern.
 
-Write code, break things, fix them, you know the drill.
+## Security-sensitive areas
 
-Before you commit, run one heavy Cargo command at a time. On a machine with about
-4 GB RAM, use one compiler job:
+Changes under these paths get closer review, and `.github/CODEOWNERS` enforces it:
 
-```bash
-cargo fmt --all -- --check
-cargo check --workspace -j 1
+- `crates/subhost-crypto` — signature and key-exchange primitives
+- `crates/subhost-wallet` — key storage and derivation
+- `crates/subhost-consensus` — quorum and slashing rules
+- `crates/subhost-state` — balance and nonce rules
+- `crates/subhost-storage` — the durable ledger format
+- `crates/subhost-rpc` — the authenticated write path
 
-# Test and lint the package you changed; subhost-cli is an example.
-cargo test -p subhost-cli -j 1
-cargo clippy -p subhost-cli --all-targets -j 1 -- -D warnings
-```
+If you change a signature payload, an address derivation, or the on-disk format,
+say so explicitly in the pull request: those changes invalidate existing wallets
+or ledgers.
 
-Replace `subhost-cli` with each package affected by your change. Do not run
-`cargo test --workspace` blindly on a low-memory machine: some test targets pull
-large EVM/WASM dependency graphs. The CI workflow shows the current safe
-multi-package test set.
+Do not open a public issue for a suspected vulnerability. Follow
+[SECURITY.md](SECURITY.md).
 
-### 3. Commit it
+## Commits and pull requests
 
-```bash
-git add .
-git commit -m "what you did in plain english"
-git push origin my-awesome-feature
-```
+Conventional-style prefixes are preferred: `feat:`, `fix:`, `docs:`, `refactor:`,
+`perf:`, `test:`, `build:`, `ci:`.
 
-### 4. Open a Pull Request
+The pull request template asks what changed, how you verified it, the security
+impact, and whether anything breaks. Fill it in; "none" is a fine answer when it
+is true.
 
-Go to GitHub, hit "New Pull Request", and tell us:
-- What you changed and why
-- Any issues it fixes
-- Screenshots if there's UI stuff
+Never commit a private key, wallet file, ledger, or `.env`. `.gitignore` covers
+the usual paths, but check `git diff --cached` before you commit.
 
-## Code Style
+## Where help is most useful
 
-We try to keep it simple:
+- **Consensus driver.** The quorum primitives exist and are tested; nothing drives
+  them into agreement yet.
+- **Block propagation.** `subhost-network` can publish and receive gossip, but no
+  node consumes it.
+- **Multi-transaction blocks.** The producer seals one transaction per block.
+- **IBC proof verification.** Packet bookkeeping is done; light-client and
+  commitment proof verification is not.
+- **State commitment.** The state root hashes a sorted account list; a Merkle
+  structure would allow proofs.
 
-- Run `cargo fmt --all -- --check` before committing
-- Fix clippy warnings, don't ignore them
-- Document your public functions with `///` comments
-- Use `thiserror` or `anyhow` for errors
+## Reporting a bug
 
-### Commit message format (optional but nice)
-
-```
-feat: add new thing
-fix: fix broken thing
-docs: update readme
-refactor: clean up mess
-perf: make it faster
-test: add more tests
-```
-
-## Where We Need Help
-
-These areas could use some love:
-
-- **Crypto/ZK stuff** - optimizations, new curves
-- **P2P networking** - libp2p is tricky, help welcome
-- **Consensus** - HotStuff and DAG improvements
-- **EVM compatibility** - revm integration work
-- **Benchmarks** - performance testing
-- **Documentation** - always behind on this
-
-## Found a Bug?
-
-Open an issue and tell us:
-1. What you were trying to do
-2. What you expected to happen
-3. What actually happened
-4. How to reproduce it
-5. Your setup (OS, Rust version, etc)
-
-The more detail, the faster we can fix it.
-
-## Questions?
-
-- Open a GitHub Discussion
-- Comment on relevant issues
-- Or just open an issue and ask
-
-## One Rule
-
-Don't be a jerk. Help others learn, be patient with mistakes, assume good intentions.
-
----
-
-That's pretty much it. Looking forward to your PR!
+Use the issue template. Include the commit, `rustc --version`, the exact commands
+that reproduce the problem, and the error output verbatim.

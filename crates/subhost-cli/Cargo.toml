@@ -1,31 +1,35 @@
 [package]
 name = "subhost-cli"
-version = "0.1.0"
-edition = "2021"
-authors = ["Subhost Labs <dev@subhost.io>"]
-license = "Apache-2.0"
-description = "CLI tool for Subhost Web3 protocol"
-repository = "https://github.com/subhost-labs/subhost-web3"
-rust-version = "1.75"
+description = "Command line interface for the Subhost Web3 protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "subhost"
 path = "src/main.rs"
 
 [dependencies]
-subhost-core = { path = "../subhost-core" }
-subhost-crypto = { path = "../subhost-crypto" }
-subhost-wallet = { path = "../subhost-wallet" }
-subhost-rpc = { path = "../subhost-rpc" }
-subhost-mempool = { path = "../subhost-mempool" }
-clap = { version = "4.4", features = ["derive"] }
-tokio = { workspace = true }
+subhost-core = { workspace = true }
+subhost-node = { workspace = true }
+subhost-telemetry = { workspace = true }
+subhost-wallet = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]
-tokio-test = { workspace = true }
+subhost-wallet = { workspace = true }
+tempfile = { workspace = true }
