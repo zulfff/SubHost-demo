@@ -56,7 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Must match `rust-version` in the workspace manifest.
-      - uses: dtolnay/rust-toolchain@1.89.0
+      - uses: dtolnay/rust-toolchain@1.100.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-features
 
