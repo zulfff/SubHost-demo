@@ -29,3 +29,10 @@ Thumbs.db
 npm-debug.log*
 /coverage/
 *.profraw
+
+# Internal working documents, kept local and deliberately untracked.
+# PENTEST.md is an audit prompt for an LLM, not a published finding; publishing it
+# advertises the exact review process and the areas known to be unfinished.
+# PRESENTASI.md is a coursework presentation script naming presenters.
+PENTEST.md
+PRESENTASI.md
