@@ -82,7 +82,7 @@ aes-gcm = "0.10"
 # tokio transport, not async-std: the whole application is tokio-based, and
 # async-std is discontinued (RUSTSEC-2025-0052).
 libp2p = { version = "0.56", features = ["tcp", "dns", "tokio", "noise", "yamux", "ping", "kad", "gossipsub", "mdns", "macros"] }
-jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+jsonrpsee = { version = "0.26", features = ["server", "macros"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors", "limit"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
