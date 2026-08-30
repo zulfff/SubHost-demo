@@ -892,7 +892,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3725,7 +3725,7 @@ dependencies = [
  "ark-serialize",
  "chacha20poly1305",
  "ed25519-dalek 3.0.0",
- "rand 0.8.8",
+ "rand 0.10.2",
  "sha3",
  "thiserror 1.0.69",
  "x25519-dalek",
@@ -3892,7 +3892,7 @@ dependencies = [
  "aes-gcm",
  "ed25519-dalek 3.0.0",
  "hex",
- "rand 0.8.8",
+ "rand 0.10.2",
  "scrypt",
  "serde",
  "serde_json",
