@@ -91,7 +91,8 @@ allocations only when no ledger exists yet.
 "$SUBHOST_BIN" init \
   --chain-id 1 \
   --data-dir "$SUBHOST_TEST_DATA" \
-  --alloc "$ALICE_ADDRESS=1000000"
+  --alloc "$ALICE_ADDRESS=1000000" \
+  --alloc "$BOB_ADDRESS=100000"
 ```
 
 `init` reports that no validators are configured. That is expected: the genesis is
@@ -124,7 +125,7 @@ Expected:
 chain_id  1
 height    0
 0x...alice   1000000
-0x...bob     0
+0x...bob     100000
 ```
 
 Balances print in decimal. Raw JSON-RPC returns hex.
@@ -145,7 +146,7 @@ hash of the committed block's transaction. Pass `--nonce` and `--chain-id`
 explicitly to override the queried values.
 
 With `gas_price = 1` and `gas_limit = 21000` the fee is 21000. Alice therefore ends
-at `1000000 - 100 - 21000 = 978900`, and Bob receives `100`.
+at `1000000 - 100 - 21000 = 978900`, and Bob ends at `100000 + 100 = 100100`.
 
 ## 7. Verify the receipt and the block
 
@@ -171,7 +172,8 @@ A successful receipt has `"status": "0x1"`, `"blockNumber": "0x1"`, and
   --password "bob-pass-123"
 ```
 
-This becomes block 2. The node seals one block per submission and fills it with
+This becomes block 2. Bob pays the 25 plus the 21000 fee, so Bob ends at `79075`
+and Alice at `978925`. The node seals one block per submission and fills it with
 every pending transaction that is currently executable. If another sender submits
 at the same time, both transfers share a block, and their receipts report distinct
 `transactionIndex` and `cumulativeGasUsed` values.
@@ -204,8 +206,12 @@ curl -s http://127.0.0.1:8545 -H 'content-type: application/json' --data "{
   \"params\":[{\"from\":\"$ALICE_ADDRESS\",\"to\":\"$BOB_ADDRESS\",\"value\":\"0x1\"}]}"
 ```
 
-Expected errors, in order: `invalid nonce`, `decryption failed`, `insufficient
-balance`, `invalid chain ID`, and `-32602` for the unsigned request.
+Expected results, in order: `transaction is not executable against the current
+state` for the stale nonce, `decryption failed` for the password, the same
+executable-state message for the overdrawn transfer, `invalid chain ID`, and
+`-32602` for the unsigned request. The node validates the nonce and the balance at
+execution time and collapses both failures into one rejection, so it does not say
+which check failed.
 
 ## 10. Confirm persistence
 
@@ -261,10 +267,11 @@ Send a transfer to node A, then ask node B:
 
 The follower logs `accepted a peer block` and reaches the same height, root, and
 balance. A block that arrives before its parent is buffered (up to 64 heights) and
-applied once the gap fills. Sending a transfer to **both** nodes produces two
-different blocks at the same height. Each node rejects the other's block because it
-does not extend the local tip, and neither recovers. That is expected until fork
-choice exists.
+applied once the gap fills. If both nodes seal a block at the same height before
+either block reaches the other, they produce two different blocks at that height.
+Each node rejects the other's block because it does not extend the local tip, and
+neither recovers. That is expected until fork choice exists. On loopback, gossip
+usually arrives before the second node seals, so the race is not guaranteed.
 
 ## 13. Optional: metrics
 
@@ -283,7 +290,8 @@ tracks mempool depth.
 Stop the node with `Ctrl-C` first.
 
 ```bash
-rm -rf "$SUBHOST_TEST_HOME" "$SUBHOST_TEST_DATA" "$SUBHOST_FOLLOWER_DATA"
+rm -rf "$SUBHOST_TEST_HOME" "$SUBHOST_TEST_DATA" "$SUBHOST_PRODUCER_DATA" \
+  "$SUBHOST_FOLLOWER_DATA"
 ```
 
 That only removes the `/tmp` directories created above.
@@ -294,8 +302,10 @@ That only removes the `/tmp` directories created above.
   created, or the address is wrong.
 - `decryption failed (wrong password or corrupt wallet)`: wrong password, or the
   file was modified.
-- `invalid nonce for 0x…: expected N, got M`: check `query nonce`.
-- `insufficient balance`: `amount + gas_price * gas_limit` exceeds the balance.
+- `transaction is not executable against the current state`: the nonce is not the
+  account's next nonce, or the balance does not cover `amount + gas_price *
+  gas_limit`. The node reports both as one rejection, so check `query nonce` and
+  `query balance`.
 - `invalid chain ID`: `--chain-id` must match the node.
 - `cannot reach the node at …`: the node is not running on that port.
 - `a validator network requires at least one initial validator`: `node

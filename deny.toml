@@ -19,17 +19,12 @@ ignore = [
     # version bump.
     { id = "RUSTSEC-2025-0141", reason = "bincode unmaintained; internal encoding only, ledger is separately verified" },
 
-    # The three below all arrive through libp2p -> libp2p-mdns/libp2p-dns ->
-    # hickory-*/if-watch. `subhost-network` is the only crate that depends on
-    # libp2p, and no binary in this workspace depends on `subhost-network`
-    # (verified with `cargo tree -i libp2p`), so none of this code is reachable
-    # in a shipped artifact. libp2p 0.56 pins hickory 0.25.2 and cannot take the
-    # fixed 0.26.1. Exit: whichever comes first — libp2p relaxing the hickory
-    # pin, or a node actually consuming `subhost-network`, at which point these
-    # must be resolved before that lands.
-    { id = "RUSTSEC-2026-0118", reason = "hickory-proto DNS resolution; unreachable from any binary, pinned by libp2p 0.56" },
-    { id = "RUSTSEC-2026-0119", reason = "hickory-proto DNS encoding; unreachable from any binary, pinned by libp2p 0.56" },
-    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; proc-macro reached only via if-watch under libp2p" },
+    # paste 1.0.15 — unmaintained. It is a build-time proc-macro reached only
+    # through libp2p-mdns / libp2p-tcp -> if-watch -> netlink-packet-*. It
+    # expands into generated code and no paste runtime is linked, and the netlink
+    # chain offers no maintained replacement. Exit: when if-watch or the netlink
+    # crates drop it.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; build-time proc-macro via if-watch under libp2p" },
 ]
 
 [licenses]
