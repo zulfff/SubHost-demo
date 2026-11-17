@@ -12,8 +12,9 @@
 //!   signature is verified over the unsigned encoding and the public key must
 //!   hash to the `from` address, so a caller cannot spend another account.
 //! - Blocks arriving from a peer go through [`RpcState::accept_block`], which
-//!   re-verifies parent, height, every signature, both roots, and the resulting
-//!   state root before any state changes.
+//!   re-verifies parent, height, every transaction signature, both roots, and the
+//!   resulting state root before any state changes. Block signatures are not
+//!   checked yet; S1.3 adds that.
 //! - The whole submit path holds one commit lock, and state is only swapped in
 //!   after the ledger write succeeds, so a failed persist cannot leave the
 //!   in-memory ledger ahead of disk.
@@ -27,5 +28,6 @@ mod state;
 #[cfg(test)]
 mod test_support;
 
+pub use block::BlockAuthority;
 pub use methods::{RpcServeError, RpcServer, RpcServerConfig};
 pub use state::{BlockEvent, RpcError, RpcState};

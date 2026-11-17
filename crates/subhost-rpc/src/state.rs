@@ -1,5 +1,6 @@
 //! Shared node state, its errors, and the lock helpers that guard it.
 
+use crate::block::BlockAuthority;
 use jsonrpsee::types::error::ErrorObject;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,9 @@ pub enum RpcError {
     #[error("block rejected: {0}")]
     BlockRejected(String),
 
+    #[error("block producer is not an authorized validator")]
+    UnauthorizedProducer,
+
     #[error("account has no state proof at the latest height")]
     UnknownAccount,
 
@@ -60,9 +64,9 @@ impl From<RpcError> for ErrorObject<'static> {
             RpcError::UnsupportedTransactionType(_) | RpcError::TransactionRejected(_) => {
                 ErrorObject::owned(-32000, message, None::<()>)
             }
-            RpcError::BlockRejected(_) | RpcError::UnknownAccount => {
-                ErrorObject::owned(-32000, message, None::<()>)
-            }
+            RpcError::BlockRejected(_)
+            | RpcError::UnknownAccount
+            | RpcError::UnauthorizedProducer => ErrorObject::owned(-32000, message, None::<()>),
             RpcError::Persistence(_) => {
                 ErrorObject::owned(-32603, "state persistence failed", None::<()>)
             }
@@ -109,6 +113,8 @@ pub struct RpcState {
     /// Block commits, for relay and tests. A lagging receiver only loses events;
     /// it never blocks the producer.
     pub(crate) block_events: broadcast::Sender<BlockEvent>,
+    /// Signing identity for blocks this node produces, when it is a validator.
+    pub(crate) authority: Option<Arc<BlockAuthority>>,
 }
 
 /// Buffered block events per subscriber. A node only needs the newest few.
@@ -144,7 +150,17 @@ impl RpcState {
             store,
             commit_lock: Arc::new(Mutex::new(())),
             block_events: broadcast::channel(BLOCK_EVENT_CAPACITY).0,
+            authority: None,
         })
+    }
+
+    /// Attach the validator identity that signs blocks this node produces.
+    ///
+    /// Without one, the node keeps the single-node behaviour: `validator` is
+    /// [`Address::ZERO`] and `signatures` is empty.
+    pub fn with_authority(mut self, authority: BlockAuthority) -> Self {
+        self.authority = Some(Arc::new(authority));
+        self
     }
 
     pub fn chain_id(&self) -> ChainId {
