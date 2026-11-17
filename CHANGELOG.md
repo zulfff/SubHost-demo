@@ -79,10 +79,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   was rejected. The genesis now funds Bob, the expected balances are updated, and
   the documented result for a stale nonce or an overdrawn sender now matches the
   message the node actually returns.
-- **Two documentation claims were inaccurate.** The README no longer says two
-  producers always fork: only producers that seal at the same height do. The threat
-  model now quotes the real `MIN_VALIDATOR_STAKE` of 10,000,000 SUB instead of
-  10,000.
+- **Several documentation claims did not match the code.** The README no longer
+  says two producers always fork: only producers that seal at the same height do.
+  The threat model now quotes the real `MIN_VALIDATOR_STAKE` of 10,000,000 SUB
+  instead of 10,000. The manual testing guide now records that the node updates
+  the block-height and pending-transaction gauges but leaves the RPC request
+  counters at zero.
 - **Faucet returned a fabricated transaction hash.** `handle_drip` hashed the
   address and the current time and returned that as `tx_hash`; no transfer was
   ever submitted and no balance changed. The faucet now loads an encrypted

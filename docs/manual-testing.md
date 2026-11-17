@@ -283,7 +283,9 @@ curl -s http://127.0.0.1:9090/health
 ```
 
 `subhost_block_height` tracks the chain tip and `subhost_pending_transactions`
-tracks mempool depth.
+tracks mempool depth. The registry also defines `subhost_rpc_requests_total`,
+`subhost_rpc_errors_total`, and a request-duration histogram, but the node does
+not increment them yet, so they stay at zero.
 
 ## 14. Clean up
 
