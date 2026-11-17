@@ -13,6 +13,8 @@ workspace = true
 
 [dependencies]
 subhost-core = { workspace = true }
+subhost-consensus = { workspace = true }
+subhost-crypto = { workspace = true }
 subhost-mempool = { workspace = true }
 subhost-state = { workspace = true }
 subhost-storage = { workspace = true }

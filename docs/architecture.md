@@ -81,7 +81,10 @@ until the commit succeeds.
   gas;
 - `gas_used` is the sum of the declared gas limits, and `gas_limit` is the fixed
   block ceiling;
-- `validator` is `Address::ZERO` and `signatures` is empty. See section 3.
+- `validator` is the configured producer address and `signatures` holds one BLS
+  signature over `Block::signing_payload()`. A node without a configured authority
+  keeps the single-node form: `validator` is `Address::ZERO` and `signatures` is
+  empty. See section 3.
 
 A producer never seals an empty block: if nothing is executable, submission fails
 instead of writing a block.
@@ -130,17 +133,25 @@ cannot succeed.
 ## 3. Who may produce a block
 
 Today: any node that can reach its own JSON-RPC port, and any peer that can deliver a
-valid block one height above the tip. There is no producer authorization.
+valid block one height above the tip. Blocks can be signed, but producer
+authorization is not enforced yet.
 
-- A locally produced block carries no validator identity and no signature.
+- A node configured with a `BlockAuthority` sets `header.validator` to its producer
+  address and attaches one BLS signature over `Block::signing_payload()`.
+  Construction checks that the producer is in the registry and that the supplied
+  secret belongs to the registered public key; it fails with
+  `RpcError::UnauthorizedProducer` otherwise.
+- A node without an authority keeps the single-node behaviour: `validator` is
+  `Address::ZERO` and `signatures` is empty.
 - `accept_block` does not check who produced a block. It checks that the block is
-  internally consistent and extends the tip.
+  internally consistent and extends the tip, and it ignores any block signature
+  bytes. S1.3 adds the check.
 - The JSON-RPC surface has no authentication, so the only thing that limits block
   production is who can reach the listening address. The node binds loopback by
   default.
 
 This is the gap S1 closes. `ADR-001` fixes BLS12-381 as the scheme, a dedicated
-producer key file, and a mandatory proof of possession. S1.2 signs
+producer key file, and a mandatory proof of possession. S1.2 now signs
 `Block::signing_payload()` on produce, S1.3 verifies one registered producer
 signature on accept, and S1.4 wires the key file and genesis registration into the
 node and CLI.

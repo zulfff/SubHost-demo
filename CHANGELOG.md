@@ -194,6 +194,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   at most one interval of transactions. Still outstanding and recorded in
   `ROADMAP.md`: segments are still read in full on start-up, the snapshot holds no
   receipt index, and history is not pruned.
+- **Block signing on produce.** `RpcState::with_authority` attaches a
+  `BlockAuthority`: the validator registry, the producer address, and its BLS
+  secret. When one is configured, `seal_block` sets `header.validator` and attaches
+  exactly one BLS signature over `Block::signing_payload()`; without one, the
+  single-node form stays `Address::ZERO` with an empty signature list.
+  `BlockAuthority::new` refuses an unregistered producer, or a secret whose public
+  key is not the registered one, with `RpcError::UnauthorizedProducer`.
+  `accept_block` still ignores block signatures; S1.3 adds verification.
 - **Segmented ledger store.** `subhost-storage` keeps history in
   `ledger/manifest.json` plus append-only `ledger/segments/NNNNNN.log` (framed
   records, BLAKE3 per record) and account state in
@@ -222,9 +230,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 - **BLS decoding helpers.** `BLSScheme::decode_public_key`,
   `BLSScheme::decode_signature`, `PUBLIC_KEY_BYTES` (48), and `SIGNATURE_BYTES`
   (96) turn compressed wire bytes into points with length and curve checks.
-  `encode_public_key`, `encode_secret_key`, `decode_secret_key`, and
-  `SECRET_KEY_BYTES` (32) define the producer key file convention: one canonical
-  little-endian scalar, hex-encoded on disk. Decoding rejects the zero scalar and
+  `encode_public_key`, `encode_signature`, `public_key`, `encode_secret_key`,
+  `decode_secret_key`, and `SECRET_KEY_BYTES` (32) define the producer key
+  convention: one canonical little-endian scalar, hex-encoded on disk, with its
+  48-byte public key and 96-byte signatures. Decoding rejects the zero scalar and
   any non-canonical encoding, so two different files cannot name the same key.
 - **Architecture overview.** `docs/architecture.md` explains the block lifecycle
   from submission to acceptance, who may produce a block today, what the ledger

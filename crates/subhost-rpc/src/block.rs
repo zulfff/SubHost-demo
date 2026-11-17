@@ -3,13 +3,54 @@
 use crate::state::{lock, read, write, BlockEvent, RpcError, RpcState};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use subhost_consensus::ValidatorRegistry;
 use subhost_core::{
     tx_root_of, Address, Block, BlockHeader, Gas, Hash, Receipt, ReceiptStatus, Transaction,
-    BLOCK_GAS_LIMIT,
+    ValidatorSignature, BLOCK_GAS_LIMIT,
 };
+use subhost_crypto::{BLSScheme, PrivateKey};
 use subhost_mempool::Mempool;
 use subhost_state::State;
 use subhost_storage::{receipt_commitment, receipts_root, LedgerSnapshot};
+
+/// The validator identity a node signs blocks with.
+///
+/// Construction checks the key against the registry, so a node cannot start
+/// signing as a validator it does not hold the key for, or with a key that does
+/// not belong to the address it claims.
+pub struct BlockAuthority {
+    validators: ValidatorRegistry,
+    producer: Address,
+    signing_key: PrivateKey,
+}
+
+impl BlockAuthority {
+    /// Bind a producer address and BLS secret to a validator registry.
+    ///
+    /// Fails with [`RpcError::UnauthorizedProducer`] when the producer is not
+    /// registered or when the secret's public key is not the registered one.
+    pub fn new(
+        validators: ValidatorRegistry,
+        producer: Address,
+        signing_key: PrivateKey,
+    ) -> Result<Self, RpcError> {
+        let Some(registered) = validators.public_key(&producer) else {
+            return Err(RpcError::UnauthorizedProducer);
+        };
+        if *registered != BLSScheme::public_key(&signing_key) {
+            return Err(RpcError::UnauthorizedProducer);
+        }
+        Ok(Self { validators, producer, signing_key })
+    }
+
+    pub fn producer(&self) -> Address {
+        self.producer
+    }
+
+    pub fn validators(&self) -> &ValidatorRegistry {
+        &self.validators
+    }
+}
 
 impl RpcState {
     /// Submit a transaction: admit it to a copy of the pool, then seal the next
@@ -122,24 +163,38 @@ impl RpcState {
             ));
         }
 
-        let block = Block {
-            header: BlockHeader {
-                version: 1,
-                chain_id: self.chain_id,
-                height,
-                timestamp: subhost_core::unix_timestamp(),
-                parent_hash,
-                state_root: candidate_state.root(),
-                tx_root: tx_root_of(&hashes),
-                receipt_root: receipts_root(&commitments),
-                // A single-node producer has no validator identity to attest with.
-                validator: Address::ZERO,
-                gas_used,
-                gas_limit: BLOCK_GAS_LIMIT,
-                extra_data: Vec::new(),
-            },
-            transactions,
-            signatures: Vec::new(),
+        let block = {
+            let validator = self.authority.as_ref().map_or(Address::ZERO, |a| a.producer);
+            let mut block = Block {
+                header: BlockHeader {
+                    version: 1,
+                    chain_id: self.chain_id,
+                    height,
+                    timestamp: subhost_core::unix_timestamp(),
+                    parent_hash,
+                    state_root: candidate_state.root(),
+                    tx_root: tx_root_of(&hashes),
+                    receipt_root: receipts_root(&commitments),
+                    // A producer without a configured authority has no identity to
+                    // attest with, which keeps single-node behaviour unchanged.
+                    validator,
+                    gas_used,
+                    gas_limit: BLOCK_GAS_LIMIT,
+                    extra_data: Vec::new(),
+                },
+                transactions,
+                signatures: Vec::new(),
+            };
+            if let Some(authority) = &self.authority {
+                // The payload commits to the block hash, so the header must be
+                // final before it is signed.
+                let signature = BLSScheme::sign(&authority.signing_key, &block.signing_payload());
+                block.signatures.push(ValidatorSignature {
+                    validator: authority.producer,
+                    signature: BLSScheme::encode_signature(&signature),
+                });
+            }
+            block
         };
 
         let block_hash = block.hash();
@@ -189,9 +244,10 @@ impl RpcState {
     /// Accept a block produced elsewhere (a peer or the consensus driver).
     ///
     /// The block is fully re-validated before any state change: parent, height,
-    /// chain, gas accounting, every signature, both commitments, the state
-    /// transition, and the resulting state root. Receipts are derived locally
-    /// and never taken from the wire.
+    /// chain, gas accounting, every transaction signature, both commitments, the
+    /// state transition, and the resulting state root. Receipts are derived
+    /// locally and never taken from the wire. Block signatures are carried but
+    /// not verified yet; S1.3 adds that.
     pub fn accept_block(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
         let previous = read(&self.blocks).last().cloned();
@@ -325,6 +381,77 @@ mod tests {
     use crate::state::read;
     use crate::test_support::{funded_state, signed_transfer, signing_key};
     use subhost_core::Amount;
+
+    /// A one-validator authority for `secret`, with a fixed producer address.
+    fn authority(secret: &PrivateKey) -> (BlockAuthority, Address) {
+        let producer = Address::new([9; 20]);
+        let public = BLSScheme::public_key(secret);
+        let mut registry = ValidatorRegistry::new();
+        registry.register(producer, public, &BLSScheme::proof_of_possession(secret)).unwrap();
+        let authority = BlockAuthority::new(registry, producer, secret.clone()).unwrap();
+        (authority, producer)
+    }
+
+    #[test]
+    fn authority_signs_the_block_it_produces() {
+        let tx_key = signing_key(7);
+        let (bls_secret, _) = BLSScheme::keygen();
+        let (authority, producer) = authority(&bls_secret);
+        let state = funded_state(&tx_key, 1_000_000).with_authority(authority);
+
+        state.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+
+        let block = state.block_at_height(1).unwrap();
+        assert_eq!(block.header.validator, producer);
+        assert_eq!(block.signatures.len(), 1);
+        let signature = &block.signatures[0];
+        assert_eq!(signature.validator, producer);
+        let decoded = BLSScheme::decode_signature(&signature.signature)
+            .expect("a produced block must carry a decodable BLS signature");
+        assert!(
+            BLSScheme::verify(
+                &BLSScheme::public_key(&bls_secret),
+                &block.signing_payload(),
+                &decoded
+            ),
+            "the signature must cover the block signing payload"
+        );
+    }
+
+    #[test]
+    fn no_authority_keeps_single_node_blocks_unsigned() {
+        let tx_key = signing_key(7);
+        let state = funded_state(&tx_key, 1_000_000);
+        state.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+
+        let block = state.block_at_height(1).unwrap();
+        assert_eq!(block.header.validator, Address::ZERO);
+        assert!(block.signatures.is_empty());
+    }
+
+    #[test]
+    fn authority_rejects_an_unknown_producer_or_a_foreign_key() {
+        let (bls_secret, _) = BLSScheme::keygen();
+        let (other_secret, _) = BLSScheme::keygen();
+        let public = BLSScheme::public_key(&bls_secret);
+        let proof = BLSScheme::proof_of_possession(&bls_secret);
+        let producer = Address::new([9; 20]);
+        let mut registry = ValidatorRegistry::new();
+        registry.register(producer, public, &proof).unwrap();
+
+        // The registry is valid, but it does not contain the claimed producer.
+        let outsider = Address::new([10; 20]);
+        assert!(matches!(
+            BlockAuthority::new(registry.clone(), outsider, bls_secret.clone()),
+            Err(RpcError::UnauthorizedProducer)
+        ));
+
+        // The producer is registered, but this secret is somebody else's.
+        assert!(matches!(
+            BlockAuthority::new(registry, producer, other_secret),
+            Err(RpcError::UnauthorizedProducer)
+        ));
+    }
 
     #[test]
     fn producer_executes_transfer_and_records_receipt() {

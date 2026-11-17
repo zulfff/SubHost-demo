@@ -134,8 +134,13 @@ impl BLSScheme {
 
     /// Sign one's own public key, proving possession of the matching secret.
     pub fn proof_of_possession(secret: &PrivateKey) -> Signature {
-        let public = G1Projective::generator() * secret.0;
+        let public = Self::public_key(secret);
         Self::hash_to_g2_in_domain(BLS_POP_DOMAIN, &Self::encode_public_key(&public)) * secret.0
+    }
+
+    /// The public key belonging to a signing secret.
+    pub fn public_key(secret: &PrivateKey) -> PublicKey {
+        G1Projective::generator() * secret.0
     }
 
     /// Verify a proof of possession against the key it claims to bind.
@@ -168,6 +173,15 @@ impl BLSScheme {
             return None;
         }
         Signature::deserialize_compressed(bytes).ok()
+    }
+
+    /// Compact 96-byte encoding of a signature, as stored in a block.
+    pub fn encode_signature(signature: &Signature) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        signature
+            .serialize_compressed(&mut bytes)
+            .expect("BLS12-381 G2 serialization into a Vec cannot fail");
+        bytes
     }
 
     /// Canonical compressed encoding of a public key.
@@ -423,6 +437,9 @@ mod tests {
         signature.serialize_compressed(&mut signature_bytes).unwrap();
         assert_eq!(key_bytes.len(), PUBLIC_KEY_BYTES);
         assert_eq!(signature_bytes.len(), SIGNATURE_BYTES);
+        assert_eq!(BLSScheme::public_key(&secret), public);
+        assert_eq!(BLSScheme::encode_public_key(&public), key_bytes);
+        assert_eq!(BLSScheme::encode_signature(&signature), signature_bytes);
 
         assert_eq!(BLSScheme::decode_public_key(&key_bytes), Some(public));
         assert_eq!(BLSScheme::decode_signature(&signature_bytes), Some(signature));

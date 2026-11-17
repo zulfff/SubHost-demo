@@ -42,7 +42,7 @@ should be treated as production ready.
 | `subhost-state` | Complete. Balances, nonce ordering, replay rejection, checked arithmetic, Merkle state root bound to the chain ID, per-account inclusion proofs. |
 | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
 | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
-| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, full re-validation of peer blocks, persist-before-commit. |
+| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, full re-validation of peer blocks, persist-before-commit. Block signatures are not verified on acceptance yet. |
 | `subhost-node` | Complete. Genesis load, ledger restore, RPC and metrics wiring, graceful shutdown, optional peer gossip that publishes locally produced blocks and applies peer blocks in height order. |
 | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
 | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
@@ -193,9 +193,10 @@ failed write leaves the pool, state, and receipts untouched. A call returns eith
 the hash of a committed block or an error. There is no pending limbo.
 
 A block accepted from a peer takes a separate path. The node re-verifies the
-parent, height, chain ID, gas accounting, every signature, both Merkle
+parent, height, chain ID, gas accounting, every transaction signature, both Merkle
 commitments, the full state transition, and the resulting state root. Receipts are
-derived locally and never trusted from the wire.
+derived locally and never trusted from the wire. Block signatures are produced but
+not verified yet.
 
 `eth_getProof` returns the leaf and sibling path for an existing account. The state
 tree is a plain Merkle tree over sorted account leaves, so membership is provable
