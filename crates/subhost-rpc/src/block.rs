@@ -241,13 +241,40 @@ impl RpcState {
         Ok(receipts)
     }
 
+    /// Check that a peer block is signed by a registered validator.
+    ///
+    /// A node without a configured authority keeps the pre-S1 behaviour and
+    /// accepts unsigned blocks. With one, the block must name a registered
+    /// validator and carry exactly one signature from that validator over
+    /// [`Block::signing_payload`]. Anything else is
+    /// [`RpcError::UnauthorizedProducer`].
+    fn verify_block_authority(&self, block: &Block) -> Result<(), RpcError> {
+        let Some(authority) = &self.authority else {
+            return Ok(());
+        };
+        let Some(public_key) = authority.validators.public_key(&block.header.validator) else {
+            return Err(RpcError::UnauthorizedProducer);
+        };
+        let [signature] = block.signatures.as_slice() else {
+            return Err(RpcError::UnauthorizedProducer);
+        };
+        if signature.validator != block.header.validator {
+            return Err(RpcError::UnauthorizedProducer);
+        }
+        let decoded = BLSScheme::decode_signature(&signature.signature)
+            .ok_or(RpcError::UnauthorizedProducer)?;
+        if !BLSScheme::verify(public_key, &block.signing_payload(), &decoded) {
+            return Err(RpcError::UnauthorizedProducer);
+        }
+        Ok(())
+    }
+
     /// Accept a block produced elsewhere (a peer or the consensus driver).
     ///
     /// The block is fully re-validated before any state change: parent, height,
-    /// chain, gas accounting, every transaction signature, both commitments, the
-    /// state transition, and the resulting state root. Receipts are derived
-    /// locally and never taken from the wire. Block signatures are carried but
-    /// not verified yet; S1.3 adds that.
+    /// chain, gas accounting, producer authority, every transaction signature,
+    /// both commitments, the state transition, and the resulting state root.
+    /// Receipts are derived locally and never taken from the wire.
     pub fn accept_block(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
         let previous = read(&self.blocks).last().cloned();
@@ -267,6 +294,10 @@ impl RpcState {
                 "block does not extend this chain at height {expected_height}"
             )));
         }
+
+        // Identity before execution: an unauthorized block must not reach the
+        // state transition at all.
+        self.verify_block_authority(&block)?;
 
         let mut candidate_state = read(&self.state).clone();
         let mut seen = HashSet::with_capacity(block.transactions.len());
@@ -392,6 +423,20 @@ mod tests {
         (authority, producer)
     }
 
+    fn registry(entries: &[(Address, &PrivateKey)]) -> ValidatorRegistry {
+        let mut registry = ValidatorRegistry::new();
+        for (address, secret) in entries {
+            registry
+                .register(
+                    *address,
+                    BLSScheme::public_key(secret),
+                    &BLSScheme::proof_of_possession(secret),
+                )
+                .unwrap();
+        }
+        registry
+    }
+
     #[test]
     fn authority_signs_the_block_it_produces() {
         let tx_key = signing_key(7);
@@ -451,6 +496,69 @@ mod tests {
             BlockAuthority::new(registry, producer, other_secret),
             Err(RpcError::UnauthorizedProducer)
         ));
+    }
+
+    /// A producer and a follower that both know the two-validator registry.
+    fn signed_block_and_follower() -> (Block, RpcState) {
+        let tx_key = signing_key(7);
+        let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+        let (alice_secret, _) = BLSScheme::keygen();
+        let (bob_secret, _) = BLSScheme::keygen();
+        let alice = Address::new([9; 20]);
+        let bob = Address::new([10; 20]);
+        let registry = registry(&[(alice, &alice_secret), (bob, &bob_secret)]);
+
+        let producer = funded_state(&tx_key, 1_000_000)
+            .with_authority(BlockAuthority::new(registry.clone(), alice, alice_secret).unwrap());
+        producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+        let block = producer.block_at_height(1).unwrap();
+
+        let follower = RpcState::in_memory(1)
+            .unwrap()
+            .with_authority(BlockAuthority::new(registry, bob, bob_secret).unwrap());
+        follower.seed_accounts([(sender, 1_000_000)]).unwrap();
+        (block, follower)
+    }
+
+    #[test]
+    fn a_block_with_a_valid_producer_signature_is_accepted() {
+        let (block, follower) = signed_block_and_follower();
+        follower.accept_block(block).unwrap();
+        assert_eq!(follower.block_height(), 1);
+        assert_eq!(follower.block_count(), 1);
+    }
+
+    #[test]
+    fn a_block_without_a_valid_producer_signature_is_rejected() {
+        let (block, follower) = signed_block_and_follower();
+
+        let mut missing = block.clone();
+        missing.signatures.clear();
+
+        let mut unknown = block.clone();
+        unknown.header.validator = Address::new([11; 20]);
+
+        let mut wrong_signer = block.clone();
+        wrong_signer.signatures[0].validator = Address::new([10; 20]);
+
+        let mut tampered_header = block.clone();
+        tampered_header.header.timestamp ^= 1;
+
+        let mut malformed = block.clone();
+        malformed.signatures[0].signature = vec![0xff; subhost_crypto::SIGNATURE_BYTES];
+
+        let mut extra = block.clone();
+        extra.signatures.push(extra.signatures[0].clone());
+
+        for candidate in [missing, unknown, wrong_signer, tampered_header, malformed, extra] {
+            assert!(matches!(
+                follower.accept_block(candidate),
+                Err(RpcError::UnauthorizedProducer)
+            ));
+            assert_eq!(follower.block_height(), 0, "a rejected block must not advance the tip");
+        }
+        assert_eq!(follower.block_count(), 0);
+        assert_eq!(follower.pending_count(), 0);
     }
 
     #[test]

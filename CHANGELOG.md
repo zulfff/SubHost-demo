@@ -185,6 +185,13 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Producer verification on accept.** With a configured authority,
+  `accept_block` requires `header.validator` to be a registered validator and
+  exactly one BLS signature from that validator over `Block::signing_payload()`,
+  checked before the state transition. Missing, extra, foreign, malformed, or stale
+  signatures are rejected with `RpcError::UnauthorizedProducer` and leave the tip,
+  state, and pool untouched. A node without an authority keeps accepting unsigned
+  blocks, so the guarantee is not network-wide yet.
 - **Periodic state snapshots.** `persist` writes a fresh
   `ledger/snapshot-<height>.bin` on the first commit and then once every
   `SNAPSHOT_INTERVAL_BLOCKS` (1024) blocks instead of at every commit, and keeps
@@ -201,7 +208,6 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   single-node form stays `Address::ZERO` with an empty signature list.
   `BlockAuthority::new` refuses an unregistered producer, or a secret whose public
   key is not the registered one, with `RpcError::UnauthorizedProducer`.
-  `accept_block` still ignores block signatures; S1.3 adds verification.
 - **Segmented ledger store.** `subhost-storage` keeps history in
   `ledger/manifest.json` plus append-only `ledger/segments/NNNNNN.log` (framed
   records, BLAKE3 per record) and account state in

@@ -132,9 +132,8 @@ cannot succeed.
 
 ## 3. Who may produce a block
 
-Today: any node that can reach its own JSON-RPC port, and any peer that can deliver a
-valid block one height above the tip. Blocks can be signed, but producer
-authorization is not enforced yet.
+Today: any node that can reach its own JSON-RPC port. Producer authorization is
+enforced only on a node that has a configured authority.
 
 - A node configured with a `BlockAuthority` sets `header.validator` to its producer
   address and attaches one BLS signature over `Block::signing_payload()`.
@@ -143,15 +142,19 @@ authorization is not enforced yet.
   `RpcError::UnauthorizedProducer` otherwise.
 - A node without an authority keeps the single-node behaviour: `validator` is
   `Address::ZERO` and `signatures` is empty.
-- `accept_block` does not check who produced a block. It checks that the block is
-  internally consistent and extends the tip, and it ignores any block signature
-  bytes. S1.3 adds the check.
+- `accept_block` on a node with an authority requires `header.validator` to be in
+  the registry and exactly one signature from that validator over the payload,
+  checked before the state transition. A missing, extra, foreign, malformed, or
+  stale signature is rejected with `RpcError::UnauthorizedProducer`.
+- A node without an authority does not check block signatures, so an unsigned
+  block still passes there. The guarantee becomes network-wide only when every
+  node has a registry; S1.4 wires genesis into that decision.
 - The JSON-RPC surface has no authentication, so the only thing that limits block
   production is who can reach the listening address. The node binds loopback by
   default.
 
 This is the gap S1 closes. `ADR-001` fixes BLS12-381 as the scheme, a dedicated
-producer key file, and a mandatory proof of possession. S1.2 now signs
+producer key file, and a mandatory proof of possession. S1.2 signs
 `Block::signing_payload()` on produce, S1.3 verifies one registered producer
 signature on accept, and S1.4 wires the key file and genesis registration into the
 node and CLI.
@@ -226,9 +229,11 @@ What the ledger does not guarantee:
   start-up I/O and disk use still grow with history until S4.3–S4.4;
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
-- no authentication for JSON-RPC or metrics clients, and no producer authorization
-  on gossip. The gossip transport encrypts and authenticates peer connections, but
-  any peer may publish a block proposal.
+- no authentication for JSON-RPC or metrics clients. Producer authorization on
+  gossip is enforced only by nodes with a configured validator registry; a node
+  without one still accepts unsigned blocks, so the guarantee is not network-wide.
+  The gossip transport encrypts and authenticates peer connections, but any peer
+  may publish a block proposal.
 
 ## 5. Component ownership
 
