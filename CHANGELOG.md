@@ -202,6 +202,20 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 - **Public layout constants.** `LEDGER_DIR_NAME`, `MANIFEST_FILE_NAME`, and
   `LEDGER_BACKUP_FILE_NAME` describe the segmented store; `LEDGER_FILE_NAME` and
   `MAX_LEDGER_BYTES` now apply to the legacy single file only.
+- **Validator registry from genesis.** `ValidatorRegistry::from_genesis` builds the
+  signing registry directly from `GenesisConfig::initial_validators`. It checks
+  every entry before registering any of them: non-zero voting power, a public key
+  and proof that decode as compressed BLS points, and a proof that verifies under
+  the proof-of-possession domain. Duplicates fail; an empty slice yields an empty
+  registry. New errors: `ZeroVotingPower`, `MalformedPublicKey`, and
+  `MalformedProofOfPossession`. Nothing calls it yet; S1.4 wires it into bootstrap.
+- **BLS decoding helpers.** `BLSScheme::decode_public_key`,
+  `BLSScheme::decode_signature`, `PUBLIC_KEY_BYTES` (48), and `SIGNATURE_BYTES`
+  (96) turn compressed wire bytes into points with length and curve checks.
+  `encode_public_key`, `encode_secret_key`, `decode_secret_key`, and
+  `SECRET_KEY_BYTES` (32) define the producer key file convention: one canonical
+  little-endian scalar, hex-encoded on disk. Decoding rejects the zero scalar and
+  any non-canonical encoding, so two different files cannot name the same key.
 - **Architecture overview.** `docs/architecture.md` explains the block lifecycle
   from submission to acceptance, who may produce a block today, what the ledger
   guarantees and what it does not, and which crate owns each decision. Every claim
@@ -296,6 +310,11 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   outstanding and recorded in `ROADMAP.md`: the state snapshot is rewritten at the
   head on every persist, loading still reads the whole segment history, and there
   is no pruning command yet (S4.2–S4.4).
+- **Proofs of possession use their own domain tag.** `BLSScheme::proof_of_possession`
+  now hashes under `subhost-bls-pop-01` instead of reusing the protocol signature
+  domain, so a proof can no longer be replayed as a signature over the encoded
+  public key, and such a signature is no longer accepted as a proof. No node read
+  or wrote proofs before this change, so no stored data is affected.
 - **`subhost-rpc` is split into `state.rs`, `block.rs`, and `methods.rs`.** `lib.rs`
   now holds only crate docs and re-exports. No behaviour changed: the same 24 unit
   tests and 3 integration tests pass, and the gas-limit check from `cb062c0` lives

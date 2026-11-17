@@ -11,7 +11,7 @@
 
 use ark_serialize::CanonicalDeserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use subhost_core::{encode_canonical, Address, Block, Hash};
+use subhost_core::{encode_canonical, Address, Block, Hash, ValidatorInfo};
 use subhost_crypto::{BLSScheme, PublicKey, Signature};
 use tracing::debug;
 
@@ -84,6 +84,33 @@ impl ValidatorRegistry {
             return Err(ConsensusError::DuplicateValidator(address));
         }
         Ok(())
+    }
+
+    /// Build a registry from the genesis validator set.
+    ///
+    /// Every entry is checked before it is registered: voting power must be
+    /// non-zero, the public key and proof must decode as compressed BLS points,
+    /// and the proof must verify under the proof-of-possession domain. Nothing is
+    /// registered when any entry fails, so a partial set cannot load quietly.
+    ///
+    /// An empty slice yields an empty registry, which is what a single-node
+    /// development genesis needs. A multi-node deployment is expected to supply a
+    /// set, and `GenesisConfig::requires_validators` enforces that at the node
+    /// boundary.
+    pub fn from_genesis(validators: &[ValidatorInfo]) -> Result<Self, ConsensusError> {
+        let mut registry = Self::new();
+        for validator in validators {
+            let address = validator.address;
+            if validator.power == 0 {
+                return Err(ConsensusError::ZeroVotingPower(address));
+            }
+            let public_key = BLSScheme::decode_public_key(&validator.public_key)
+                .ok_or(ConsensusError::MalformedPublicKey(address))?;
+            let proof = BLSScheme::decode_signature(&validator.proof_of_possession)
+                .ok_or(ConsensusError::MalformedProofOfPossession(address))?;
+            registry.register(address, public_key, &proof)?;
+        }
+        Ok(registry)
     }
 
     pub fn public_key(&self, address: &Address) -> Option<&PublicKey> {
@@ -476,6 +503,15 @@ pub enum ConsensusError {
     #[error("validator {0} provided an invalid proof of possession")]
     InvalidProofOfPossession(Address),
 
+    #[error("validator {0} has zero voting power")]
+    ZeroVotingPower(Address),
+
+    #[error("validator {0} has a malformed public key")]
+    MalformedPublicKey(Address),
+
+    #[error("validator {0} has a malformed proof of possession")]
+    MalformedProofOfPossession(Address),
+
     #[error("no validator public keys are registered")]
     EmptyValidatorRegistry,
 
@@ -552,6 +588,109 @@ mod tests {
             validators.push((addr, secret));
         }
         (registry, validators)
+    }
+
+    fn compressed_public(public: &PublicKey) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        public.serialize_compressed(&mut bytes).unwrap();
+        bytes
+    }
+
+    /// A genesis entry with a real key and a real proof of possession.
+    fn genesis_validator(index: u8, power: u64) -> (ValidatorInfo, PrivateKey) {
+        let (secret, public) = BLSScheme::keygen();
+        let info = ValidatorInfo {
+            address: address(index),
+            public_key: compressed_public(&public),
+            power,
+            proof_of_possession: compress(&BLSScheme::proof_of_possession(&secret)),
+        };
+        (info, secret)
+    }
+
+    #[test]
+    fn registry_from_genesis_registers_every_valid_validator() {
+        let (first, _) = genesis_validator(1, 1);
+        let (second, _) = genesis_validator(2, 3);
+        let registry = ValidatorRegistry::from_genesis(&[first.clone(), second.clone()]).unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert!(registry.contains(&first.address));
+        assert!(registry.contains(&second.address));
+        assert!(ValidatorRegistry::from_genesis(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn registry_from_genesis_rejects_zero_power_and_duplicates() {
+        let (validator, _) = genesis_validator(1, 1);
+
+        let mut zero_power = validator.clone();
+        zero_power.power = 0;
+        assert!(matches!(
+            ValidatorRegistry::from_genesis(&[zero_power]),
+            Err(ConsensusError::ZeroVotingPower(a)) if a == validator.address
+        ));
+
+        assert!(matches!(
+            ValidatorRegistry::from_genesis(&[validator.clone(), validator.clone()]),
+            Err(ConsensusError::DuplicateValidator(a)) if a == validator.address
+        ));
+    }
+
+    #[test]
+    fn registry_from_genesis_rejects_malformed_fields() {
+        let (validator, _) = genesis_validator(1, 1);
+
+        let mut empty_proof = validator.clone();
+        empty_proof.proof_of_possession = Vec::new();
+        assert!(matches!(
+            ValidatorRegistry::from_genesis(&[empty_proof]),
+            Err(ConsensusError::MalformedProofOfPossession(_))
+        ));
+
+        let mut short_key = validator.clone();
+        short_key.public_key.truncate(BLS_PUBLIC_KEY_BYTES - 1);
+        assert!(matches!(
+            ValidatorRegistry::from_genesis(&[short_key]),
+            Err(ConsensusError::MalformedPublicKey(_))
+        ));
+
+        let mut junk_key = validator;
+        junk_key.public_key = vec![0xff; BLS_PUBLIC_KEY_BYTES];
+        assert!(matches!(
+            ValidatorRegistry::from_genesis(&[junk_key]),
+            Err(ConsensusError::MalformedPublicKey(_))
+        ));
+    }
+
+    #[test]
+    fn registry_from_genesis_rejects_shared_domain_and_foreign_proofs() {
+        let (mut validator, secret) = genesis_validator(1, 1);
+
+        // The pre-ADR construction: an ordinary signature over the encoded key.
+        let shared_domain = BLSScheme::sign(&secret, &validator.public_key);
+        validator.proof_of_possession = compress(&shared_domain);
+        assert!(matches!(
+            ValidatorRegistry::from_genesis(&[validator.clone()]),
+            Err(ConsensusError::InvalidProofOfPossession(_))
+        ));
+
+        // A proof that belongs to somebody else.
+        let (other, _) = genesis_validator(2, 1);
+        validator.proof_of_possession = other.proof_of_possession;
+        assert!(matches!(
+            ValidatorRegistry::from_genesis(&[validator]),
+            Err(ConsensusError::InvalidProofOfPossession(_))
+        ));
+    }
+
+    #[test]
+    fn block_and_qc_signing_payloads_never_collide() {
+        let block = block(7);
+        let qc = QuorumCertificate::payload_for(7, &block.hash());
+
+        assert_ne!(block.signing_payload(), qc);
+        assert_ne!(block.signing_payload().len(), qc.len());
     }
 
     fn certificate(

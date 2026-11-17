@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `2885435` · S0.1–S0.3 merged · `Q-001` agreed · S4.1 in review
+Status: 2026-11-18 · baseline `main` = `db308ca` · S0.1–S0.3 and S4.1 merged · S1.1 in review · `Q-001` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
