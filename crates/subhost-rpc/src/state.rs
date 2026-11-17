@@ -294,7 +294,10 @@ mod tests {
         state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
         drop(state);
 
-        let path = dir.path().join(subhost_storage::LEDGER_FILE_NAME);
+        let path = dir
+            .path()
+            .join(subhost_storage::LEDGER_DIR_NAME)
+            .join(subhost_storage::MANIFEST_FILE_NAME);
         let mut bytes = std::fs::read(&path).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0x01;
