@@ -67,6 +67,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **`accept_block` accepted peer blocks over the block gas limit
+  (SUBHOST-2026-001).** The producer capped a block at `BLOCK_GAS_LIMIT` while
+  selecting transactions, but the peer path added the same gas figures without
+  ever comparing them to the limit. A gossip peer could publish a block with
+  `gas_limit = 30,000,000` and `gas_used = 40,000,000`; the node accepted,
+  applied, and persisted it, and its own ledger validator then refused that file
+  on the next restart, leaving the node down until the ledger was repaired. The
+  accept path now rejects any block whose running gas total exceeds the header
+  limit, before the transaction is applied. Three regression tests cover the
+  rejected cases and a block that uses exactly the limit.
 - **`cargo deny` failed on the 2026-11 advisory batch.** All 24 advisories were
   cleared rather than ignored. `libp2p` moved from 0.56 to 0.57, which brings
   `hickory-proto`/`hickory-resolver` 0.26.3 (15 DNS advisories),
