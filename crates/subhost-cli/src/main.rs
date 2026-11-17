@@ -386,7 +386,7 @@ fn parse_validator(value: &str) -> Result<ValidatorInfo> {
         .trim()
         .parse::<u64>()
         .with_context(|| format!("invalid validator power in {value:?}"))?;
-    Ok(ValidatorInfo { address, public_key, power })
+    Ok(ValidatorInfo { address, public_key, power, proof_of_possession: Vec::new() })
 }
 
 #[allow(clippy::too_many_arguments)]

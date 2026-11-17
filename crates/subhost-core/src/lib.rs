@@ -18,6 +18,8 @@ pub const PUBLIC_KEY_SIZE: usize = 32;
 pub const BLOCK_GAS_LIMIT: Gas = 30_000_000;
 /// Default target block interval used when a genesis file omits it.
 pub const DEFAULT_BLOCK_TIME_MS: u64 = 1_000;
+/// Domain tag mixed into every block signing payload.
+pub const BLOCK_SIGNING_DOMAIN: &[u8] = b"subhost-block-v1";
 
 /// A 32-byte BLAKE3 digest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -288,6 +290,21 @@ impl Block {
         self.header.hash()
     }
 
+    /// Bytes a validator signs to attest this block.
+    ///
+    /// Layout: `BLOCK_SIGNING_DOMAIN || chain_id || height || block_hash`, with
+    /// both integers big-endian. The block hash commits to the header, so the
+    /// payload covers every header field and the transaction/receipt roots
+    /// without signing the signature list itself.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(BLOCK_SIGNING_DOMAIN.len() + 8 + 8 + HASH_SIZE);
+        payload.extend_from_slice(BLOCK_SIGNING_DOMAIN);
+        payload.extend_from_slice(&self.header.chain_id.to_be_bytes());
+        payload.extend_from_slice(&self.header.height.to_be_bytes());
+        payload.extend_from_slice(self.hash().as_bytes());
+        payload
+    }
+
     /// Commitment over the contained transaction hashes.
     pub fn tx_root(&self) -> Hash {
         let hashes: Vec<[u8; HASH_SIZE]> =
@@ -484,6 +501,13 @@ pub struct ValidatorInfo {
     pub address: Address,
     pub public_key: Vec<u8>,
     pub power: u64,
+    /// Proof that the validator controls `public_key`.
+    ///
+    /// Empty means the genesis document did not supply one. The registry rejects
+    /// an empty proof once validator registration is wired in; keeping the field
+    /// serde-defaulted lets older genesis files load until then.
+    #[serde(default)]
+    pub proof_of_possession: Vec<u8>,
 }
 
 /// Seconds since the Unix epoch, saturating at 0 for clocks set before 1970.
@@ -560,6 +584,27 @@ mod tests {
             chain_id: 1,
             public_key: [0u8; PUBLIC_KEY_SIZE],
             signature: TransactionSignature::EMPTY,
+        }
+    }
+
+    fn sample_block() -> Block {
+        Block {
+            header: BlockHeader {
+                version: 1,
+                chain_id: 1,
+                height: 1,
+                timestamp: 0,
+                parent_hash: Hash::ZERO,
+                state_root: Hash::ZERO,
+                tx_root: Hash::ZERO,
+                receipt_root: Hash::ZERO,
+                validator: Address::ZERO,
+                gas_used: 0,
+                gas_limit: BLOCK_GAS_LIMIT,
+                extra_data: Vec::new(),
+            },
+            transactions: vec![transaction()],
+            signatures: Vec::new(),
         }
     }
 
@@ -668,6 +713,71 @@ mod tests {
     }
 
     #[test]
+    fn block_signing_payload_is_stable_and_covers_the_header() {
+        let block = sample_block();
+        let payload = block.signing_payload();
+
+        assert_eq!(payload, block.clone().signing_payload(), "payload must be deterministic");
+
+        let mut resigned = block.clone();
+        resigned.signatures = vec![ValidatorSignature {
+            validator: Address::new([9; ADDRESS_SIZE]),
+            signature: vec![1, 2, 3],
+        }];
+        assert_eq!(resigned.signing_payload(), payload, "signatures are not signed over");
+
+        let mut other_height = block.clone();
+        other_height.header.height += 1;
+        assert_ne!(other_height.signing_payload(), payload);
+
+        let mut other_chain = block.clone();
+        other_chain.header.chain_id += 1;
+        assert_ne!(other_chain.signing_payload(), payload);
+
+        let mut other_header = block;
+        other_header.header.timestamp += 1;
+        assert_ne!(other_header.signing_payload(), payload, "the block hash covers the header");
+    }
+
+    #[test]
+    fn block_signing_payload_is_domain_separated() {
+        fn layout(domain: &[u8], block: &Block) -> Vec<u8> {
+            let mut payload = Vec::with_capacity(domain.len() + 8 + 8 + HASH_SIZE);
+            payload.extend_from_slice(domain);
+            payload.extend_from_slice(&block.header.chain_id.to_be_bytes());
+            payload.extend_from_slice(&block.header.height.to_be_bytes());
+            payload.extend_from_slice(block.hash().as_bytes());
+            payload
+        }
+
+        let block = sample_block();
+        let payload = block.signing_payload();
+        assert_eq!(payload, layout(BLOCK_SIGNING_DOMAIN, &block));
+        assert_ne!(payload, layout(b"subhost-block-v2", &block));
+        assert_ne!(payload, block.hash().as_bytes().to_vec(), "a bare hash is not a payload");
+        assert_eq!(payload.len(), BLOCK_SIGNING_DOMAIN.len() + 8 + 8 + HASH_SIZE);
+    }
+
+    #[test]
+    fn validator_proof_of_possession_is_optional_in_json() {
+        let validator = ValidatorInfo {
+            address: Address::new([4; ADDRESS_SIZE]),
+            public_key: vec![1, 2, 3],
+            power: 10,
+            proof_of_possession: vec![7, 8, 9],
+        };
+
+        let encoded = serde_json::to_value(&validator).unwrap();
+        let decoded: ValidatorInfo = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded.proof_of_possession, vec![7, 8, 9]);
+
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("proof_of_possession");
+        let decoded: ValidatorInfo = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.proof_of_possession.is_empty(), "old genesis files must still load");
+    }
+
+    #[test]
     fn genesis_allocations_round_trip_full_u128_range() {
         let mut genesis = GenesisConfig::default();
         genesis.allocations.insert(Address::new([1; ADDRESS_SIZE]), Amount::MAX);
@@ -706,6 +816,7 @@ mod tests {
             address: Address::new([4; ADDRESS_SIZE]),
             public_key: vec![1, 2, 3],
             power: 10,
+            proof_of_possession: Vec::new(),
         };
 
         let mut genesis = GenesisConfig {

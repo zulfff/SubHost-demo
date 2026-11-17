@@ -14,6 +14,9 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **`ValidatorInfo` gained `proof_of_possession`.** Rust code that constructs the
+  struct literally must set the field. JSON genesis files written without it still
+  deserialize because the field is `#[serde(default)]`.
 - **The on-disk ledger format is now version 2.** The magic is `SUBHOST1` with
   version `2`; version 1 files are refused with
   `StorageError::UnsupportedVersion(1)` rather than being migrated. No live chain
@@ -182,6 +185,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Block signing payload contract.** `subhost_core::BLOCK_SIGNING_DOMAIN` and
+  `Block::signing_payload()` define the bytes a validator will sign:
+  `domain || chain_id || height || block_hash`, with both integers big-endian.
+  Nothing signs or verifies it yet; S1.2 and S1.3 wire that in.
+- **`ValidatorInfo` carries a proof of possession.** The new
+  `proof_of_possession: Vec<u8>` field is `#[serde(default)]`, so genesis files
+  written before the field existed still load. The CLI and node set it empty until
+  S1.4 accepts and validates a real proof.
 - **Domain-separated Merkle tree.** `subhost_core::merkle` builds a perfect binary
   tree with distinct leaf, internal-node, and padding domains, so `[a, b, c]` and
   `[a, b, c, c]` cannot share a root. Includes root construction, inclusion
