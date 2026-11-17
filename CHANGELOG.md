@@ -212,6 +212,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 - **BLS decoding helpers.** `BLSScheme::decode_public_key`,
   `BLSScheme::decode_signature`, `PUBLIC_KEY_BYTES` (48), and `SIGNATURE_BYTES`
   (96) turn compressed wire bytes into points with length and curve checks.
+  `encode_public_key`, `encode_secret_key`, `decode_secret_key`, and
+  `SECRET_KEY_BYTES` (32) define the producer key file convention: one canonical
+  little-endian scalar, hex-encoded on disk. Decoding rejects the zero scalar and
+  any non-canonical encoding, so two different files cannot name the same key.
 - **Architecture overview.** `docs/architecture.md` explains the block lifecycle
   from submission to acceptance, who may produce a block today, what the ledger
   guarantees and what it does not, and which crate owns each decision. Every claim

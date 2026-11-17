@@ -39,6 +39,8 @@ const AEAD_NONCE_BYTES: usize = 12;
 pub const PUBLIC_KEY_BYTES: usize = 48;
 /// Compressed BLS12-381 G2 signature length.
 pub const SIGNATURE_BYTES: usize = 96;
+/// Canonical BLS12-381 scalar length.
+pub const SECRET_KEY_BYTES: usize = 32;
 
 /// A BLS12-381 G1 public key.
 pub type PublicKey = G1Projective;
@@ -169,12 +171,42 @@ impl BLSScheme {
     }
 
     /// Canonical compressed encoding of a public key.
-    fn encode_public_key(public: &PublicKey) -> Vec<u8> {
+    pub fn encode_public_key(public: &PublicKey) -> Vec<u8> {
         let mut bytes = Vec::new();
         public
             .serialize_compressed(&mut bytes)
             .expect("BLS12-381 G1 serialization into a Vec cannot fail");
         bytes
+    }
+
+    /// Canonical 32-byte little-endian encoding of a signing secret.
+    ///
+    /// This is the byte string a producer key file stores, hex-encoded. Keep it
+    /// out of logs and error messages.
+    pub fn encode_secret_key(secret: &PrivateKey) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        secret
+            .0
+            .serialize_compressed(&mut bytes)
+            .expect("BLS12-381 scalar serialization into a Vec cannot fail");
+        bytes
+    }
+
+    /// Decode a signing secret from [`Self::encode_secret_key`] bytes.
+    ///
+    /// The encoding must be exactly canonical: a value that only decodes after
+    /// being reduced modulo the group order is rejected, so two different files
+    /// can never name the same key. The zero scalar is rejected as well, because
+    /// it is the identity and signs nothing useful.
+    pub fn decode_secret_key(bytes: &[u8]) -> Option<PrivateKey> {
+        if bytes.len() != SECRET_KEY_BYTES {
+            return None;
+        }
+        let scalar = Scalar::deserialize_compressed(bytes).ok()?;
+        if scalar.is_zero() || Self::encode_secret_key(&PrivateKey(scalar)) != bytes {
+            return None;
+        }
+        Some(PrivateKey(scalar))
     }
 
     /// Domain-separated hash onto the prime-order G2 subgroup.
@@ -399,6 +431,21 @@ mod tests {
         assert!(BLSScheme::decode_public_key(&[0u8; PUBLIC_KEY_BYTES]).is_none());
         assert!(BLSScheme::decode_signature(&signature_bytes[..SIGNATURE_BYTES - 1]).is_none());
         assert!(BLSScheme::decode_signature(&[0u8; SIGNATURE_BYTES]).is_none());
+    }
+
+    #[test]
+    fn secret_key_bytes_round_trip_and_reject_non_canonical_input() {
+        let (secret, public) = BLSScheme::keygen();
+        let bytes = BLSScheme::encode_secret_key(&secret);
+        assert_eq!(bytes.len(), SECRET_KEY_BYTES);
+
+        let decoded = BLSScheme::decode_secret_key(&bytes).expect("canonical key must decode");
+        let signature = BLSScheme::sign(&decoded, b"from file");
+        assert!(BLSScheme::verify(&public, b"from file", &signature));
+
+        assert!(BLSScheme::decode_secret_key(&[0u8; SECRET_KEY_BYTES]).is_none());
+        assert!(BLSScheme::decode_secret_key(&bytes[..SECRET_KEY_BYTES - 1]).is_none());
+        assert!(BLSScheme::decode_secret_key(&[0xff; SECRET_KEY_BYTES]).is_none());
     }
 
     #[test]
