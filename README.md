@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" width="200" alt="Subhost Web3">
+  <img src="assets/brand/subhost-logo.svg" width="200" alt="Subhost Web3">
 </p>
 
 <h1 align="center">Subhost Web3</h1>
@@ -266,6 +266,7 @@ warning-free rustdoc. The workspace forbids `unsafe_code` and denies `todo!`,
 
 - [Threat model](docs/security/threat-model.md)
 - [Manual testing guide](docs/manual-testing.md)
+- [Brand mark](docs/brand.md)
 - [Tokenomics design](docs/tokenomics.md) — an undeployed economic proposal, not a live token
 - [Changelog](CHANGELOG.md)
 - [Contributing](CONTRIBUTING.md)
