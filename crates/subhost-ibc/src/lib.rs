@@ -1,15 +1,27 @@
-//! IBC channel handshake, packet flow, and replay protection.
+//! IBC channel handshake, packet flow, replay protection, and commitment proofs.
 //!
-//! Scope: this implements the *local* packet state machine — channel lifecycle,
-//! sequence ordering, timeouts, and replay rejection. It does **not** verify light
-//! client proofs or commitment proofs from the counterparty chain, so a packet is
-//! trusted only as far as the relayer that delivered it. Do not treat this as a
-//! trust-minimized bridge.
+//! Scope: the *local* packet state machine — channel lifecycle, sequence
+//! ordering, timeouts, and replay rejection — plus [`light_client`], which
+//! verifies counterparty headers signed by one trusted ed25519 key and checks
+//! Merkle commitment proofs against the verified header's app hash.
+//!
+//! [`IbcModule::receive_packet_with_proof`] ties the two together: a packet is
+//! only accepted when the counterparty chain provably committed it. Plain
+//! [`IbcModule::receive_packet`] remains available for local testing, but it
+//! trusts the relayer completely.
+//!
+//! Limits: no validator-set rotation, no Tendermint multisig/quorum
+//! certificates, no non-membership proofs, and no fork choice. The light client
+//! is suitable for a single-sequencer counterparty, not for a decentralized one.
+
+pub mod light_client;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use subhost_core::{Address, Amount, BlockHeight, Timestamp};
 use tracing::info;
+
+use light_client::{packet_commitment_key, packet_commitment_value, CommitmentProof, LightClient};
 
 /// Largest packet payload accepted.
 pub const MAX_PACKET_BYTES: usize = 128 * 1024;
@@ -345,6 +357,45 @@ impl IbcModule {
         Ok(transfer)
     }
 
+    /// Accept an inbound packet only if a verified counterparty header commits
+    /// it, then apply the normal channel, timeout, ordering, and replay rules.
+    ///
+    /// The light client must track the channel's configured counterparty chain,
+    /// the proof must be for this exact `(port, channel, sequence)` key, and the
+    /// committed value must equal the packet payload. Nothing is mutated until
+    /// both the commitment proof and the packet state machine accept.
+    pub fn receive_packet_with_proof(
+        &mut self,
+        client: &LightClient,
+        packet: IbcPacket,
+        proof: CommitmentProof,
+    ) -> Result<IbcTransfer, IbcError> {
+        self.ensure_enabled()?;
+        if client.chain_id() != self.config.counterparty_chain_id {
+            return Err(IbcError::UntrustedHeader(format!(
+                "light client tracks {} but this channel expects {}",
+                client.chain_id(),
+                self.config.counterparty_chain_id
+            )));
+        }
+
+        let expected_key =
+            packet_commitment_key(&packet.source_port, &packet.source_channel, packet.sequence);
+        if proof.key != expected_key {
+            return Err(IbcError::InvalidCommitment(
+                "proof is for a different packet commitment key".into(),
+            ));
+        }
+        if proof.value != packet_commitment_value(&packet) {
+            return Err(IbcError::InvalidCommitment(
+                "committed value does not match the packet payload".into(),
+            ));
+        }
+        client.verify_commitment(&proof)?;
+
+        self.receive_packet(packet)
+    }
+
     /// Acknowledge a packet this chain sent. Each sequence may be acked once.
     pub fn acknowledge_packet(&mut self, sequence: u64) -> Result<(), IbcError> {
         self.ensure_enabled()?;
@@ -462,11 +513,23 @@ pub enum IbcError {
 
     #[error("serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("untrusted counterparty header: {0}")]
+    UntrustedHeader(String),
+
+    #[error("header signature is not valid ed25519")]
+    InvalidHeaderSignature,
+
+    #[error("invalid commitment proof: {0}")]
+    InvalidCommitment(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use light_client::{packet_commitment_key, CommitmentStore, HeaderSignature, SignedHeader};
+    use subhost_core::Hash;
 
     fn transfer(source_channel: &str) -> IbcTransfer {
         IbcTransfer {
@@ -802,5 +865,140 @@ mod tests {
         };
         module.receive_packet(second_channel).unwrap();
         assert_eq!(module.expected_recv_sequence("channel-1"), 2);
+    }
+
+    // --- Commitment proof verification -------------------------------------
+
+    fn counterparty_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn signed_header(
+        key: &SigningKey,
+        chain_id: &str,
+        height: BlockHeight,
+        timestamp: Timestamp,
+        app_hash: Hash,
+    ) -> SignedHeader {
+        let mut header = SignedHeader {
+            chain_id: chain_id.to_string(),
+            height,
+            timestamp,
+            app_hash,
+            public_key: key.verifying_key().to_bytes(),
+            signature: HeaderSignature::EMPTY,
+        };
+        header.signature =
+            HeaderSignature::from_ed25519(&key.sign(&header.signing_payload()).to_bytes());
+        header
+    }
+
+    fn key_for(packet: &IbcPacket) -> Vec<u8> {
+        packet_commitment_key(&packet.source_port, &packet.source_channel, packet.sequence)
+    }
+
+    /// Commit `packet` into a fresh store and sign a header over its root.
+    fn commit(packet: &IbcPacket, height: BlockHeight) -> (CommitmentStore, SignedHeader) {
+        let mut store = CommitmentStore::new();
+        store.insert(key_for(packet), packet.data.clone());
+        let header = signed_header(
+            &counterparty_key(7),
+            &IbcConfig::default().counterparty_chain_id,
+            height,
+            1_700_000_000 + height,
+            store.app_hash(),
+        );
+        (store, header)
+    }
+
+    #[test]
+    fn a_proven_packet_is_delivered_and_cannot_be_replayed() {
+        let packet = inbound(1);
+        let (store, header) = commit(&packet, 10);
+        let client = LightClient::new(&header).unwrap();
+        let mut module = module_with_open_channel(ChannelOrdering::Ordered);
+
+        let proof = store.proof(&key_for(&packet)).unwrap();
+        let received =
+            module.receive_packet_with_proof(&client, packet.clone(), proof.clone()).unwrap();
+        assert_eq!(received.amount, 100);
+        assert!(module.has_received("counterparty-0", 1));
+
+        // The same proof is replayed: the packet state machine, not the proof
+        // check, is what stops it.
+        assert!(matches!(
+            module.receive_packet_with_proof(&client, packet, proof),
+            Err(IbcError::Replay)
+        ));
+    }
+
+    #[test]
+    fn a_packet_must_be_committed_by_the_trusted_counterparty() {
+        let packet = inbound(1);
+        let (store, header) = commit(&packet, 10);
+        let client = LightClient::new(&header).unwrap();
+        let mut module = module_with_open_channel(ChannelOrdering::Unordered);
+        let proof = store.proof(&key_for(&packet)).unwrap();
+
+        // A client for a different chain cannot authorize this channel.
+        let other_header = signed_header(
+            &counterparty_key(7),
+            "other-chain-1",
+            10,
+            1_700_000_010,
+            store.app_hash(),
+        );
+        let other_client = LightClient::new(&other_header).unwrap();
+        assert!(matches!(
+            module.receive_packet_with_proof(&other_client, packet.clone(), proof.clone()),
+            Err(IbcError::UntrustedHeader(_))
+        ));
+        assert!(!module.has_received("counterparty-0", 1));
+
+        // A proof for another key is refused.
+        let mut wrong_key = proof.clone();
+        wrong_key.key = packet_commitment_key("transfer", "counterparty-0", 2);
+        assert!(matches!(
+            module.receive_packet_with_proof(&client, packet.clone(), wrong_key),
+            Err(IbcError::InvalidCommitment(_))
+        ));
+
+        // A payload that the counterparty did not commit is refused.
+        let mut wrong_value = proof.clone();
+        wrong_value.value =
+            serde_json::to_vec(&IbcTransfer { amount: 999, ..transfer("counterparty-0") }).unwrap();
+        assert!(matches!(
+            module.receive_packet_with_proof(&client, packet.clone(), wrong_value),
+            Err(IbcError::InvalidCommitment(_))
+        ));
+
+        // A valid commitment does not excuse a packet that breaks the channel
+        // binding: the state machine still runs and rejects it.
+        let bad = IbcPacket { destination_port: "attacker".to_string(), ..packet };
+        assert!(matches!(
+            module.receive_packet_with_proof(&client, bad, proof),
+            Err(IbcError::InvalidPacket(_))
+        ));
+        assert!(!module.has_received("counterparty-0", 1));
+    }
+
+    #[test]
+    fn a_proof_only_verifies_against_the_header_it_was_committed_under() {
+        let packet = inbound(1);
+        let (store, header) = commit(&packet, 10);
+        let mut client = LightClient::new(&header).unwrap();
+        let proof = store.proof(&key_for(&packet)).unwrap();
+        client.verify_commitment(&proof).unwrap();
+
+        // The counterparty advances; its new root no longer commits this proof.
+        let new_header = signed_header(
+            &counterparty_key(7),
+            &IbcConfig::default().counterparty_chain_id,
+            11,
+            1_700_000_011,
+            Hash::from_data(b"new root"),
+        );
+        client.update(&new_header).unwrap();
+        assert!(matches!(client.verify_commitment(&proof), Err(IbcError::InvalidCommitment(_))));
     }
 }

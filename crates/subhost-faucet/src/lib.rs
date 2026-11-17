@@ -280,6 +280,7 @@ impl FaucetState {
             gas_limit: TRANSFER_GAS_LIMIT,
             data: Vec::new(),
             chain_id,
+            public_key: self.signer.public_key(),
             signature: TransactionSignature::EMPTY,
         };
         let signature = self.signer.sign(&unsigned);
@@ -625,6 +626,7 @@ mod tests {
             gas_limit: TRANSFER_GAS_LIMIT,
             data: Vec::new(),
             chain_id: 1,
+            public_key: signer.public_key(),
             signature: TransactionSignature::EMPTY,
         };
         let signature = signer.sign(&tx);

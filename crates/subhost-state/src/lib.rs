@@ -5,7 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use subhost_core::{Address, Amount, ChainId, Nonce, Transaction, TransactionType};
+use subhost_core::merkle::{leaf_hash, merkle_proof, merkle_root, MerkleProof};
+use subhost_core::{
+    encode_canonical, Address, Amount, ChainId, Hash, Nonce, Transaction, TransactionType,
+};
+
+/// Domain tag mixed into every account leaf so a proof is bound to one chain.
+const STATE_LEAF_DOMAIN: &[u8] = b"subhost-state-account-v2";
 
 /// An account's mutable state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,8 +109,52 @@ impl State {
     }
 
     /// Root commitment over the account set, used as the block `state_root`.
-    pub fn root(&self) -> subhost_core::Hash {
-        subhost_core::Hash::from_data(&subhost_core::encode_canonical(&self.snapshot()))
+    ///
+    /// The root is a Merkle root over address-sorted account leaves, so it is
+    /// independent of insertion order and every account is individually provable
+    /// with [`Self::account_proof`]. The chain ID is mixed into each leaf, which
+    /// binds the whole root to one chain.
+    pub fn root(&self) -> Hash {
+        merkle_root(&self.account_leaves())
+    }
+
+    /// Address-sorted account leaves, in the same order as [`Self::snapshot`].
+    fn account_leaves(&self) -> Vec<Hash> {
+        let snapshot = self.snapshot();
+        snapshot
+            .accounts
+            .iter()
+            .map(|(address, account)| account_leaf(self.chain_id, address, account))
+            .collect()
+    }
+
+    /// Build a Merkle inclusion proof for an existing account.
+    ///
+    /// Returns `None` for an unknown account: a plain Merkle tree can prove
+    /// membership, not the absence of an address.
+    pub fn account_proof(&self, address: &Address) -> Option<AccountProof> {
+        let snapshot = self.snapshot();
+        let index = snapshot.accounts.iter().position(|(candidate, _)| candidate == address)?;
+        let leaves: Vec<Hash> = snapshot
+            .accounts
+            .iter()
+            .map(|(address, account)| account_leaf(self.chain_id, address, account))
+            .collect();
+        let proof = merkle_proof(&leaves, index)?;
+        Some(AccountProof {
+            chain_id: self.chain_id,
+            address: *address,
+            account: snapshot.accounts[index].1.clone(),
+            root: self.root(),
+            proof,
+        })
+    }
+
+    /// Verify an account proof against a known state root.
+    pub fn verify_account_proof(root: &Hash, proof: &AccountProof) -> bool {
+        proof.root == *root
+            && proof.proof.leaf == account_leaf(proof.chain_id, &proof.address, &proof.account)
+            && proof.proof.verify(root)
     }
 
     /// Move `value` from `from` to `to`, rejecting overdraft and credit overflow.
@@ -210,6 +260,26 @@ impl State {
     }
 }
 
+/// A Merkle inclusion proof for one account at one state root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountProof {
+    pub chain_id: ChainId,
+    pub address: Address,
+    pub account: Account,
+    pub root: Hash,
+    pub proof: MerkleProof,
+}
+
+impl AccountProof {
+    pub fn verify(&self, root: &Hash) -> bool {
+        State::verify_account_proof(root, self)
+    }
+}
+
+fn account_leaf(chain_id: ChainId, address: &Address, account: &Account) -> Hash {
+    leaf_hash(&encode_canonical(&(STATE_LEAF_DOMAIN, chain_id, address, account)))
+}
+
 /// A deterministic, sorted view of the whole account set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateSnapshot {
@@ -261,6 +331,7 @@ mod tests {
             gas_limit: 21_000,
             data: Vec::new(),
             chain_id: 1,
+            public_key: [0u8; subhost_core::PUBLIC_KEY_SIZE],
             signature: TransactionSignature::EMPTY,
         }
     }
@@ -445,6 +516,68 @@ mod tests {
         .is_err());
 
         assert!(State::from_snapshot(StateSnapshot { chain_id: 0, accounts: Vec::new() }).is_err());
+    }
+
+    #[test]
+    fn every_account_has_a_verifiable_merkle_proof() {
+        let mut state = State::with_chain_id(7);
+        for index in 0..9u8 {
+            state.set_balance(addr(index + 1), u128::from(index) * 1_000);
+            state.accounts.get_mut(&addr(index + 1)).unwrap().nonce = u64::from(index);
+        }
+        let root = state.root();
+
+        for index in 0..9u8 {
+            let address = addr(index + 1);
+            let proof = state.account_proof(&address).expect("a funded account has a proof");
+            assert!(proof.verify(&root), "proof for {address} must verify");
+            assert_eq!(proof.account, *state.account(&address).unwrap());
+            assert_eq!(proof.root, root);
+            assert!(State::verify_account_proof(&root, &proof));
+        }
+        assert!(state.account_proof(&addr(99)).is_none());
+    }
+
+    #[test]
+    fn account_proofs_reject_a_wrong_root_a_tampered_account_and_a_moved_leaf() {
+        let mut state = State::with_chain_id(1);
+        state.set_balance(addr(1), 10);
+        state.set_balance(addr(2), 20);
+        state.set_balance(addr(3), 30);
+        let root = state.root();
+        let proof = state.account_proof(&addr(2)).unwrap();
+        assert!(proof.verify(&root));
+
+        assert!(!proof.verify(&Hash::ZERO), "a different root must fail");
+
+        let mut tampered = proof.clone();
+        tampered.account.balance += 1;
+        assert!(!tampered.verify(&root), "the account is bound into the leaf");
+
+        let mut moved = proof;
+        moved.proof.index ^= 1;
+        assert!(!moved.verify(&root), "the index selects the path");
+    }
+
+    #[test]
+    fn state_root_is_independent_of_insertion_order_and_chain_bound() {
+        let mut first = State::with_chain_id(1);
+        first.set_balance(addr(3), 30);
+        first.set_balance(addr(1), 10);
+        first.set_balance(addr(2), 20);
+
+        let mut second = State::with_chain_id(1);
+        second.set_balance(addr(2), 20);
+        second.set_balance(addr(3), 30);
+        second.set_balance(addr(1), 10);
+
+        assert_eq!(first.root(), second.root());
+
+        let mut other_chain = State::with_chain_id(2);
+        other_chain.set_balance(addr(1), 10);
+        other_chain.set_balance(addr(2), 20);
+        other_chain.set_balance(addr(3), 30);
+        assert_ne!(first.root(), other_chain.root(), "the chain ID is bound into the root");
     }
 
     #[test]

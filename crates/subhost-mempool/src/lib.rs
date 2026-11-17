@@ -70,7 +70,7 @@ pub struct Admission {
 ///   lowest-gas-price transaction when full.
 /// - Deterministic proposal ordering: highest gas price first, then sender, then
 ///   nonce.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Mempool {
     config: MempoolConfig,
     txs: HashMap<Hash, Transaction>,
@@ -354,6 +354,7 @@ mod tests {
             gas_limit: 21_000,
             data: Vec::new(),
             chain_id: 1,
+            public_key: [0u8; subhost_core::PUBLIC_KEY_SIZE],
             signature: TransactionSignature::EMPTY,
         }
     }

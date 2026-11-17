@@ -3708,6 +3708,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "ed25519-dalek 3.0.0",
  "hex",
  "serde",
  "serde_json",
@@ -3779,6 +3780,7 @@ dependencies = [
 name = "subhost-ibc"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek 3.0.0",
  "serde",
  "serde_json",
  "subhost-core",
@@ -3823,8 +3825,11 @@ dependencies = [
 name = "subhost-node"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "ed25519-dalek 3.0.0",
  "subhost-core",
  "subhost-metrics",
+ "subhost-network",
  "subhost-rpc",
  "subhost-storage",
  "tempfile",
@@ -3868,6 +3873,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "ed25519-dalek 3.0.0",
  "serde",
  "subhost-core",
  "subhost-state",

@@ -14,7 +14,7 @@ use subhost_core::{
     Address, Amount, ChainId, GenesisConfig, Transaction, TransactionSignature, TransactionType,
     ValidatorInfo,
 };
-use subhost_node::{Node, NodeConfig, GENESIS_FILE_NAME};
+use subhost_node::{Node, NodeConfig, P2pConfig, GENESIS_FILE_NAME};
 use subhost_telemetry::{TelemetryConfig, Verbosity};
 use subhost_wallet::Wallet;
 
@@ -82,6 +82,22 @@ enum Commands {
 
         #[arg(long, default_value_t = 1000)]
         max_connections: u32,
+
+        /// Multiaddr to listen on for peer gossip. Omit to run offline.
+        #[arg(long)]
+        p2p_listen: Option<String>,
+
+        /// Bootstrap peer multiaddr, repeatable. Requires --p2p-listen.
+        #[arg(long = "bootstrap-peer", value_name = "MULTIADDR", requires = "p2p_listen")]
+        bootstrap_peers: Vec<String>,
+
+        /// Disable local mDNS peer discovery.
+        #[arg(long, requires = "p2p_listen")]
+        no_mdns: bool,
+
+        /// Maximum number of peer connections.
+        #[arg(long, default_value_t = 50, requires = "p2p_listen")]
+        max_peers: usize,
     },
 
     /// Manage local wallets.
@@ -237,8 +253,29 @@ fn main() -> Result<()> {
             Commands::Init { chain_id, data_dir, allocations, validators, force } => {
                 init_genesis(chain_id, data_dir, allocations, validators, force)
             }
-            Commands::Node { validator, listen, data_dir, metrics_addr, max_connections } => {
-                run_node(validator, listen, data_dir, metrics_addr, max_connections).await
+            Commands::Node {
+                validator,
+                listen,
+                data_dir,
+                metrics_addr,
+                max_connections,
+                p2p_listen,
+                bootstrap_peers,
+                no_mdns,
+                max_peers,
+            } => {
+                run_node(
+                    validator,
+                    listen,
+                    data_dir,
+                    metrics_addr,
+                    max_connections,
+                    p2p_listen,
+                    bootstrap_peers,
+                    no_mdns,
+                    max_peers,
+                )
+                .await
             }
             Commands::Wallet { cmd } => handle_wallet(cmd),
             Commands::Tx { cmd } => handle_transaction(cmd).await,
@@ -352,12 +389,17 @@ fn parse_validator(value: &str) -> Result<ValidatorInfo> {
     Ok(ValidatorInfo { address, public_key, power })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_node(
     validator: bool,
     listen: String,
     data_dir: Option<PathBuf>,
     metrics_addr: Option<SocketAddr>,
     max_connections: u32,
+    p2p_listen: Option<String>,
+    bootstrap_peers: Vec<String>,
+    no_mdns: bool,
+    max_peers: usize,
 ) -> Result<()> {
     let data_dir = match data_dir {
         Some(dir) => dir,
@@ -365,6 +407,13 @@ async fn run_node(
     };
     let rpc_addr: SocketAddr =
         listen.parse().with_context(|| format!("invalid listen address {listen:?}"))?;
+    // clap already enforces that peer options require --p2p-listen.
+    let network = p2p_listen.map(|listen_addr| P2pConfig {
+        listen_addr,
+        bootstrap_peers,
+        max_peers,
+        enable_mdns: !no_mdns,
+    });
 
     let node = Node::bootstrap(NodeConfig {
         data_dir,
@@ -373,6 +422,7 @@ async fn run_node(
         metrics_addr,
         validator,
         fallback_chain_id: 1,
+        network,
     })?;
     node.run().await?;
     Ok(())
@@ -534,6 +584,7 @@ async fn handle_transaction(cmd: TxCommands) -> Result<()> {
                 gas_limit: TRANSFER_GAS_LIMIT,
                 data: Vec::new(),
                 chain_id,
+                public_key,
                 signature: TransactionSignature::EMPTY,
             };
             let signature = signing_key.sign(&unsigned.signing_payload()).to_bytes();
@@ -740,6 +791,17 @@ mod tests {
             ],
             &["subhost", "node", "--listen", "127.0.0.1:8545", "--data-dir", "./data"],
             &["subhost", "node", "--validator", "--metrics-addr", "127.0.0.1:9090"],
+            &[
+                "subhost",
+                "node",
+                "--p2p-listen",
+                "/ip4/0.0.0.0/tcp/30333",
+                "--bootstrap-peer",
+                "/ip4/127.0.0.1/tcp/30334",
+                "--no-mdns",
+                "--max-peers",
+                "8",
+            ],
             &["subhost", "wallet", "new", "--password", "password123"],
             &["subhost", "wallet", "list"],
             &["subhost", "wallet", "show", "0x1111111111111111111111111111111111111111"],
@@ -768,6 +830,32 @@ mod tests {
                 "{invocation:?} must parse"
             );
         }
+    }
+
+    #[test]
+    fn peer_options_require_a_listen_address() {
+        // Networking stays off by default.
+        let parsed = Cli::try_parse_from(["subhost", "node"]).unwrap();
+        match parsed.command {
+            Commands::Node { p2p_listen, bootstrap_peers, no_mdns, .. } => {
+                assert!(p2p_listen.is_none());
+                assert!(bootstrap_peers.is_empty());
+                assert!(!no_mdns);
+            }
+            _ => panic!("expected the node command"),
+        }
+
+        // A bootstrap peer without a listen address is a usage error, not a
+        // silently ignored flag.
+        assert!(Cli::try_parse_from([
+            "subhost",
+            "node",
+            "--bootstrap-peer",
+            "/ip4/127.0.0.1/tcp/30334",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from(["subhost", "node", "--no-mdns"]).is_err());
+        assert!(Cli::try_parse_from(["subhost", "node", "--max-peers", "4"]).is_err());
     }
 
     #[test]

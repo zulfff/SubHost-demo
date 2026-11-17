@@ -11,11 +11,13 @@
 //! rejected rather than silently loaded.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use subhost_core::{tx_root_of, Block, ChainId, Hash, Receipt, ReceiptStatus};
+use subhost_core::{
+    encode_canonical, tx_root_of, Block, ChainId, Gas, Hash, Receipt, ReceiptStatus,
+};
 use subhost_state::{State, StateSnapshot};
 use tracing::debug;
 
@@ -26,7 +28,10 @@ pub const MAX_LEDGER_BYTES: u64 = 64 * 1024 * 1024;
 pub const LEDGER_FILE_NAME: &str = "node-state.bin";
 
 const LEDGER_MAGIC: [u8; 8] = *b"SUBHOST1";
-const LEDGER_FORMAT_VERSION: u32 = 1;
+/// Version 2 introduced Merkle state roots, multi-transaction blocks, and
+/// transaction-indexed receipts. A version 1 file cannot be validated against
+/// the new commitments, so it is refused rather than silently reinterpreted.
+const LEDGER_FORMAT_VERSION: u32 = 2;
 
 /// The full persisted ledger: account state plus the local block history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,17 +230,32 @@ impl LedgerStore {
     }
 }
 
-/// Recompute the commitment for a single-transaction block receipt.
+/// Commitment for one successful receipt.
 ///
-/// The producer and the validator must agree byte-for-byte, so this lives beside
-/// the validator rather than in the RPC crate.
-pub fn receipt_root(tx_hash: Hash, height: u64, gas_used: u64) -> Hash {
-    Hash::from_data(&subhost_core::encode_canonical(&(
+/// Every field that the receipt reports is committed, including its position in
+/// the block and the cumulative gas figure, so a relayer cannot reorder receipts
+/// without changing the block's `receipt_root`. The block hash is deliberately
+/// excluded because the commitment is computed before the header is hashed.
+pub fn receipt_commitment(
+    tx_hash: Hash,
+    block_height: u64,
+    transaction_index: u32,
+    gas_used: Gas,
+    cumulative_gas_used: Gas,
+) -> Hash {
+    Hash::from_data(&encode_canonical(&(
         tx_hash,
-        height,
+        block_height,
+        transaction_index,
         gas_used,
+        cumulative_gas_used,
         ReceiptStatus::Success as u8,
     )))
+}
+
+/// Ordered commitment over every receipt in one block.
+pub fn receipts_root(commitments: &[Hash]) -> Hash {
+    Hash::from_data(&encode_canonical(&commitments.to_vec()))
 }
 
 /// Replay every persisted block and receipt against the restored state.
@@ -250,6 +270,10 @@ pub fn validate_chain(
     state: &State,
 ) -> Result<(), StorageError> {
     let mut parent = Hash::ZERO;
+    let mut seen_blocks = HashSet::with_capacity(blocks.len());
+    let mut seen_transactions = HashSet::new();
+    let mut transaction_count = 0usize;
+
     for (index, block) in blocks.iter().enumerate() {
         let expected_height = u64::try_from(index)
             .ok()
@@ -258,52 +282,95 @@ pub fn validate_chain(
         if block.header.height != expected_height
             || block.header.parent_hash != parent
             || block.header.chain_id != chain_id
-            || block.transactions.len() != 1
             || block.header.gas_used > block.header.gas_limit
+            || !seen_blocks.insert(block.hash())
         {
             return Err(StorageError::Invalid(format!(
                 "invalid block sequence at height {expected_height}"
             )));
         }
 
-        let tx = &block.transactions[0];
-        let tx_hash = tx.hash();
-        if block.header.tx_root != tx_root_of(&[tx_hash])
-            || tx.chain_id != chain_id
-            || block.header.gas_used != tx.gas_limit
-            || block.header.receipt_root
-                != receipt_root(tx_hash, block.header.height, block.header.gas_used)
+        let mut gas_used = 0u64;
+        let mut hashes = Vec::with_capacity(block.transactions.len());
+        let mut commitments = Vec::with_capacity(block.transactions.len());
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            let tx_hash = tx.hash();
+            if tx.chain_id != chain_id
+                || tx.gas_limit == 0
+                || !tx.verify_signature()
+                || !seen_transactions.insert(tx_hash)
+            {
+                return Err(StorageError::Invalid(format!(
+                    "invalid transaction at height {expected_height}"
+                )));
+            }
+            gas_used = gas_used
+                .checked_add(tx.gas_limit)
+                .ok_or_else(|| StorageError::Invalid("block gas overflow".into()))?;
+            hashes.push(tx_hash);
+            let transaction_index = u32::try_from(tx_index)
+                .map_err(|_| StorageError::Invalid("too many transactions in a block".into()))?;
+            commitments.push(receipt_commitment(
+                tx_hash,
+                expected_height,
+                transaction_index,
+                tx.gas_limit,
+                gas_used,
+            ));
+        }
+
+        if gas_used != block.header.gas_used
+            || block.header.tx_root != tx_root_of(&hashes)
+            || block.header.receipt_root != receipts_root(&commitments)
         {
             return Err(StorageError::Invalid(format!(
                 "invalid block commitment at height {expected_height}"
             )));
         }
+        transaction_count = transaction_count
+            .checked_add(block.transactions.len())
+            .ok_or_else(|| StorageError::Invalid("transaction count overflow".into()))?;
         parent = block.hash();
     }
 
-    if blocks.len() != receipts.len() {
-        return Err(StorageError::Invalid("every block must have exactly one receipt".into()));
+    if transaction_count != receipts.len() {
+        return Err(StorageError::Invalid(
+            "every transaction must have exactly one receipt".into(),
+        ));
     }
 
-    let mut receipt_blocks = HashSet::with_capacity(receipts.len());
+    let mut receipt_by_tx = HashMap::with_capacity(receipts.len());
     for receipt in receipts {
-        if !receipt_blocks.insert(receipt.block_hash) {
-            return Err(StorageError::Invalid("multiple receipts reference the same block".into()));
+        if receipt.status != ReceiptStatus::Success {
+            return Err(StorageError::Invalid("a failed receipt cannot be committed".into()));
         }
-        let Some(block) = blocks.iter().find(|block| block.hash() == receipt.block_hash) else {
-            return Err(StorageError::Invalid("receipt references an unknown block".into()));
-        };
-        if receipt.block_height != block.header.height
-            || !block.transactions.iter().any(|tx| tx.hash() == receipt.tx_hash)
-            || receipt.status != ReceiptStatus::Success
-            || receipt.gas_used != block.header.gas_used
-            || receipt_root(receipt.tx_hash, receipt.block_height, receipt.gas_used)
-                != block.header.receipt_root
-        {
-            return Err(StorageError::Invalid(format!(
-                "invalid receipt for block {}",
-                receipt.block_height
-            )));
+        if receipt_by_tx.insert(receipt.tx_hash, receipt).is_some() {
+            return Err(StorageError::Invalid("duplicate receipt for one transaction".into()));
+        }
+    }
+
+    for block in blocks {
+        let mut cumulative_gas_used = 0u64;
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            cumulative_gas_used = cumulative_gas_used
+                .checked_add(tx.gas_limit)
+                .ok_or_else(|| StorageError::Invalid("block gas overflow".into()))?;
+            let transaction_index = u32::try_from(tx_index)
+                .map_err(|_| StorageError::Invalid("too many transactions in a block".into()))?;
+            let receipt = receipt_by_tx
+                .get(&tx.hash())
+                .ok_or_else(|| StorageError::Invalid("missing transaction receipt".into()))?;
+            if receipt.block_hash != block.hash()
+                || receipt.block_height != block.header.height
+                || receipt.transaction_index != transaction_index
+                || receipt.gas_used != tx.gas_limit
+                || receipt.cumulative_gas_used != cumulative_gas_used
+            {
+                return Err(StorageError::Invalid(format!(
+                    "invalid receipt for block {}",
+                    block.header.height
+                )));
+            }
         }
     }
 
@@ -360,38 +427,70 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
     use subhost_core::{
         Address, BlockHeader, Transaction, TransactionSignature, TransactionType, BLOCK_GAS_LIMIT,
     };
 
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[1u8; 32])
+    }
+
+    fn sender() -> Address {
+        Address::from_public_key(&key().verifying_key().to_bytes())
+    }
+
     fn transfer(nonce: u64) -> Transaction {
-        Transaction {
+        let key = key();
+        let public_key = key.verifying_key().to_bytes();
+        let mut tx = Transaction {
             tx_type: TransactionType::Transfer,
             nonce,
-            from: Address::new([1; 20]),
+            from: Address::from_public_key(&public_key),
             to: Some(Address::new([2; 20])),
             value: 10,
             gas_price: 1,
             gas_limit: 21_000,
             data: Vec::new(),
             chain_id: 1,
+            public_key,
             signature: TransactionSignature::EMPTY,
-        }
+        };
+        let signature = key.sign(&tx.signing_payload()).to_bytes();
+        tx.signature = TransactionSignature::from_ed25519(&signature);
+        tx
     }
 
-    /// Build a one-transaction-per-block ledger the validator must accept.
-    fn ledger(block_count: u64) -> (LedgerSnapshot, State) {
+    /// Seal a list of blocks, applying every transaction to a fresh state.
+    ///
+    /// This mirrors what a producer must do: gas and commitments are accumulated
+    /// per transaction and the state root is taken after the whole block.
+    fn build(block_transactions: Vec<Vec<Transaction>>) -> (LedgerSnapshot, State) {
         let mut state = State::with_chain_id(1);
-        state.credit(Address::new([1; 20]), 10_000_000).unwrap();
+        state.credit(sender(), 10_000_000).unwrap();
         let mut blocks = Vec::new();
         let mut receipts = Vec::new();
         let mut parent = Hash::ZERO;
 
-        for height in 1..=block_count {
-            let tx = transfer(height - 1);
-            state.apply_transaction(&tx).unwrap();
-            let tx_hash = tx.hash();
-            let gas_used = tx.gas_limit;
+        for (index, transactions) in block_transactions.into_iter().enumerate() {
+            let height = u64::try_from(index).unwrap() + 1;
+            let mut hashes = Vec::with_capacity(transactions.len());
+            let mut commitments = Vec::with_capacity(transactions.len());
+            let mut gas_used = 0u64;
+            for (tx_index, tx) in transactions.iter().enumerate() {
+                state.apply_transaction(tx).unwrap();
+                let tx_hash = tx.hash();
+                gas_used += tx.gas_limit;
+                hashes.push(tx_hash);
+                commitments.push(receipt_commitment(
+                    tx_hash,
+                    height,
+                    u32::try_from(tx_index).unwrap(),
+                    tx.gas_limit,
+                    gas_used,
+                ));
+            }
+
             let header = BlockHeader {
                 version: 1,
                 chain_id: 1,
@@ -399,28 +498,100 @@ mod tests {
                 timestamp: 1_700_000_000 + height,
                 parent_hash: parent,
                 state_root: state.root(),
-                tx_root: tx_root_of(&[tx_hash]),
-                receipt_root: receipt_root(tx_hash, height, gas_used),
+                tx_root: tx_root_of(&hashes),
+                receipt_root: receipts_root(&commitments),
                 validator: Address::ZERO,
                 gas_used,
                 gas_limit: BLOCK_GAS_LIMIT,
                 extra_data: Vec::new(),
             };
-            let block = Block { header, transactions: vec![tx], signatures: Vec::new() };
-            receipts.push(Receipt {
-                tx_hash,
-                block_hash: block.hash(),
-                block_height: height,
-                gas_used,
-                status: ReceiptStatus::Success,
-                logs: Vec::new(),
-                contract_address: None,
-            });
+            let block = Block { header, transactions, signatures: Vec::new() };
+
+            let mut cumulative_gas_used = 0u64;
+            for (tx_index, tx) in block.transactions.iter().enumerate() {
+                cumulative_gas_used += tx.gas_limit;
+                receipts.push(Receipt {
+                    tx_hash: tx.hash(),
+                    block_hash: block.hash(),
+                    block_height: height,
+                    transaction_index: u32::try_from(tx_index).unwrap(),
+                    gas_used: tx.gas_limit,
+                    cumulative_gas_used,
+                    status: ReceiptStatus::Success,
+                    logs: Vec::new(),
+                    contract_address: None,
+                });
+            }
+
             parent = block.hash();
             blocks.push(block);
         }
 
         (LedgerSnapshot { chain_id: 1, state: state.snapshot(), blocks, receipts }, state)
+    }
+
+    /// Build a one-transaction-per-block ledger the validator must accept.
+    fn ledger(block_count: u64) -> (LedgerSnapshot, State) {
+        build((0..block_count).map(|nonce| vec![transfer(nonce)]).collect())
+    }
+
+    #[test]
+    fn a_block_may_hold_several_transactions() {
+        let (snapshot, state) = build(vec![vec![transfer(0), transfer(1), transfer(2)]]);
+        assert_eq!(snapshot.blocks.len(), 1);
+        assert_eq!(snapshot.blocks[0].transactions.len(), 3);
+        assert_eq!(snapshot.receipts.len(), 3);
+
+        let indexes: Vec<u32> = snapshot.receipts.iter().map(|r| r.transaction_index).collect();
+        assert_eq!(indexes, vec![0, 1, 2]);
+        let cumulative: Vec<u64> =
+            snapshot.receipts.iter().map(|r| r.cumulative_gas_used).collect();
+        assert_eq!(cumulative, vec![21_000, 42_000, 63_000]);
+        assert_eq!(snapshot.blocks[0].header.gas_used, 63_000);
+
+        assert!(validate_chain(&snapshot.blocks, &snapshot.receipts, 1, &state).is_ok());
+        assert_eq!(state.balance(&Address::new([2; 20])), 30);
+    }
+
+    #[test]
+    fn receipt_fields_are_committed_even_when_the_list_is_reordered() {
+        let (snapshot, state) = build(vec![vec![transfer(0), transfer(1), transfer(2)]]);
+        assert!(validate_chain(&snapshot.blocks, &snapshot.receipts, 1, &state).is_ok());
+
+        // Receipts are addressed by transaction hash, so the order of the
+        // persisted list is not itself part of the commitment.
+        let mut reordered = snapshot.clone();
+        reordered.receipts.swap(0, 2);
+        assert!(validate_chain(&reordered.blocks, &reordered.receipts, 1, &state).is_ok());
+
+        // Rewriting the cumulative figure is caught even when gas_used is right.
+        let mut regassed = snapshot.clone();
+        regassed.receipts[1].cumulative_gas_used += 1;
+        assert!(validate_chain(&regassed.blocks, &regassed.receipts, 1, &state).is_err());
+
+        // Reassigning a transaction index is caught.
+        let mut remapped = snapshot.clone();
+        remapped.receipts[0].transaction_index = 1;
+        assert!(validate_chain(&remapped.blocks, &remapped.receipts, 1, &state).is_err());
+
+        // Duplicating a transaction inside one block no longer matches tx_root.
+        let duplicated_tx = snapshot.blocks[0].transactions[0].clone();
+        let mut duplicated = snapshot.clone();
+        duplicated.blocks[0].transactions.push(duplicated_tx);
+        assert!(validate_chain(&duplicated.blocks, &duplicated.receipts, 1, &state).is_err());
+    }
+
+    #[test]
+    fn an_unsigned_transaction_is_rejected_even_with_honest_commitments() {
+        // `build` commits whatever it is given, so the only check left that can
+        // reject this block is the signature rule in `validate_chain`.
+        let mut unsigned = transfer(0);
+        unsigned.signature = TransactionSignature::EMPTY;
+        let (snapshot, state) = build(vec![vec![unsigned]]);
+        assert!(matches!(
+            validate_chain(&snapshot.blocks, &snapshot.receipts, 1, &state),
+            Err(StorageError::Invalid(_))
+        ));
     }
 
     #[test]

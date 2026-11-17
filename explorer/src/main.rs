@@ -226,6 +226,7 @@ impl ExplorerState {
             gas_limit: TRANSFER_GAS_LIMIT,
             data: Vec::new(),
             chain_id,
+            public_key: signing_key.verifying_key().to_bytes(),
             signature: TransactionSignature::EMPTY,
         };
         let signature = signing_key.sign(&unsigned.signing_payload()).to_bytes();

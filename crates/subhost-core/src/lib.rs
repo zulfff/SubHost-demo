@@ -6,10 +6,14 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod merkle;
+
 /// Length of a [`struct@Hash`] in bytes (BLAKE3-256).
 pub const HASH_SIZE: usize = 32;
 /// Length of an [`Address`] in bytes.
 pub const ADDRESS_SIZE: usize = 20;
+/// Length of an ed25519 public key carried by a signed transaction.
+pub const PUBLIC_KEY_SIZE: usize = 32;
 /// Per-block gas ceiling enforced by the block producer and the ledger validator.
 pub const BLOCK_GAS_LIMIT: Gas = 30_000_000;
 /// Default target block interval used when a genesis file omits it.
@@ -176,6 +180,11 @@ pub struct Transaction {
     pub gas_limit: Gas,
     pub data: Vec<u8>,
     pub chain_id: ChainId,
+    /// ed25519 public key that controls `from`.
+    ///
+    /// It is part of the signed payload, so a block or a peer can authenticate a
+    /// transaction without trusting whoever delivered it.
+    pub public_key: [u8; PUBLIC_KEY_SIZE],
     pub signature: TransactionSignature,
 }
 
@@ -205,6 +214,29 @@ impl Transaction {
     /// `gas_price * gas_limit`, or `None` on overflow.
     pub fn fee(&self) -> Option<Amount> {
         self.gas_price.checked_mul(u128::from(self.gas_limit))
+    }
+
+    /// Verify that `signature` was produced by the key that owns `from`.
+    ///
+    /// This is the one authentication rule every path uses: RPC admission,
+    /// gossip relay, and block acceptance. The public key is bound to the
+    /// address before the signature is checked, so a caller cannot claim an
+    /// address it does not control.
+    pub fn verify_signature(&self) -> bool {
+        use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
+
+        if Address::from_public_key(&self.public_key) != self.from {
+            return false;
+        }
+        let Ok(verifying_key) = VerifyingKey::from_bytes(&self.public_key) else {
+            return false;
+        };
+        verifying_key
+            .verify(
+                &self.signing_payload(),
+                &Ed25519Signature::from_bytes(&self.signature.to_ed25519()),
+            )
+            .is_ok()
     }
 }
 
@@ -284,7 +316,11 @@ pub struct Receipt {
     pub tx_hash: Hash,
     pub block_hash: Hash,
     pub block_height: BlockHeight,
+    /// Position of the transaction inside its block.
+    pub transaction_index: u32,
     pub gas_used: Gas,
+    /// Gas used by this transaction and every transaction before it in the block.
+    pub cumulative_gas_used: Gas,
     pub status: ReceiptStatus,
     pub logs: Vec<Log>,
     pub contract_address: Option<Address>,
@@ -522,6 +558,7 @@ mod tests {
             gas_limit: 21_000,
             data: Vec::new(),
             chain_id: 1,
+            public_key: [0u8; PUBLIC_KEY_SIZE],
             signature: TransactionSignature::EMPTY,
         }
     }
@@ -555,6 +592,32 @@ mod tests {
         tx.signature = TransactionSignature::EMPTY;
         tx.value += 1;
         assert_ne!(tx.signing_payload(), payload, "value must be signed over");
+    }
+
+    #[test]
+    fn transaction_signature_binds_the_public_key_and_every_field() {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let public_key = key.verifying_key().to_bytes();
+        let mut tx = transaction();
+        tx.from = Address::from_public_key(&public_key);
+        tx.public_key = public_key;
+        let signature = key.sign(&tx.signing_payload()).to_bytes();
+        tx.signature = TransactionSignature::from_ed25519(&signature);
+        assert!(tx.verify_signature());
+
+        let mut tampered = tx.clone();
+        tampered.value += 1;
+        assert!(!tampered.verify_signature(), "value is part of the payload");
+
+        let mut wrong_key = tx.clone();
+        wrong_key.public_key = [9u8; PUBLIC_KEY_SIZE];
+        assert!(!wrong_key.verify_signature(), "the key must own the address");
+
+        let mut wrong_sender = tx;
+        wrong_sender.from = Address::new([3; ADDRESS_SIZE]);
+        assert!(!wrong_sender.verify_signature());
     }
 
     #[test]

@@ -2,9 +2,12 @@
 //! quorum rules, and the staking/slashing registry.
 //!
 //! Scope: these are the verifiable pieces of the protocol — vertex admission,
-//! quorum support, QC signature validation, and stake accounting. There is no
-//! driving consensus loop or block production here; the single-node producer
-//! lives in `subhost-rpc`. Nothing in this crate fabricates agreement.
+//! quorum support, QC signature validation, and stake accounting. The
+//! [`driver`] module turns them into an in-process agreement loop: one view at a
+//! time, a `2f + 1` BLS quorum commits a block, and every proposal must extend
+//! the committed tip. The driver has no networking, timeouts, view changes, or
+//! leader rotation yet, so it is a tested state machine rather than a
+//! decentralized testnet.
 
 use ark_serialize::CanonicalDeserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -12,6 +15,7 @@ use subhost_core::{encode_canonical, Address, Block, Hash};
 use subhost_crypto::{BLSScheme, PublicKey, Signature};
 use tracing::debug;
 
+pub mod driver;
 pub mod staking;
 
 /// Compressed BLS12-381 G2 signature length.
@@ -329,6 +333,7 @@ impl QuorumCertificate {
 }
 
 /// HotStuff view state and QC validation.
+#[derive(Clone)]
 pub struct HotStuff {
     view: u64,
     high_qc: Option<QuorumCertificate>,
@@ -476,6 +481,15 @@ pub enum ConsensusError {
 
     #[error("invalid proposal: {0}")]
     InvalidProposal(String),
+
+    #[error("proposal view {proposed} does not follow the current view {current}")]
+    InvalidView { proposed: u64, current: u64 },
+
+    #[error("no proposal is open for voting")]
+    NoProposal,
+
+    #[error("this replica has no validator signing key")]
+    NotAValidator,
 }
 
 #[cfg(test)]

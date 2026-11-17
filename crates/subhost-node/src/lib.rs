@@ -1,15 +1,29 @@
-//! Node bootstrap: genesis, ledger, JSON-RPC, and metrics in one place.
+//! Node bootstrap: genesis, ledger, JSON-RPC, metrics, and peer gossip in one
+//! place.
 //!
 //! This is the single place that decides how a running node is assembled, so the
 //! CLI, tests, and container entrypoint cannot drift apart.
+//!
+//! Scope of the networking: a node publishes every block its own producer
+//! seals, and applies blocks received from peers through
+//! [`RpcState::accept_block`], which re-validates the whole block. Blocks that
+//! arrive before their parent are buffered briefly and applied in height order.
+//! There is no peer scoring, fork choice, or block request/response protocol.
 
+use bincode::Options;
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use subhost_core::{ChainId, GenesisConfig};
+use subhost_core::{encode_canonical, Block, BlockHeight, ChainId, GenesisConfig};
 use subhost_metrics::{Metrics, MetricsConfig};
-use subhost_rpc::{RpcServer, RpcServerConfig, RpcState};
+use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessage};
+use subhost_rpc::{BlockEvent, RpcServer, RpcServerConfig, RpcState};
 use subhost_storage::LedgerStore;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Re-exported so callers can configure networking without depending on
+/// `subhost-network` directly.
+pub use subhost_network::NetworkConfig as P2pConfig;
 
 /// Genesis file name inside the data directory.
 pub const GENESIS_FILE_NAME: &str = "genesis.json";
@@ -29,6 +43,8 @@ pub struct NodeConfig {
     pub validator: bool,
     /// Chain ID used when the data directory has no genesis file.
     pub fallback_chain_id: ChainId,
+    /// Peer gossip settings. `None` keeps the node single-node and offline.
+    pub network: Option<NetworkConfig>,
 }
 
 impl NodeConfig {
@@ -41,6 +57,7 @@ impl NodeConfig {
             metrics_addr: None,
             validator: false,
             fallback_chain_id: 1,
+            network: None,
         }
     }
 
@@ -168,6 +185,15 @@ impl Node {
             })
         };
 
+        let network_task = self.config.network.clone().map(|config| {
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                if let Err(error) = run_network(state, config).await {
+                    warn!(%error, "peer gossip stopped");
+                }
+            })
+        });
+
         let rpc = RpcServer::new(self.state.clone());
         let result = tokio::select! {
             result = rpc.run(rpc_config) => result.map_err(NodeError::from),
@@ -175,10 +201,157 @@ impl Node {
         };
 
         observer.abort();
+        if let Some(task) = network_task {
+            task.abort();
+        }
         if let Some(task) = metrics_task {
             task.abort();
         }
         result
+    }
+}
+
+/// How far ahead of the local tip a peer block may be buffered.
+const MAX_BLOCKS_AHEAD: BlockHeight = 64;
+
+/// Holds peer blocks that arrived before their parent.
+///
+/// Blocks at or below the next expected height are dropped: they are already
+/// committed or cannot be replayed. Blocks further than [`MAX_BLOCKS_AHEAD`] are
+/// refused outright so a peer cannot make the node buffer unbounded history.
+#[derive(Debug, Default)]
+struct BlockBuffer {
+    pending: BTreeMap<BlockHeight, Block>,
+}
+
+impl BlockBuffer {
+    /// Keep a block for a future height, or discard it as stale/far-future.
+    fn offer(&mut self, block: Block, next_height: BlockHeight) {
+        let height = block.header.height;
+        if height < next_height || height > next_height.saturating_add(MAX_BLOCKS_AHEAD) {
+            debug!(height, next_height, "discarding an out-of-range peer block");
+            return;
+        }
+        // The first block seen for a height wins; a duplicate cannot replace it.
+        self.pending.entry(height).or_insert(block);
+    }
+
+    fn pop_next(&mut self, next_height: BlockHeight) -> Option<Block> {
+        self.pending.remove(&next_height)
+    }
+
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// Apply every buffered block that now extends the local tip.
+///
+/// A rejection is logged and the block dropped: `accept_block` is deterministic,
+/// so retrying the same block cannot succeed.
+fn apply_buffered(state: &RpcState, buffer: &mut BlockBuffer) {
+    loop {
+        let next = state.block_height().saturating_add(1);
+        let Some(block) = buffer.pop_next(next) else { break };
+        let hash = block.hash();
+        match state.accept_block(block) {
+            Ok(receipts) => info!(
+                height = next,
+                %hash,
+                transactions = receipts.len(),
+                "accepted a peer block"
+            ),
+            Err(error) => warn!(height = next, %hash, %error, "rejected a peer block"),
+        }
+    }
+}
+
+/// Canonical bytes for a block on the gossip wire.
+fn encode_block(block: &Block) -> Vec<u8> {
+    encode_canonical(block)
+}
+
+/// Decode a peer block with an explicit size limit.
+///
+/// `bincode::options` must use the same integer encoding as
+/// [`subhost_core::encode_canonical`] (fixed width, little endian); the limit
+/// stops a short payload from requesting a huge allocation.
+fn decode_block(data: &[u8]) -> Result<Block, bincode::Error> {
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(subhost_network::MAX_TRANSMIT_BYTES as u64)
+        .deserialize(data)
+}
+
+/// Pump gossip until the process shuts down.
+///
+/// The swarm and the application loop live in one task, so aborting the task
+/// stops both. Nothing is spawned here that could outlive the node.
+async fn run_network(state: RpcState, config: NetworkConfig) -> Result<(), NodeError> {
+    let (manager, handle) = NetworkManager::new(config)?;
+    let local_peer_id = handle.local_peer_id;
+    let NetworkHandle { outbound, mut inbound, .. } = handle;
+    info!(%local_peer_id, "starting peer gossip");
+
+    let mut block_events = state.subscribe_blocks();
+    let mut buffer = BlockBuffer::default();
+
+    tokio::select! {
+        result = manager.run() => {
+            if let Err(error) = result {
+                warn!(%error, "gossip swarm stopped");
+            }
+            Ok(())
+        }
+        () = pump_gossip(&state, &outbound, &mut inbound, &mut block_events, &mut buffer) => {
+            Ok(())
+        }
+    }
+}
+
+/// Apply inbound blocks and relay locally sealed ones.
+async fn pump_gossip(
+    state: &RpcState,
+    outbound: &tokio::sync::mpsc::Sender<NetworkMessage>,
+    inbound: &mut tokio::sync::mpsc::Receiver<NetworkMessage>,
+    block_events: &mut tokio::sync::broadcast::Receiver<BlockEvent>,
+    buffer: &mut BlockBuffer,
+) {
+    loop {
+        tokio::select! {
+            message = inbound.recv() => match message {
+                Some(NetworkMessage::BlockProposal { data }) => match decode_block(&data) {
+                    Ok(block) => {
+                        buffer.offer(block, state.block_height().saturating_add(1));
+                        debug!(buffered = buffer.len(), "evaluating a peer block");
+                        apply_buffered(state, buffer);
+                    }
+                    Err(error) => debug!(%error, "discarding an undecodable peer block"),
+                },
+                // Other flows exist on the wire but are not driven here.
+                Some(_) => {}
+                None => break,
+            },
+            event = block_events.recv() => match event {
+                // Only relay blocks this node produced; a received block already
+                // reached every peer through gossip.
+                Ok(BlockEvent::Sealed(block)) => {
+                    let message = NetworkMessage::BlockProposal { data: encode_block(&block) };
+                    if outbound.try_send(message).is_err() {
+                        debug!("outbound gossip queue is full; a block was not relayed");
+                    }
+                }
+                Ok(BlockEvent::Accepted(block)) => {
+                    // The local ledger moved; buffered successors may now fit.
+                    debug!(height = block.header.height, "local tip advanced from a peer block");
+                    apply_buffered(state, buffer);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(skipped, "block event observer fell behind");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+        }
     }
 }
 
@@ -241,12 +414,18 @@ pub enum NodeError {
 
     #[error("cannot install shutdown signal handler: {0}")]
     ShutdownSignal(#[source] std::io::Error),
+
+    #[error(transparent)]
+    Network(#[from] subhost_network::NetworkError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use subhost_core::{Address, ValidatorInfo};
+    use ed25519_dalek::{Signer, SigningKey};
+    use subhost_core::{
+        Address, Transaction, TransactionSignature, TransactionType, ValidatorInfo,
+    };
 
     fn genesis_with(chain_id: ChainId, allocation: Option<(Address, u128)>) -> GenesisConfig {
         let mut genesis = GenesisConfig { chain_id, ..Default::default() };
@@ -356,5 +535,134 @@ mod tests {
         );
         assert!(config.metrics_addr.is_none());
         assert!(!config.validator);
+    }
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn signed_transfer(key: &SigningKey, nonce: u64, value: u128) -> Transaction {
+        let public_key = key.verifying_key().to_bytes();
+        let mut tx = Transaction {
+            tx_type: TransactionType::Transfer,
+            nonce,
+            from: Address::from_public_key(&public_key),
+            to: Some(Address::new([2; 20])),
+            value,
+            gas_price: 1,
+            gas_limit: 21_000,
+            data: Vec::new(),
+            chain_id: 1,
+            public_key,
+            signature: TransactionSignature::EMPTY,
+        };
+        tx.signature =
+            TransactionSignature::from_ed25519(&key.sign(&tx.signing_payload()).to_bytes());
+        tx
+    }
+
+    /// A producer with two committed blocks, plus a follower at genesis.
+    fn chain_with_two_blocks() -> (RpcState, RpcState, Address) {
+        let key = signing_key(7);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let producer = RpcState::in_memory(1).unwrap();
+        producer.seed_accounts([(sender, 1_000_000)]).unwrap();
+        producer.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        producer.submit_transaction(signed_transfer(&key, 1, 10)).unwrap();
+
+        let follower = RpcState::in_memory(1).unwrap();
+        follower.seed_accounts([(sender, 1_000_000)]).unwrap();
+        (producer, follower, sender)
+    }
+
+    #[test]
+    fn out_of_order_peer_blocks_are_applied_in_height_order() {
+        let (producer, follower, sender) = chain_with_two_blocks();
+        let first = producer.block_at_height(1).unwrap();
+        let second = producer.block_at_height(2).unwrap();
+
+        let mut buffer = BlockBuffer::default();
+        buffer.offer(second, 1);
+        buffer.offer(first, 1);
+        assert_eq!(buffer.len(), 2);
+        apply_buffered(&follower, &mut buffer);
+
+        assert_eq!(follower.block_height(), 2);
+        // Two transfers pay both the moved value and 21_000 gas each.
+        assert_eq!(follower.balance(&sender), 1_000_000 - 20 - 42_000);
+        assert_eq!(follower.balance(&Address::new([2; 20])), 20);
+        assert_eq!(buffer.len(), 0, "both buffered blocks were consumed");
+
+        // Replaying committed history is discarded, not re-applied.
+        buffer.offer(producer.block_at_height(1).unwrap(), follower.block_height() + 1);
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn the_buffer_refuses_stale_and_far_future_blocks() {
+        let (producer, _, _) = chain_with_two_blocks();
+        let first = producer.block_at_height(1).unwrap();
+        let mut buffer = BlockBuffer::default();
+
+        // Below the expected height.
+        buffer.offer(first.clone(), 5);
+        assert_eq!(buffer.len(), 0);
+
+        // Further ahead than the node is willing to hold.
+        let mut future = first.clone();
+        future.header.height = 1 + MAX_BLOCKS_AHEAD + 1;
+        buffer.offer(future, 1);
+        assert_eq!(buffer.len(), 0);
+
+        // At the horizon is allowed, one past it is not.
+        let mut horizon = first.clone();
+        horizon.header.height = 1 + MAX_BLOCKS_AHEAD;
+        buffer.offer(horizon.clone(), 1);
+        assert_eq!(buffer.len(), 1);
+
+        // A duplicate cannot replace what is already buffered.
+        buffer.offer(horizon, 1);
+        assert_eq!(buffer.len(), 1);
+    }
+
+    #[test]
+    fn apply_buffered_drops_a_block_that_fails_validation() {
+        let (producer, follower, sender) = chain_with_two_blocks();
+        let mut tampered = producer.block_at_height(1).unwrap();
+        tampered.transactions[0].value += 1;
+
+        let mut buffer = BlockBuffer::default();
+        buffer.offer(tampered, 1);
+        apply_buffered(&follower, &mut buffer);
+
+        assert_eq!(follower.block_height(), 0, "a forged block must not commit");
+        assert_eq!(follower.balance(&sender), 1_000_000);
+        assert_eq!(buffer.len(), 0);
+    }
+
+    #[test]
+    fn blocks_survive_the_gossip_encoding() {
+        let (producer, _, _) = chain_with_two_blocks();
+        let block = producer.block_at_height(1).unwrap();
+        let encoded = encode_block(&block);
+        assert_eq!(decode_block(&encoded).unwrap(), block);
+
+        // Truncated input is an error, never a partial block.
+        assert!(decode_block(&encoded[..encoded.len() / 2]).is_err());
+        assert!(decode_block(b"not a block").is_err());
+    }
+
+    #[test]
+    fn networking_is_off_unless_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = Node::bootstrap(NodeConfig::new(dir.path())).unwrap();
+        assert!(node.config().network.is_none());
+
+        let config = NodeConfig {
+            network: Some(NetworkConfig { enable_mdns: false, ..Default::default() }),
+            ..NodeConfig::new(dir.path())
+        };
+        let node = Node::bootstrap(config).unwrap();
+        assert!(node.config().network.is_some());
     }
 }

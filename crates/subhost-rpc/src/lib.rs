@@ -1,14 +1,19 @@
 //! JSON-RPC server and the single-node block producer behind it.
 //!
-//! Scope: this is an honest, deliberately small Ethereum-compatible subset for a
-//! single local node. Every accepted transaction is executed immediately and
-//! sealed into its own block, so `eth_sendTransaction` either returns a hash for
-//! a committed block or an error — there is no pending limbo.
+//! Scope: an honest, deliberately small Ethereum-compatible subset for a single
+//! local node. A submission is admitted to the pool and the next block is sealed
+//! with every pending transaction that is currently executable (per-sender
+//! nonce-contiguous, bounded by the block gas limit), so `eth_sendTransaction`
+//! either returns a hash for a committed block or an error — there is no pending
+//! limbo.
 //!
 //! Security notes:
 //! - `eth_sendTransaction` requires an ed25519 public key and signature; the
 //!   signature is verified over the unsigned encoding and the public key must
 //!   hash to the `from` address, so a caller cannot spend another account.
+//! - Blocks arriving from a peer go through [`RpcState::accept_block`], which
+//!   re-verifies parent, height, every signature, both roots, and the resulting
+//!   state root before any state changes.
 //! - The whole submit path holds one commit lock, and state is only swapped in
 //!   after the ledger write succeeds, so a failed persist cannot leave the
 //!   in-memory ledger ahead of disk.
@@ -18,7 +23,7 @@
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use jsonrpsee::server::{BatchRequestConfig, RpcModule, Server, ServerHandle};
 use jsonrpsee::types::error::ErrorObject;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -27,8 +32,11 @@ use subhost_core::{
     ReceiptStatus, Transaction, TransactionSignature, TransactionType, BLOCK_GAS_LIMIT,
 };
 use subhost_mempool::Mempool;
-use subhost_state::State;
-use subhost_storage::{receipt_root, LedgerSnapshot, LedgerStore, StorageError};
+use subhost_state::{AccountProof, State};
+use subhost_storage::{
+    receipt_commitment, receipts_root, LedgerSnapshot, LedgerStore, StorageError,
+};
+use tokio::sync::broadcast;
 use tracing::{info, warn};
 
 /// Largest JSON-RPC request body accepted.
@@ -63,6 +71,12 @@ pub enum RpcError {
     #[error("transaction rejected: {0}")]
     TransactionRejected(String),
 
+    #[error("block rejected: {0}")]
+    BlockRejected(String),
+
+    #[error("account has no state proof at the latest height")]
+    UnknownAccount,
+
     #[error("state persistence failed: {0}")]
     Persistence(String),
 
@@ -84,6 +98,9 @@ impl From<RpcError> for ErrorObject<'static> {
             RpcError::UnsupportedTransactionType(_) | RpcError::TransactionRejected(_) => {
                 ErrorObject::owned(-32000, message, None::<()>)
             }
+            RpcError::BlockRejected(_) | RpcError::UnknownAccount => {
+                ErrorObject::owned(-32000, message, None::<()>)
+            }
             RpcError::Persistence(_) => {
                 ErrorObject::owned(-32603, "state persistence failed", None::<()>)
             }
@@ -101,6 +118,16 @@ impl From<StorageError> for RpcError {
 /// Shared node state behind the RPC surface.
 ///
 /// Cloning is cheap and shares the same ledger: every field is behind an `Arc`.
+/// A block commit this node observed, published so the network layer can relay
+/// only blocks this node actually produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockEvent {
+    /// A block sealed by this node's own producer.
+    Sealed(Block),
+    /// A block accepted from a peer and re-validated locally.
+    Accepted(Block),
+}
+
 #[derive(Clone)]
 pub struct RpcState {
     chain_id: ChainId,
@@ -117,7 +144,13 @@ pub struct RpcState {
     store: LedgerStore,
     /// Serializes the read-execute-persist-swap sequence.
     commit_lock: Arc<Mutex<()>>,
+    /// Block commits, for relay and tests. A lagging receiver only loses events;
+    /// it never blocks the producer.
+    block_events: broadcast::Sender<BlockEvent>,
 }
+
+/// Buffered block events per subscriber. A node only needs the newest few.
+const BLOCK_EVENT_CAPACITY: usize = 64;
 
 impl RpcState {
     /// In-memory node, used by tests and ephemeral deployments.
@@ -148,11 +181,17 @@ impl RpcState {
             receipts: Arc::new(RwLock::new(receipts)),
             store,
             commit_lock: Arc::new(Mutex::new(())),
+            block_events: broadcast::channel(BLOCK_EVENT_CAPACITY).0,
         })
     }
 
     pub fn chain_id(&self) -> ChainId {
         self.chain_id
+    }
+
+    /// Observe blocks this node seals or accepts.
+    pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockEvent> {
+        self.block_events.subscribe()
     }
 
     pub fn block_height(&self) -> u64 {
@@ -175,6 +214,16 @@ impl RpcState {
 
     pub fn nonce(&self, address: &Address) -> Nonce {
         read(&self.state).nonce(address)
+    }
+
+    /// Merkle root over the current account set, bound to the chain ID.
+    pub fn state_root(&self) -> Hash {
+        read(&self.state).root()
+    }
+
+    /// Merkle inclusion proof for one account at the current state root.
+    pub fn account_proof(&self, address: &Address) -> Option<AccountProof> {
+        read(&self.state).account_proof(address)
     }
 
     pub fn receipt(&self, tx_hash: &Hash) -> Option<Receipt> {
@@ -212,19 +261,17 @@ impl RpcState {
         Ok(())
     }
 
-    /// Submit a transaction: admit it to the pool, execute it, and seal it into
-    /// the next block. Any failure restores the pool to its previous contents.
+    /// Submit a transaction: admit it to a copy of the pool, then seal the next
+    /// block with every pending transaction that is currently executable.
+    ///
+    /// The live pool is only replaced after the ledger write succeeds, so a
+    /// failed commit leaves admission, replacement, and eviction entirely undone.
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
         let requested_hash = tx.hash();
-        let sender = tx.from;
-        let nonce = tx.nonce;
 
-        // Remember what occupied the slot so a rollback is exact.
-        let previous_pending =
-            read(&self.mempool).get_by_sender_nonce(&sender, nonce).map(|(_, existing)| existing);
-
-        let admission = write(&self.mempool)
+        let mut candidate_pool = read(&self.mempool).clone();
+        let admission = candidate_pool
             .admit(tx)
             .map_err(|error| RpcError::TransactionRejected(error.to_string()))?;
         if !admission.accepted {
@@ -235,56 +282,72 @@ impl RpcState {
         }
         debug_assert_eq!(admission.hash, requested_hash);
 
-        match self.seal_next_block(&admission.hash) {
-            Ok(receipt) => Ok(receipt.tx_hash),
-            Err(error) => {
-                self.restore_pool(&admission.hash, previous_pending, admission.displaced);
-                Err(error)
-            }
+        let receipts = self.seal_block(&mut candidate_pool)?;
+        if !receipts.contains_key(&requested_hash) {
+            return Err(RpcError::TransactionRejected(
+                "transaction is not executable against the current state".into(),
+            ));
         }
+
+        *write(&self.mempool) = candidate_pool;
+        Ok(requested_hash)
     }
 
-    /// Execute one pending transaction and commit it as the next block.
+    /// Execute one pending transaction and commit it with the rest of the next
+    /// block's executable transactions.
     pub fn include_transaction(&self, tx_hash: &Hash) -> Result<Receipt, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
-        self.seal_next_block(tx_hash)
+        let mut candidate_pool = read(&self.mempool).clone();
+        if !candidate_pool.contains(tx_hash) {
+            return Err(RpcError::InvalidTxHash);
+        }
+        let receipts = self.seal_block(&mut candidate_pool)?;
+        let receipt = receipts.get(tx_hash).cloned().ok_or(RpcError::InvalidTxHash)?;
+        *write(&self.mempool) = candidate_pool;
+        Ok(receipt)
     }
 
-    /// Undo a pool admission after a failed commit.
-    fn restore_pool(
-        &self,
-        hash: &Hash,
-        previous_pending: Option<Transaction>,
-        displaced: Option<Transaction>,
-    ) {
-        let mut mempool = write(&self.mempool);
-        mempool.remove(hash);
-        for tx in [previous_pending, displaced].into_iter().flatten() {
-            if let Err(error) = mempool.add(tx) {
-                // Losing a rollback insertion drops a transaction the client can
-                // resubmit; it must never take the node down.
-                warn!(%error, "could not restore a displaced transaction to the mempool");
+    /// Transactions the producer may include, in deterministic order.
+    ///
+    /// Senders are visited in address order and each contributes the nonce
+    /// continuous prefix that fits in the remaining block gas. Execution stops at
+    /// the first rejected transaction for a sender, so a block can never skip a
+    /// nonce. [`State::apply_transaction`] validates before mutating, so a reject
+    /// leaves `state` untouched.
+    fn select_transactions(&self, pool: &Mempool, state: &mut State) -> Vec<Transaction> {
+        let mut senders: Vec<Address> = pool.pending().iter().map(|tx| tx.from).collect();
+        senders.sort_unstable();
+        senders.dedup();
+
+        let mut selected = Vec::new();
+        let mut gas_used: Gas = 0;
+        for sender in senders {
+            for tx in pool.ready_for(&sender, state.nonce(&sender)) {
+                let Some(next_gas) = gas_used.checked_add(tx.gas_limit) else { break };
+                if next_gas > BLOCK_GAS_LIMIT {
+                    break;
+                }
+                if state.apply_transaction(&tx).is_err() {
+                    break;
+                }
+                gas_used = next_gas;
+                selected.push(tx);
             }
         }
+        selected
     }
 
-    /// The commit path: execute against a state clone, build the block, persist,
-    /// then swap every in-memory view over at once.
-    fn seal_next_block(&self, tx_hash: &Hash) -> Result<Receipt, RpcError> {
-        let tx = read(&self.mempool).get(tx_hash).cloned().ok_or(RpcError::InvalidTxHash)?;
-
-        let gas_used = tx.gas_limit;
-        if gas_used > BLOCK_GAS_LIMIT {
-            return Err(RpcError::TransactionRejected(format!(
-                "transaction gas {gas_used} exceeds the block gas limit {BLOCK_GAS_LIMIT}"
-            )));
-        }
-
-        // Execute on a clone: on error the live state is untouched.
+    /// Seal every executable pending transaction into one block.
+    ///
+    /// On success the pool has the mined transactions removed and every other
+    /// in-memory view has been swapped; on error nothing is published. The caller
+    /// installs the mutated pool only after this returns `Ok`.
+    fn seal_block(&self, pool: &mut Mempool) -> Result<HashMap<Hash, Receipt>, RpcError> {
         let mut candidate_state = read(&self.state).clone();
-        candidate_state
-            .apply_transaction(&tx)
-            .map_err(|error| RpcError::TransactionRejected(error.to_string()))?;
+        let transactions = self.select_transactions(pool, &mut candidate_state);
+        if transactions.is_empty() {
+            return Ok(HashMap::new());
+        }
 
         let previous_block = read(&self.blocks).last().cloned();
         let height = match previous_block.as_ref() {
@@ -292,6 +355,21 @@ impl RpcState {
             None => 1,
         };
         let parent_hash = previous_block.as_ref().map_or(Hash::ZERO, Block::hash);
+
+        let mut hashes = Vec::with_capacity(transactions.len());
+        let mut commitments = Vec::with_capacity(transactions.len());
+        let mut gas_used: Gas = 0;
+        for (index, tx) in transactions.iter().enumerate() {
+            gas_used = gas_used.checked_add(tx.gas_limit).ok_or(RpcError::Internal)?;
+            hashes.push(tx.hash());
+            commitments.push(receipt_commitment(
+                tx.hash(),
+                height,
+                u32::try_from(index).map_err(|_| RpcError::Internal)?,
+                tx.gas_limit,
+                gas_used,
+            ));
+        }
 
         let block = Block {
             header: BlockHeader {
@@ -301,41 +379,166 @@ impl RpcState {
                 timestamp: subhost_core::unix_timestamp(),
                 parent_hash,
                 state_root: candidate_state.root(),
-                tx_root: tx_root_of(&[*tx_hash]),
-                receipt_root: receipt_root(*tx_hash, height, gas_used),
+                tx_root: tx_root_of(&hashes),
+                receipt_root: receipts_root(&commitments),
                 // A single-node producer has no validator identity to attest with.
                 validator: Address::ZERO,
                 gas_used,
                 gas_limit: BLOCK_GAS_LIMIT,
                 extra_data: Vec::new(),
             },
-            transactions: vec![tx],
+            transactions,
             signatures: Vec::new(),
         };
-        let receipt = Receipt {
-            tx_hash: *tx_hash,
-            block_hash: block.hash(),
-            block_height: height,
-            gas_used,
-            status: ReceiptStatus::Success,
-            logs: Vec::new(),
-            contract_address: None,
-        };
+
+        let block_hash = block.hash();
+        let mut receipts = HashMap::with_capacity(block.transactions.len());
+        let mut cumulative_gas_used: Gas = 0;
+        for (index, tx) in block.transactions.iter().enumerate() {
+            cumulative_gas_used =
+                cumulative_gas_used.checked_add(tx.gas_limit).ok_or(RpcError::Internal)?;
+            receipts.insert(
+                tx.hash(),
+                Receipt {
+                    tx_hash: tx.hash(),
+                    block_hash,
+                    block_height: height,
+                    transaction_index: u32::try_from(index).map_err(|_| RpcError::Internal)?,
+                    gas_used: tx.gas_limit,
+                    cumulative_gas_used,
+                    status: ReceiptStatus::Success,
+                    logs: Vec::new(),
+                    contract_address: None,
+                },
+            );
+        }
 
         let mut next_blocks = read(&self.blocks).clone();
-        next_blocks.push(block);
+        next_blocks.push(block.clone());
         let mut next_receipts = read(&self.receipts).clone();
-        next_receipts.insert(*tx_hash, receipt.clone());
+        for (hash, receipt) in &receipts {
+            next_receipts.insert(*hash, receipt.clone());
+        }
 
         // Durability before visibility: if this fails nothing is swapped in.
         self.persist(&candidate_state, &next_blocks, &next_receipts)?;
 
+        for tx in &block.transactions {
+            pool.remove(&tx.hash());
+        }
         *write(&self.state) = candidate_state;
-        write(&self.mempool).remove(tx_hash);
         *write(&self.blocks) = next_blocks;
         *write(&self.receipts) = next_receipts;
         self.block_height.store(height, Ordering::SeqCst);
-        Ok(receipt)
+        // A send fails only when no receiver is attached, which is normal.
+        let _ = self.block_events.send(BlockEvent::Sealed(block));
+        Ok(receipts)
+    }
+
+    /// Accept a block produced elsewhere (a peer or the consensus driver).
+    ///
+    /// The block is fully re-validated before any state change: parent, height,
+    /// chain, gas accounting, every signature, both commitments, the state
+    /// transition, and the resulting state root. Receipts are derived locally
+    /// and never taken from the wire.
+    pub fn accept_block(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        let previous = read(&self.blocks).last().cloned();
+        let expected_height = match previous.as_ref() {
+            Some(previous) => previous.header.height.checked_add(1).ok_or(RpcError::Internal)?,
+            None => 1,
+        };
+        let expected_parent = previous.as_ref().map_or(Hash::ZERO, Block::hash);
+
+        if block.header.height != expected_height
+            || block.header.parent_hash != expected_parent
+            || block.header.chain_id != self.chain_id
+            || block.header.gas_limit != BLOCK_GAS_LIMIT
+            || block.transactions.is_empty()
+        {
+            return Err(RpcError::BlockRejected(format!(
+                "block does not extend this chain at height {expected_height}"
+            )));
+        }
+
+        let mut candidate_state = read(&self.state).clone();
+        let mut seen = HashSet::with_capacity(block.transactions.len());
+        let mut hashes = Vec::with_capacity(block.transactions.len());
+        let mut commitments = Vec::with_capacity(block.transactions.len());
+        let mut gas_used: Gas = 0;
+        for (index, tx) in block.transactions.iter().enumerate() {
+            if tx.chain_id != self.chain_id || !tx.verify_signature() || !seen.insert(tx.hash()) {
+                return Err(RpcError::BlockRejected(format!(
+                    "invalid transaction {index} in block {}",
+                    block.header.height
+                )));
+            }
+            candidate_state
+                .apply_transaction(tx)
+                .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
+            gas_used = gas_used.checked_add(tx.gas_limit).ok_or(RpcError::Internal)?;
+            hashes.push(tx.hash());
+            commitments.push(receipt_commitment(
+                tx.hash(),
+                block.header.height,
+                u32::try_from(index).map_err(|_| RpcError::Internal)?,
+                tx.gas_limit,
+                gas_used,
+            ));
+        }
+
+        if gas_used != block.header.gas_used
+            || block.header.tx_root != tx_root_of(&hashes)
+            || block.header.receipt_root != receipts_root(&commitments)
+            || candidate_state.root() != block.header.state_root
+        {
+            return Err(RpcError::BlockRejected(format!(
+                "block {} commitments or state transition do not verify",
+                block.header.height
+            )));
+        }
+
+        let block_hash = block.hash();
+        let mut receipts = Vec::with_capacity(block.transactions.len());
+        let mut cumulative_gas_used: Gas = 0;
+        for (index, tx) in block.transactions.iter().enumerate() {
+            cumulative_gas_used =
+                cumulative_gas_used.checked_add(tx.gas_limit).ok_or(RpcError::Internal)?;
+            receipts.push(Receipt {
+                tx_hash: tx.hash(),
+                block_hash,
+                block_height: block.header.height,
+                transaction_index: u32::try_from(index).map_err(|_| RpcError::Internal)?,
+                gas_used: tx.gas_limit,
+                cumulative_gas_used,
+                status: ReceiptStatus::Success,
+                logs: Vec::new(),
+                contract_address: None,
+            });
+        }
+
+        let mut next_blocks = read(&self.blocks).clone();
+        next_blocks.push(block.clone());
+        let mut next_receipts = read(&self.receipts).clone();
+        for receipt in &receipts {
+            next_receipts.insert(receipt.tx_hash, receipt.clone());
+        }
+
+        self.persist(&candidate_state, &next_blocks, &next_receipts)?;
+
+        {
+            let mut pool = write(&self.mempool);
+            for tx in &block.transactions {
+                pool.remove(&tx.hash());
+                pool.prune_below_nonce(&tx.from, candidate_state.nonce(&tx.from));
+            }
+        }
+        *write(&self.state) = candidate_state;
+        *write(&self.blocks) = next_blocks;
+        *write(&self.receipts) = next_receipts;
+        self.block_height.store(block.header.height, Ordering::SeqCst);
+        let _ = self.block_events.send(BlockEvent::Accepted(block));
+        Ok(receipts)
     }
 
     fn persist(
@@ -472,8 +675,8 @@ fn receipt_json(receipt: &Receipt) -> serde_json::Value {
         "transactionHash": receipt.tx_hash.to_string(),
         "blockHash": receipt.block_hash.to_string(),
         "blockNumber": format!("0x{:x}", receipt.block_height),
-        "transactionIndex": "0x0",
-        "cumulativeGasUsed": format!("0x{:x}", receipt.gas_used),
+        "transactionIndex": format!("0x{:x}", receipt.transaction_index),
+        "cumulativeGasUsed": format!("0x{:x}", receipt.cumulative_gas_used),
         "gasUsed": format!("0x{:x}", receipt.gas_used),
         "status": format!("0x{:x}", receipt.status as u8),
         "contractAddress": receipt.contract_address.map(|address| address.to_string()),
@@ -538,6 +741,7 @@ fn block_json(block: &Block, full_transactions: bool) -> serde_json::Value {
 fn transaction_from_params(
     params: &serde_json::Value,
     configured_chain_id: ChainId,
+    public_key: [u8; subhost_core::PUBLIC_KEY_SIZE],
 ) -> Result<Transaction, RpcError> {
     let from = params
         .get("from")
@@ -575,6 +779,7 @@ fn transaction_from_params(
         gas_limit,
         data: hex_data(params.get("data").or_else(|| params.get("input")))?,
         chain_id,
+        public_key,
         signature: TransactionSignature::EMPTY,
     })
 }
@@ -677,13 +882,37 @@ impl RpcServer {
             Ok::<_, RpcError>(format!("0x{:x}", state.nonce(&parse_address(&address)?)))
         })?;
 
+        // Subhost extension: a Merkle membership proof for an account at the
+        // latest state root. `storageKeys` and a block tag are accepted for shape
+        // compatibility, but this chain has no contract storage yet, so the
+        // response contains no storage proof. Absence cannot be proven.
+        module.register_method("eth_getProof", |params, state, _extensions| {
+            let address: String = params.sequence().next().map_err(|_| RpcError::InvalidParams)?;
+            let address = parse_address(&address)?;
+            let proof = state.account_proof(&address).ok_or(RpcError::UnknownAccount)?;
+
+            let mut account_proof = Vec::with_capacity(proof.proof.siblings.len() + 1);
+            account_proof.push(proof.proof.leaf.to_string());
+            account_proof.extend(proof.proof.siblings.iter().map(Hash::to_string));
+
+            Ok::<_, RpcError>(serde_json::json!({
+                "address": address.to_string(),
+                "accountProof": account_proof,
+                "balance": format!("0x{:x}", proof.account.balance),
+                "nonce": format!("0x{:x}", proof.account.nonce),
+                "stateRoot": proof.root.to_string(),
+                "leafIndex": format!("0x{:x}", proof.proof.index),
+                "storageProof": [],
+            }))
+        })?;
+
         module.register_method("eth_sendTransaction", |params, state, _extensions| {
             let request: serde_json::Value = params.one().map_err(|_| RpcError::InvalidParams)?;
-            let unsigned = transaction_from_params(&request, state.chain_id())?;
 
             // Signature is mandatory: the node never signs on a caller's behalf.
             let public_key = fixed_hex::<32>(request.get("publicKey"))?;
             let signature = fixed_hex::<64>(request.get("signature"))?;
+            let unsigned = transaction_from_params(&request, state.chain_id(), public_key)?;
             verify_transaction_signature(&unsigned, &public_key, &signature)?;
 
             let tx = Transaction {
@@ -775,6 +1004,7 @@ mod tests {
             gas_limit: DEFAULT_TX_GAS_LIMIT,
             data: Vec::new(),
             chain_id: 1,
+            public_key,
             signature: TransactionSignature::EMPTY,
         };
         let signature = key.sign(&unsigned.signing_payload()).to_bytes();
@@ -924,6 +1154,135 @@ mod tests {
         assert_eq!(state.balance(&Address::new([2; 20])), 30);
     }
 
+    #[tokio::test]
+    async fn block_events_distinguish_sealed_from_accepted_blocks() {
+        let key = signing_key(7);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let producer = funded_state(&key, 1_000_000);
+        let mut events = producer.subscribe_blocks();
+
+        producer.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        match events.recv().await.unwrap() {
+            BlockEvent::Sealed(block) => assert_eq!(block.header.height, 1),
+            other => panic!("expected a sealed block, got {other:?}"),
+        }
+
+        let follower = RpcState::in_memory(1).unwrap();
+        follower.seed_accounts([(sender, 1_000_000)]).unwrap();
+        let mut follower_events = follower.subscribe_blocks();
+        follower.accept_block(producer.block_at_height(1).unwrap()).unwrap();
+        match follower_events.recv().await.unwrap() {
+            BlockEvent::Accepted(block) => assert_eq!(block.header.height, 1),
+            other => panic!("expected an accepted block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_block_carries_every_executable_transaction() {
+        let alice = signing_key(7);
+        let bob = signing_key(8);
+        let state = RpcState::in_memory(1).unwrap();
+        state
+            .seed_accounts([
+                (Address::from_public_key(&alice.verifying_key().to_bytes()), 100_000),
+                (Address::from_public_key(&bob.verifying_key().to_bytes()), 100_000),
+            ])
+            .unwrap();
+
+        // Park Alice's transaction without asking the producer for a block.
+        let alice_tx = signed_transfer(&alice, 0, 10);
+        state.mempool.write().unwrap().add(alice_tx.clone()).unwrap();
+
+        let bob_tx = signed_transfer(&bob, 0, 20);
+        let hash = state.submit_transaction(bob_tx.clone()).unwrap();
+        assert_eq!(hash, bob_tx.hash());
+
+        assert_eq!(state.block_height(), 1);
+        let block = state.block_at_height(1).unwrap();
+        assert_eq!(block.transactions.len(), 2);
+        assert_eq!(state.pending_count(), 0);
+        assert_eq!(block.header.gas_used, 2 * DEFAULT_TX_GAS_LIMIT);
+
+        let receipts: Vec<Receipt> = block
+            .transactions
+            .iter()
+            .map(|tx| state.receipt(&tx.hash()).expect("every included transaction has a receipt"))
+            .collect();
+        let indexes: Vec<u32> = receipts.iter().map(|receipt| receipt.transaction_index).collect();
+        assert_eq!(indexes, vec![0, 1]);
+        assert_eq!(receipts[0].cumulative_gas_used, DEFAULT_TX_GAS_LIMIT);
+        assert_eq!(receipts[1].cumulative_gas_used, 2 * DEFAULT_TX_GAS_LIMIT);
+    }
+
+    #[test]
+    fn a_nonce_gap_blocks_later_transactions_of_the_same_sender() {
+        let key = signing_key(7);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = funded_state(&key, 1_000_000);
+
+        // Nonce 1 cannot execute before nonce 0, so the submission is rejected
+        // and leaves no trace in the pool.
+        let gap = signed_transfer(&key, 1, 10);
+        assert!(matches!(
+            state.submit_transaction(gap.clone()),
+            Err(RpcError::TransactionRejected(_))
+        ));
+        assert_eq!(state.block_height(), 0);
+        assert_eq!(state.pending_count(), 0);
+
+        // Once nonce 0 arrives, the contiguous prefix of both mines in order.
+        state.mempool.write().unwrap().add(gap).unwrap();
+        state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        assert_eq!(state.block_height(), 1);
+        assert_eq!(state.block_at_height(1).unwrap().transactions.len(), 2);
+        assert_eq!(state.nonce(&sender), 2);
+        assert_eq!(state.balance(&Address::new([2; 20])), 20);
+    }
+
+    #[test]
+    fn accept_block_replays_a_peer_block_and_rejects_tampering() {
+        let key = signing_key(7);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let producer = funded_state(&key, 1_000_000);
+        let hash = producer.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        let block = producer.block_at_height(1).unwrap();
+        assert_eq!(block.transactions[0].hash(), hash);
+
+        let follower = RpcState::in_memory(1).unwrap();
+        follower.seed_accounts([(sender, 1_000_000)]).unwrap();
+        // The same transaction reached the follower through gossip; accepting the
+        // block must prune it from the pool.
+        follower.mempool.write().unwrap().add(block.transactions[0].clone()).unwrap();
+
+        let receipts = follower.accept_block(block.clone()).unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(follower.block_height(), 1);
+        assert_eq!(follower.block_count(), 1);
+        assert_eq!(follower.state_root(), block.header.state_root);
+        assert_eq!(follower.balance(&Address::new([2; 20])), 10);
+        assert_eq!(follower.nonce(&sender), 1);
+        assert_eq!(follower.pending_count(), 0);
+
+        // The same height cannot be replayed on top of itself.
+        assert!(matches!(follower.accept_block(block.clone()), Err(RpcError::BlockRejected(_))));
+
+        // A mutated transaction invalidates its signature (and every root).
+        let mut tampered = block.clone();
+        tampered.transactions[0].value += 1;
+        let other = RpcState::in_memory(1).unwrap();
+        other.seed_accounts([(sender, 1_000_000)]).unwrap();
+        assert!(matches!(other.accept_block(tampered), Err(RpcError::BlockRejected(_))));
+        assert_eq!(other.block_height(), 0);
+
+        // Even a well-formed block fails when its declared state root is wrong.
+        let mut bad_state_root = block;
+        bad_state_root.header.state_root = Hash::ZERO;
+        let third = RpcState::in_memory(1).unwrap();
+        third.seed_accounts([(sender, 1_000_000)]).unwrap();
+        assert!(matches!(third.accept_block(bad_state_root), Err(RpcError::BlockRejected(_))));
+        assert_eq!(third.block_height(), 0);
+    }
+
     #[test]
     fn rejects_insufficient_balance_without_mutating_state() {
         let key = signing_key(7);
@@ -1030,7 +1389,7 @@ mod tests {
             "value": "0x1",
         });
         assert!(matches!(
-            transaction_from_params(&request, 1),
+            transaction_from_params(&request, 1, [0u8; 32]),
             Err(RpcError::UnsupportedTransactionType(TransactionType::ContractCreation))
         ));
     }
@@ -1042,7 +1401,10 @@ mod tests {
             "to": Address::new([2; 20]).to_string(),
             "chainId": "0x9",
         });
-        assert!(matches!(transaction_from_params(&request, 1), Err(RpcError::InvalidChainId)));
+        assert!(matches!(
+            transaction_from_params(&request, 1, [0u8; 32]),
+            Err(RpcError::InvalidChainId)
+        ));
     }
 
     #[test]
@@ -1051,15 +1413,21 @@ mod tests {
             "from": Address::new([1; 20]).to_string(),
             "to": Address::new([2; 20]).to_string(),
         });
-        assert_eq!(transaction_from_params(&base, 1).unwrap().gas_limit, DEFAULT_TX_GAS_LIMIT);
+        assert_eq!(
+            transaction_from_params(&base, 1, [0u8; 32]).unwrap().gas_limit,
+            DEFAULT_TX_GAS_LIMIT
+        );
 
         let mut with_gas = base.clone();
         with_gas["gas"] = serde_json::json!("0x7530");
-        assert_eq!(transaction_from_params(&with_gas, 1).unwrap().gas_limit, 30_000);
+        assert_eq!(transaction_from_params(&with_gas, 1, [0u8; 32]).unwrap().gas_limit, 30_000);
 
         let mut with_gas_limit = base;
         with_gas_limit["gasLimit"] = serde_json::json!("0x7530");
-        assert_eq!(transaction_from_params(&with_gas_limit, 1).unwrap().gas_limit, 30_000);
+        assert_eq!(
+            transaction_from_params(&with_gas_limit, 1, [0u8; 32]).unwrap().gas_limit,
+            30_000
+        );
     }
 
     #[tokio::test]
@@ -1150,6 +1518,53 @@ mod tests {
         )
         .await;
         assert_eq!(nonce["result"], "0x1");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn http_get_proof_returns_a_verifiable_merkle_path() {
+        let key = signing_key(7);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = funded_state(&key, 100_000);
+        let (addr, handle) = start_test_server(state.clone()).await;
+
+        let response = rpc_request(
+            addr,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "eth_getProof",
+                "params": [sender.to_string(), [], "latest"],
+            }),
+        )
+        .await;
+        let result = &response["result"];
+
+        assert_eq!(result["address"], sender.to_string());
+        assert_eq!(result["balance"], "0x186a0");
+        assert_eq!(result["nonce"], "0x0");
+        assert_eq!(result["stateRoot"], state.state_root().to_string());
+
+        // The first element is the leaf, the rest are the path from the bottom.
+        let path = result["accountProof"].as_array().expect("an account proof");
+        assert_eq!(path[0], state.account_proof(&sender).unwrap().proof.leaf.to_string());
+        assert_eq!(path.len(), 1 + state.account_proof(&sender).unwrap().proof.siblings.len());
+
+        let proof = state.account_proof(&sender).unwrap();
+        assert!(proof.verify(&state.state_root()));
+
+        // An account that has never been touched cannot be proven absent.
+        let unknown = rpc_request(
+            addr,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2,
+                "method": "eth_getProof",
+                "params": [Address::new([9; 20]).to_string(), [], "latest"],
+            }),
+        )
+        .await;
+        assert_eq!(unknown["error"]["code"], -32000);
 
         handle.stop().unwrap();
         handle.stopped().await;
