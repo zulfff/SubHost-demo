@@ -667,10 +667,30 @@ mod tests {
         assert!(node.config().network.is_some());
     }
 
-    /// Port 0 lets the OS choose, so the test never collides with a real service.
-    fn free_loopback_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    /// Two distinct free loopback ports, both bound until chosen.
+    ///
+    /// Binding both listeners at once guarantees the two ports differ; asking for
+    /// one port twice can return the same number and make one node fail to bind.
+    fn two_free_loopback_ports() -> (u16, u16) {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        (first.local_addr().unwrap().port(), second.local_addr().unwrap().port())
+    }
+
+    /// Wait until a libp2p TCP listener accepts connections on `port`.
+    ///
+    /// A follower dials its bootstrap peer once, at startup. On a loaded CI runner
+    /// that dial can happen before the producer has bound its listener, and because
+    /// there is no redial the mesh never forms. Waiting for the port first removes
+    /// that ordering dependency.
+    async fn wait_until_listening(port: u16) {
+        for _ in 0..250 {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("no listener on 127.0.0.1:{port} after 5s");
     }
 
     /// Two real nodes, real libp2p over loopback TCP, real gossip.
@@ -684,8 +704,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_nodes_exchange_blocks_over_real_gossip() {
         let (producer, follower, sender) = chain_with_two_blocks();
-        let producer_port = free_loopback_port();
-        let follower_port = free_loopback_port();
+        let (producer_port, follower_port) = two_free_loopback_ports();
 
         let (manager, handle) = NetworkManager::new(NetworkConfig {
             listen_addr: format!("/ip4/127.0.0.1/tcp/{producer_port}"),
@@ -694,6 +713,7 @@ mod tests {
         })
         .unwrap();
         let producer_task = tokio::spawn(manager.run());
+        wait_until_listening(producer_port).await;
 
         let follower_task = tokio::spawn(run_network(
             follower.clone(),
