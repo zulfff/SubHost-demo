@@ -185,6 +185,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Architecture overview.** `docs/architecture.md` explains the block lifecycle
+  from submission to acceptance, who may produce a block today, what the ledger
+  guarantees and what it does not, and which crate owns each decision. Every claim
+  is tied to the code path that enforces it.
 - **Block signing payload contract.** `subhost_core::BLOCK_SIGNING_DOMAIN` and
   `Block::signing_payload()` define the bytes a validator will sign:
   `domain || chain_id || height || block_hash`, with both integers big-endian.
