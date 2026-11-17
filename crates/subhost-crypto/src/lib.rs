@@ -10,14 +10,16 @@
 //!   requires replacing it.
 //! - Aggregate verification over a *shared* message is only safe when every
 //!   participant's key carries a verified proof of possession; see
-//!   [`BLSScheme::proof_of_possession`].
+//!   [`BLSScheme::proof_of_possession`]. Proofs of possession are hashed under
+//!   their own domain tag, so a proof cannot be replayed as a protocol signature
+//!   over the encoded public key.
 //! - X25519 shared secrets are always contributory-checked, so a low-order peer
 //!   key cannot force a predictable secret.
 
 use ark_bls12_381::{Fr as Scalar, G1Projective, G2Projective};
 use ark_ec::{pairing::Pairing, PrimeGroup};
 use ark_ff::{Field, PrimeField, Zero};
-use ark_serialize::CanonicalSerialize;
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;
@@ -25,8 +27,18 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Domain separation tag for protocol BLS signatures.
 const BLS_DOMAIN: &[u8] = b"subhost-bls-01";
+/// Domain separation tag for proofs of possession.
+///
+/// A proof must not double as a protocol signature over the encoded public key,
+/// so it is hashed under its own tag rather than [`BLS_DOMAIN`].
+const BLS_POP_DOMAIN: &[u8] = b"subhost-bls-pop-01";
 /// ChaCha20-Poly1305 nonce length.
 const AEAD_NONCE_BYTES: usize = 12;
+
+/// Compressed BLS12-381 G1 public key length.
+pub const PUBLIC_KEY_BYTES: usize = 48;
+/// Compressed BLS12-381 G2 signature length.
+pub const SIGNATURE_BYTES: usize = 96;
 
 /// A BLS12-381 G1 public key.
 pub type PublicKey = G1Projective;
@@ -121,15 +133,39 @@ impl BLSScheme {
     /// Sign one's own public key, proving possession of the matching secret.
     pub fn proof_of_possession(secret: &PrivateKey) -> Signature {
         let public = G1Projective::generator() * secret.0;
-        Self::sign(secret, &Self::encode_public_key(&public))
+        Self::hash_to_g2_in_domain(BLS_POP_DOMAIN, &Self::encode_public_key(&public)) * secret.0
     }
 
     /// Verify a proof of possession against the key it claims to bind.
     pub fn verify_possession(public: &PublicKey, proof: &Signature) -> bool {
-        if public.is_zero() {
+        if public.is_zero() || proof.is_zero() {
             return false;
         }
-        Self::verify(public, &Self::encode_public_key(public), proof)
+        let message_point =
+            Self::hash_to_g2_in_domain(BLS_POP_DOMAIN, &Self::encode_public_key(public));
+        ark_bls12_381::Bls12_381::pairing(*public, message_point)
+            == ark_bls12_381::Bls12_381::pairing(G1Projective::generator(), *proof)
+    }
+
+    /// Decode a compressed BLS12-381 G1 public key.
+    ///
+    /// Rejects the wrong length, a point off the curve, and a point outside the
+    /// prime-order subgroup. The identity element decodes successfully and is
+    /// rejected later by [`Self::verify_possession`], so registration cannot
+    /// accept a key that verifies against everything.
+    pub fn decode_public_key(bytes: &[u8]) -> Option<PublicKey> {
+        if bytes.len() != PUBLIC_KEY_BYTES {
+            return None;
+        }
+        PublicKey::deserialize_compressed(bytes).ok()
+    }
+
+    /// Decode a compressed BLS12-381 G2 signature with the same checks.
+    pub fn decode_signature(bytes: &[u8]) -> Option<Signature> {
+        if bytes.len() != SIGNATURE_BYTES {
+            return None;
+        }
+        Signature::deserialize_compressed(bytes).ok()
     }
 
     /// Canonical compressed encoding of a public key.
@@ -145,9 +181,14 @@ impl BLSScheme {
     ///
     /// See the module docs: this is hash-and-multiply, not RFC 9380 hash-to-curve.
     fn hash_to_g2(message: &[u8]) -> G2Projective {
+        Self::hash_to_g2_in_domain(BLS_DOMAIN, message)
+    }
+
+    /// Hash under an explicit domain tag.
+    fn hash_to_g2_in_domain(domain: &[u8], message: &[u8]) -> G2Projective {
         use sha3::{Digest, Sha3_384};
         let mut hasher = Sha3_384::new();
-        hasher.update(BLS_DOMAIN);
+        hasher.update(domain);
         // Length-prefix the message so no two distinct inputs share a digest.
         hasher.update((message.len() as u64).to_be_bytes());
         hasher.update(message);
@@ -312,6 +353,52 @@ mod tests {
             &Signature::zero()
         ));
         assert!(!BLSScheme::verify_possession(&PublicKey::zero(), &Signature::zero()));
+    }
+
+    #[test]
+    fn possession_proofs_use_their_own_domain() {
+        let (secret, public) = BLSScheme::keygen();
+        let mut encoded = Vec::new();
+        public.serialize_compressed(&mut encoded).unwrap();
+
+        // The old shared-domain construction signs the encoded key under BLS_DOMAIN.
+        let legacy = BLSScheme::sign(&secret, &encoded);
+        assert!(BLSScheme::verify(&public, &encoded, &legacy));
+        assert!(
+            !BLSScheme::verify_possession(&public, &legacy),
+            "a protocol signature over the key must not count as a proof"
+        );
+
+        let proof = BLSScheme::proof_of_possession(&secret);
+        assert!(BLSScheme::verify_possession(&public, &proof));
+        assert!(
+            !BLSScheme::verify(&public, &encoded, &proof),
+            "a proof must not be replayable as a protocol signature"
+        );
+
+        let (_, other) = BLSScheme::keygen();
+        assert!(!BLSScheme::verify_possession(&other, &proof));
+    }
+
+    #[test]
+    fn compressed_keys_and_signatures_round_trip_and_reject_bad_input() {
+        let (secret, public) = BLSScheme::keygen();
+        let signature = BLSScheme::sign(&secret, b"round trip");
+
+        let mut key_bytes = Vec::new();
+        public.serialize_compressed(&mut key_bytes).unwrap();
+        let mut signature_bytes = Vec::new();
+        signature.serialize_compressed(&mut signature_bytes).unwrap();
+        assert_eq!(key_bytes.len(), PUBLIC_KEY_BYTES);
+        assert_eq!(signature_bytes.len(), SIGNATURE_BYTES);
+
+        assert_eq!(BLSScheme::decode_public_key(&key_bytes), Some(public));
+        assert_eq!(BLSScheme::decode_signature(&signature_bytes), Some(signature));
+
+        assert!(BLSScheme::decode_public_key(&key_bytes[..PUBLIC_KEY_BYTES - 1]).is_none());
+        assert!(BLSScheme::decode_public_key(&[0u8; PUBLIC_KEY_BYTES]).is_none());
+        assert!(BLSScheme::decode_signature(&signature_bytes[..SIGNATURE_BYTES - 1]).is_none());
+        assert!(BLSScheme::decode_signature(&[0u8; SIGNATURE_BYTES]).is_none());
     }
 
     #[test]
