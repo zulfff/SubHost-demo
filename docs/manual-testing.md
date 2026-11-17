@@ -1,9 +1,12 @@
-# Manual Testing: Two Wallets
+# Manual testing: two wallets
 
-This walks through a single-node chain end to end: wallet creation, ed25519
-signing, balances, nonces, fees, block production, and restart persistence.
+This walkthrough runs a chain end to end: wallet creation, ed25519 signing,
+balances, nonces, fees, block production, account proofs, restart persistence, and
+two-node block gossip.
 
-It is not a multi-node testnet. There is no P2P and no consensus.
+It is not a multi-node testnet. `--p2p-listen` relays blocks between nodes, but the
+node has no consensus, no fork choice, and no block sync, so only one node may
+produce.
 
 ## 1. Build
 
@@ -12,8 +15,8 @@ cargo build -p subhost-cli
 export SUBHOST_BIN="$(pwd)/target/debug/subhost"
 ```
 
-Build parallelism is capped at two jobs by `.cargo/config.toml`, which keeps the
-build inside about 4 GB of RAM.
+`.cargo/config.toml` caps build parallelism at two jobs, which keeps the build
+inside about 4 GB of RAM.
 
 ### Scripted path
 
@@ -32,15 +35,15 @@ source /tmp/subhost-two-users-current.env && scripts/user1-alice.sh
 source /tmp/subhost-two-users-current.env && scripts/user2-bob.sh
 ```
 
-Alice sends 100 units to Bob; Bob sends 25 back. Each script prints the balance
+Alice sends 100 units to Bob, and Bob sends 25 back. Each script prints the balance
 before and after, the receipt, and the resulting block. The scripts let the CLI
-resolve the nonce, so they can be rerun without editing a counter.
+resolve the nonce, so you can rerun them without editing a counter.
 
 Override the port with `RPC_URL`, for example
 `RPC_URL=http://127.0.0.1:18545 scripts/user1-alice.sh`.
 
-For the browser dashboard, use `scripts/start-web-demo.sh`, which starts a node
-and the explorer together on `http://127.0.0.1:3000`.
+For the browser dashboard, use `scripts/start-web-demo.sh`, which starts a node and
+the explorer together on `http://127.0.0.1:3000`.
 
 The rest of this document does the same thing by hand.
 
@@ -57,7 +60,7 @@ export SUBHOST_HOME="$SUBHOST_TEST_HOME/.subhost"
 ## 3. Create Alice and Bob
 
 The passwords below are examples. Passing a password as a CLI argument exposes it
-to shell history and the process list; do not use this pattern for real funds.
+to shell history and the process list, so do not use this pattern for real funds.
 
 ```bash
 "$SUBHOST_BIN" wallet new --password "alice-pass-123" --name alice
@@ -81,7 +84,7 @@ Inspect one with:
 
 ## 4. Write genesis and start the node
 
-`init` must run before the node starts for the first time; the node applies
+`init` must run before the node starts for the first time. The node applies
 allocations only when no ledger exists yet.
 
 ```bash
@@ -141,8 +144,8 @@ chain ID and nonce from the node, submits `eth_sendTransaction`, and prints the
 hash of the committed block's transaction. Pass `--nonce` and `--chain-id`
 explicitly to override the queried values.
 
-With `gas_price = 1` and `gas_limit = 21000` the fee is 21000, so Alice goes to
-`1000000 - 100 - 21000 = 978900` and Bob receives `100`.
+With `gas_price = 1` and `gas_limit = 21000` the fee is 21000. Alice therefore ends
+at `1000000 - 100 - 21000 = 978900`, and Bob receives `100`.
 
 ## 7. Verify the receipt and the block
 
@@ -168,11 +171,15 @@ A successful receipt has `"status": "0x1"`, `"blockNumber": "0x1"`, and
   --password "bob-pass-123"
 ```
 
-This becomes block 2. Each accepted transaction is sealed into its own block.
+This becomes block 2. The node seals one block per submission and fills it with
+every pending transaction that is currently executable. If another sender submits
+at the same time, both transfers share a block, and their receipts report distinct
+`transactionIndex` and `cumulativeGasUsed` values.
 
 ## 9. Confirm the failure paths
 
-Each of these must be rejected. If any succeeds, that is a bug worth reporting.
+Each of these must be rejected. If any of them succeeds, that is a bug worth
+reporting.
 
 ```bash
 # Replayed nonce.
@@ -202,12 +209,64 @@ balance`, `invalid chain ID`, and `-32602` for the unsigned request.
 
 ## 10. Confirm persistence
 
-Stop the node with `Ctrl-C`, then start it again with the same `--data-dir`. It
-logs `restored existing ledger` with the height, and every balance and nonce
-survives. The ledger is checksummed and every block and receipt commitment is
-replayed on load, so a corrupted file is refused rather than partially loaded.
+Stop the node with `Ctrl-C`, then start it again with the same `--data-dir`. It logs
+`restored existing ledger` with the height, and every balance and nonce survives.
+The ledger is checksummed and every block and receipt commitment is replayed on
+load, so a corrupted file is refused rather than partially loaded.
 
-## 11. Optional: metrics
+## 11. Optional: account proof
+
+```bash
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' --data "{
+  \"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_getProof\",
+  \"params\":[\"$ALICE_ADDRESS\",[],\"latest\"]}"
+```
+
+The response carries `stateRoot`, the account's balance and nonce, and an
+`accountProof` array whose first element is the leaf and whose remainder is the
+sibling path. An address that has never held a balance returns an error, because
+this tree proves membership and not absence.
+
+## 12. Optional: two nodes over gossip
+
+Gossip delivers live blocks only. Both nodes must start at height 0, and the
+follower must connect before the first block is produced. There is no backfill for
+a node that was offline.
+
+```bash
+export SUBHOST_PRODUCER_DATA="$(mktemp -d /tmp/subhost-producer.XXXXXX)"
+export SUBHOST_FOLLOWER_DATA="$(mktemp -d /tmp/subhost-follower.XXXXXX)"
+"$SUBHOST_BIN" init --chain-id 1 --data-dir "$SUBHOST_PRODUCER_DATA" \
+  --alloc "$ALICE_ADDRESS=1000000"
+cp "$SUBHOST_PRODUCER_DATA/genesis.json" "$SUBHOST_FOLLOWER_DATA/genesis.json"
+```
+
+```bash
+# Terminal A: the producer.
+"$SUBHOST_BIN" node --listen 127.0.0.1:8545 --data-dir "$SUBHOST_PRODUCER_DATA" \
+  --p2p-listen /ip4/127.0.0.1/tcp/30333 --no-mdns
+
+# Terminal B: the follower. It restores the same genesis and never receives a
+# transaction of its own.
+"$SUBHOST_BIN" node --listen 127.0.0.1:18545 --data-dir "$SUBHOST_FOLLOWER_DATA" \
+  --p2p-listen /ip4/127.0.0.1/tcp/30334 \
+  --bootstrap-peer /ip4/127.0.0.1/tcp/30333 --no-mdns
+```
+
+Send a transfer to node A, then ask node B:
+
+```bash
+"$SUBHOST_BIN" query chain --rpc-url http://127.0.0.1:18545
+```
+
+The follower logs `accepted a peer block` and reaches the same height, root, and
+balance. A block that arrives before its parent is buffered (up to 64 heights) and
+applied once the gap fills. Sending a transfer to **both** nodes produces two
+different blocks at the same height. Each node rejects the other's block because it
+does not extend the local tip, and neither recovers. That is expected until fork
+choice exists.
+
+## 13. Optional: metrics
 
 Start the node with `--metrics-addr 127.0.0.1:9090`, then:
 
@@ -219,24 +278,25 @@ curl -s http://127.0.0.1:9090/health
 `subhost_block_height` tracks the chain tip and `subhost_pending_transactions`
 tracks mempool depth.
 
-## Common errors
+## 14. Clean up
 
-- `no wallet for 0x… in …` — `SUBHOST_HOME` differs from where the wallet was
-  created, or the address is wrong.
-- `decryption failed (wrong password or corrupt wallet)` — wrong password, or the
-  file was modified.
-- `invalid nonce for 0x…: expected N, got M` — check `query nonce`.
-- `insufficient balance` — `amount + gas_price * gas_limit` exceeds the balance.
-- `invalid chain ID` — `--chain-id` must match the node.
-- `cannot reach the node at …` — the node is not running on that port.
-- `a validator network requires at least one initial validator` — `node
-  --validator` needs `init --validator`.
-
-## 12. Clean up
+Stop the node with `Ctrl-C` first.
 
 ```bash
-# Stop the node with Ctrl-C first.
-rm -rf "$SUBHOST_TEST_HOME" "$SUBHOST_TEST_DATA"
+rm -rf "$SUBHOST_TEST_HOME" "$SUBHOST_TEST_DATA" "$SUBHOST_FOLLOWER_DATA"
 ```
 
-Only removes the `/tmp` directories created above.
+That only removes the `/tmp` directories created above.
+
+## Common errors
+
+- `no wallet for 0x… in …`: `SUBHOST_HOME` differs from where the wallet was
+  created, or the address is wrong.
+- `decryption failed (wrong password or corrupt wallet)`: wrong password, or the
+  file was modified.
+- `invalid nonce for 0x…: expected N, got M`: check `query nonce`.
+- `insufficient balance`: `amount + gas_price * gas_limit` exceeds the balance.
+- `invalid chain ID`: `--chain-id` must match the node.
+- `cannot reach the node at …`: the node is not running on that port.
+- `a validator network requires at least one initial validator`: `node
+  --validator` needs `init --validator`.

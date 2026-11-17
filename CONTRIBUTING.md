@@ -11,7 +11,7 @@ cd SubHost-demo
 ```
 
 `rust-toolchain.toml` pins the toolchain, so `rustup` installs the right compiler
-and components (`rustfmt`, `clippy`) automatically on first build. The minimum
+and components (`rustfmt`, `clippy`) automatically on the first build. The minimum
 supported Rust version is 1.89, and CI checks it separately. It is not 1.75:
 transitive dependencies in `Cargo.lock` require edition 2024, which 1.75 cannot
 parse, and `enum-ordinalize` (reached through `educe` -> `ark-ec`) requires 1.89.
@@ -38,11 +38,12 @@ release build, and `cargo doc` with warnings denied. All of them are required.
 - **No warnings.** Clippy runs with `-D warnings` over every target and feature.
 - **No `unsafe`.** The workspace sets `unsafe_code = "forbid"`.
 - **No placeholders.** `todo!`, `unimplemented!`, and `dbg!` are denied. A function
-  that cannot do its job must return an error, not pretend to succeed.
+  that cannot do its job must return an error instead of pretending to succeed.
 - **Checked arithmetic on anything that represents value.** Balances, nonces, and
-  gas are `checked_*`, not wrapping. An overflow is an error.
+  gas use `checked_*`, not wrapping. An overflow is an error.
 - **Tests for behaviour, including the failure paths.** A new validation rule needs
-  a test proving the invalid input is rejected, not only that valid input passes.
+  a test proving the invalid input is rejected, not only a test showing valid input
+  passes.
 - **Document why, not what.** Comments should explain a non-obvious decision or a
   security property. Do not narrate the code.
 
@@ -50,7 +51,7 @@ release build, and `cargo doc` with warnings denied. All of them are required.
 
 The README's status table is authoritative about what is implemented. If your
 change makes something work, update that table. If it does not, do not describe it
-as if it does — an aspirational comment or doc line is treated as a defect here.
+as if it does. An aspirational comment or doc line is treated as a defect here.
 
 Naming a module after a technique does not implement it. `subhost-network` carries
 a `TransactionStem` message type but implements no Dandelion++ relay, and the
@@ -60,16 +61,16 @@ module documentation says so. Keep that pattern.
 
 Changes under these paths get closer review, and `.github/CODEOWNERS` enforces it:
 
-- `crates/subhost-crypto` — signature and key-exchange primitives
-- `crates/subhost-wallet` — key storage and derivation
-- `crates/subhost-consensus` — quorum and slashing rules
-- `crates/subhost-state` — balance and nonce rules
-- `crates/subhost-storage` — the durable ledger format
-- `crates/subhost-rpc` — the authenticated write path
+- `crates/subhost-crypto`: signature and key-exchange primitives
+- `crates/subhost-wallet`: key storage and derivation
+- `crates/subhost-consensus`: quorum and slashing rules
+- `crates/subhost-state`: balance and nonce rules
+- `crates/subhost-storage`: the durable ledger format
+- `crates/subhost-rpc`: the authenticated write path
 
 If you change a signature payload, an address derivation, or the on-disk format,
-say so explicitly in the pull request: those changes invalidate existing wallets
-or ledgers.
+say so explicitly in the pull request. Those changes invalidate existing wallets or
+ledgers.
 
 Do not open a public issue for a suspected vulnerability. Follow
 [SECURITY.md](SECURITY.md).
@@ -80,23 +81,28 @@ Conventional-style prefixes are preferred: `feat:`, `fix:`, `docs:`, `refactor:`
 `perf:`, `test:`, `build:`, `ci:`.
 
 The pull request template asks what changed, how you verified it, the security
-impact, and whether anything breaks. Fill it in; "none" is a fine answer when it
-is true.
+impact, and whether anything breaks. Fill it in. "none" is a fine answer when it is
+true.
 
-Never commit a private key, wallet file, ledger, or `.env`. `.gitignore` covers
-the usual paths, but check `git diff --cached` before you commit.
+Never commit a private key, wallet file, ledger, or `.env`. `.gitignore` covers the
+usual paths, but check `git diff --cached` before you commit.
 
 ## Where help is most useful
 
-- **Consensus driver.** The quorum primitives exist and are tested; nothing drives
-  them into agreement yet.
-- **Block propagation.** `subhost-network` can publish and receive gossip, but no
-  node consumes it.
-- **Multi-transaction blocks.** The producer seals one transaction per block.
-- **IBC proof verification.** Packet bookkeeping is done; light-client and
-  commitment proof verification is not.
-- **State commitment.** The state root hashes a sorted account list; a Merkle
-  structure would allow proofs.
+- **Consensus in the node.** `subhost-consensus::driver` reaches agreement
+  in-process over `2f + 1` BLS votes, but the node still produces blocks directly
+  and never runs the driver. Wiring it in needs validator keys from genesis, vote
+  gossip, timeouts, view changes, and leader rotation.
+- **Fork choice and reorgs.** `accept_block` only accepts the exact child of the
+  local tip. A competing block at the same height is rejected and dropped forever,
+  so two producers fork with no recovery path.
+- **Block sync.** Gossip delivers live blocks only. A node that was offline has no
+  way to request missed history.
+- **Multi-validator IBC light clients.** The current client trusts one ed25519 key.
+  Validator-set rotation, Tendermint-style quorum certificates, and non-membership
+  proofs are not implemented.
+- **Sparse state commitment.** The Merkle tree proves membership. Proving that an
+  account is absent requires a sparse or indexed tree.
 
 ## Reporting a bug
 

@@ -12,6 +12,31 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 (clean), and `cargo test --workspace --all-features` (all suites green).
 
+### Breaking changes
+
+- **The on-disk ledger format is now version 2.** The magic is `SUBHOST1` with
+  version `2`; version 1 files are refused with
+  `StorageError::UnsupportedVersion(1)` rather than being migrated. No live chain
+  data exists, but any ledger written by an earlier build must be deleted.
+- **The transaction wire format changed.** `Transaction` carries a 32-byte
+  `public_key`, so its canonical encoding, hash, and signing payload all differ
+  from earlier builds. `Transaction::verify_signature` is now the single
+  authentication rule: it binds the key to `from`, then verifies ed25519 over
+  `signing_payload`. Pre-change signed transactions are invalid, and pre-change
+  transaction hashes are not present in any receipt.
+- **State and receipt commitments changed value.** `state_root` is now a raw
+  Merkle root over address-sorted account leaves with the chain ID mixed into each
+  leaf, and every block's `receipt_root` commits to per-receipt
+  `(tx hash, height, index, gas, cumulative gas)`. Blocks produced before this
+  change do not reproduce these roots.
+- **`Receipt` gained `transaction_index` and `cumulative_gas_used`**, and
+  `subhost_storage::receipt_root` was replaced by `receipt_commitment` plus
+  `receipts_root`.
+- **A submission can return a multi-transaction block.** `eth_sendTransaction`
+  still returns the submitted transaction's hash, but the block it lands in may
+  contain other senders' transactions, so `gasUsed` and `cumulativeGasUsed` in its
+  receipt are no longer always `21_000`.
+
 ### Removed
 
 - **10 orphan `omnichain-*` directories.** Duplicated the `subhost-*` crates,
@@ -54,7 +79,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   the view and the block hash, and a quorum of distinct registered signers is
   required. `clippy::never_loop` was firing on this as a hard error.
 - **`DAG::has_quorum_support` measured the wrong thing.** It counted distinct
-  authors among a vertex's own parents — its ancestry — which any vertex can
+  authors among a vertex's own parents (its ancestry), which any vertex can
   satisfy with unrelated history. It now counts distinct next-round authors that
   reference the vertex as a parent, which is what support means.
 - **`StakingModule::slash` was a no-op.** It computed a penalty and returned it
@@ -129,15 +154,45 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Domain-separated Merkle tree.** `subhost_core::merkle` builds a perfect binary
+  tree with distinct leaf, internal-node, and padding domains, so `[a, b, c]` and
+  `[a, b, c, c]` cannot share a root. Includes root construction, inclusion
+  proofs, verification, and a key/value leaf helper.
+- **Merkle state commitment and account proofs.** `State::root` is a Merkle root
+  over address-sorted account leaves bound to the chain ID, insertion order does
+  not affect it, and `State::account_proof` / `verify_account_proof` produce and
+  check inclusion paths. Exposed over JSON-RPC as `eth_getProof`.
+- **Multi-transaction block production.** The producer now selects the
+  nonce-contiguous prefix for each sender in address order within the 30M block
+  gas limit and seals one block per submission. Selection runs against a candidate
+  state clone, and the live pool is replaced only after a successful ledger write.
+- **Peer block acceptance.** `RpcState::accept_block` re-validates a block from a
+  peer end to end: parent, height, chain, gas, signatures, transaction and receipt
+  roots, and the resulting state root. It derives receipts locally instead of
+  trusting the wire. Malformed blocks are rejected with `BlockRejected`.
+- **Block event stream.** `RpcState::subscribe_blocks` reports whether a block was
+  sealed locally or accepted from a peer.
+- **Node block propagation.** `subhost node --p2p-listen` publishes every locally
+  sealed block over libp2p gossip and applies peer blocks in height order, holding
+  blocks that arrive before their parent in a bounded 64-block buffer.
+- **Consensus driver.** `subhost_consensus::driver` advances one view at a time,
+  collects BLS votes for one proposal, and commits on `2f + 1` distinct signers.
+  Each proposal must extend the committed tip, and votes are accepted once per
+  validator per view. Includes a four-validator test with one faulty replica.
+- **IBC light client and commitment proofs.** `subhost_ibc::light_client` verifies
+  ed25519-signed counterparty headers with strictly increasing height and time,
+  tracks a trusted app hash, and checks Merkle membership proofs against it.
+  `IbcModule::receive_packet_with_proof` requires the proof to match the packet's
+  commitment key and payload before the normal packet rules run.
 - **`subhost-storage` is a real crate.** The ledger format was inline in
   `subhost-rpc`. It is now a documented, separately tested crate: versioned
   magic-and-checksum envelope, atomic write with directory fsync, `0600`
   permissions, size bound, and full replay of every block and receipt commitment
   against the restored state on load. Nine tests, including bit-flip, truncation,
   wrong-magic, wrong-chain, and eight distinct tampering cases.
-- **`subhost-node` is a real crate.** Node bootstrap — genesis load, ledger
+- **`subhost-node` is a real crate.** Node bootstrap (genesis load, ledger
   restore, one-time allocation application, RPC and metrics wiring, and graceful
-  SIGTERM/Ctrl-C shutdown — lived in the CLI's `main.rs`. Eight tests.
+  SIGTERM/Ctrl-C shutdown) lived in the CLI's `main.rs`. Eight tests.
 - **`subhost-telemetry` is a real crate.** Three binaries each initialized
   `tracing_subscriber` differently and ignored `RUST_LOG`. One
   `RUST_LOG`-aware initializer now serves all of them, with optional JSON output
@@ -164,14 +219,23 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 - **Wallet KDF parameters are recorded in the file**, so the work factor can be
   raised later without invalidating existing wallets. Parameters below N = 2^14
   are rejected.
-- **Test coverage is now 202 passing tests across all 17 workspace members.**
+- **Test coverage is now 244 passing tests across all 17 workspace members.**
   The previous workflow ran the suites of six crates, 45 tests in total; the
   other crates had tests that CI never executed, or none at all. Every crate now
   covers its failure paths, not only its happy path: tampering, overflow, replay,
-  malformed input, and end-to-end HTTP round trips against a live server.
+  malformed input, forged signatures and proofs, out-of-order blocks, and
+  end-to-end HTTP round trips against a live server.
 
 ### Changed
 
+- **The block producer no longer rolls back by re-inserting evicted transactions.**
+  Admission, replacement, eviction, and sealing all happen on a pool clone; the
+  live pool is swapped only after the ledger write succeeds, so a failed commit
+  leaves no partial mutation.
+- **Gossip is now consumed.** `subhost-node` runs the network manager, publishes
+  only blocks it sealed itself, and feeds inbound block proposals through
+  `accept_block`. Received blocks are not re-broadcast.
+- **`Mempool` is `Clone`**, which the candidate-pool commit path requires.
 - **Workspace lints.** `unsafe_code = "forbid"`, `rust_2018_idioms`,
   `unreachable_pub`, `unused_qualifications`, `clippy::all`, and denied
   `todo!`/`unimplemented!`/`dbg!` across every crate.

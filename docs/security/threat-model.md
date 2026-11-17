@@ -1,6 +1,7 @@
-# Threat Model
+# Threat model
 
-This document outlines the security assumptions, potential threats, and mitigations for the Subhost protocol. It is a living document that evolves as the protocol matures and new threats are identified.
+This document records the security assumptions, threats, and mitigations for the
+Subhost protocol. It changes as the protocol matures and new threats appear.
 
 > **Implementation status.** A threat model describes the surface we intend to
 > defend, so most mitigations below are a roadmap rather than a live control. Read
@@ -12,48 +13,61 @@ This document outlines the security assumptions, potential threats, and mitigati
 > replace-by-fee and deterministic ordering; account rules with nonce ordering,
 > replay rejection, and checked arithmetic; a checksummed, atomically written
 > ledger whose every block and receipt commitment is replayed on load; a JSON-RPC
-> subset that requires a valid signature bound to the sender; BLS-verified quorum
-> certificates; stake-deducting slashing; and a libp2p gossip transport.
+> subset that requires a valid signature bound to the sender; Merkle state and
+> receipt commitments with per-account inclusion proofs; multi-transaction block
+> production and full re-validation of peer blocks; BLS-verified quorum
+> certificates with an in-process `2f + 1` driver; stake-deducting slashing; a
+> libp2p gossip transport that the node uses for live block propagation; and an IBC
+> light client that verifies a single ed25519 signer's headers and Merkle
+> commitment proofs.
 >
-> **Not implemented:** a consensus loop or block propagation, an encrypted mempool,
-> Dandelion++ routing, threshold encryption, on-chain governance, EVM or WASM
-> execution, zk proofs, a Merkle Patricia Trie, oracle or MEV defences, an HSM
-> program, and any authentication on the JSON-RPC, metrics, or faucet surfaces.
-> There is no bug bounty.
+> **Not implemented:** consensus inside the node, fork choice, reorg handling,
+> block sync/backfill, peer scoring, an encrypted mempool, Dandelion++ routing,
+> threshold encryption, on-chain governance, EVM or WASM execution, zk proofs, a
+> Merkle Patricia Trie, non-membership proofs, validator-set rotation or multisig
+> light clients, oracle or MEV defences, an HSM program, and any authentication on
+> the JSON-RPC, metrics, or faucet surfaces. There is no bug bounty.
 >
 > `SECURITY.md` is the authoritative, code-verified statement of the current
 > posture. Where this document and `SECURITY.md` disagree, `SECURITY.md` wins.
 
-## Security Objectives
+## Security objectives
 
 Subhost aims to provide the following security guarantees:
 
-- **Liveness**: The network must continue processing transactions even if some validators fail or act maliciously (up to 1/3 of stake)
-- **Safety**: Validators cannot finalize conflicting transactions (no double-spends)
+- **Liveness**: The network must continue processing transactions even if some
+  validators fail or act maliciously (up to 1/3 of stake)
+- **Safety**: Validators cannot finalize conflicting transactions (no
+  double-spends)
 - **Data Availability**: All transaction data must be available for verification
-- **Censorship Resistance**: No single entity can prevent valid transactions from being included
+- **Censorship Resistance**: No single entity can prevent valid transactions from
+  being included
 
-## Trust Assumptions
+## Trust assumptions
 
-### What We Assume
+### What we assume
 
-- At least 2/3 of staked tokens are controlled by honest validators
+- At least 2/3 of staked tokens are controlled by honest validators, and the BLS
+  keys registered on chain are the ones the validators actually hold
+- The IBC light client's genesis header and its single ed25519 key were obtained
+  out of band; if that key is replaced, the bridge trusts the replacement
 - Network partitions are temporary and eventually resolve
 - Cryptographic primitives (BLS12-381, SHA3, Blake3) remain secure
 - Economic incentives align validator behavior with protocol health
 
-### What We Do Not Assume
+### What we do not assume
 
 - Validators will not attempt to maximize their own profit
 - Nodes will not collude if profitable
 - External dependencies (RPCs, price oracles) are trustworthy
 - Users will keep their private keys secure
 
-## Threat Categories
+## Threat categories
 
-### Consensus Attacks
+### Consensus attacks
 
-#### Double Signing
+#### Double signing
+
 A validator signs two conflicting blocks at the same height.
 
 **Impact**: Safety violation, potential chain split
@@ -66,8 +80,10 @@ A validator signs two conflicting blocks at the same height.
 
 **Detection**: Anyone can submit evidence of double signing
 
-#### Long Range Attacks
-An attacker buys old private keys and attempts to rewrite history from an old checkpoint.
+#### Long range attacks
+
+An attacker buys old private keys and attempts to rewrite history from an old
+checkpoint.
 
 **Impact**: Chain reorganization, safety violation
 
@@ -79,7 +95,8 @@ An attacker buys old private keys and attempts to rewrite history from an old ch
 
 **Detection**: Checkpoint monitoring, social consensus alerts
 
-#### Nothing at Stake
+#### Nothing at stake
+
 Validators stake on multiple forks simultaneously without cost.
 
 **Impact**: Consensus failure, inability to finalize
@@ -91,12 +108,13 @@ Validators stake on multiple forks simultaneously without cost.
 
 **Detection**: Vote aggregation reveals equivocation
 
-### Network Layer Attacks
+### Network layer attacks
 
-#### Eclipse Attacks
+#### Eclipse attacks
+
 An attacker isolates a validator from honest peers, feeding them false information.
 
-**Impact**: Validator makes decisions based on incomplete/wrong data
+**Impact**: Validator makes decisions based on incomplete or wrong data
 
 **Mitigation**:
 - Minimum peer requirements (min 10 peers)
@@ -106,7 +124,8 @@ An attacker isolates a validator from honest peers, feeding them false informati
 
 **Detection**: Peer count monitoring, block height comparisons
 
-#### DDoS Attacks
+#### DDoS attacks
+
 Overwhelming validators or seed nodes with traffic.
 
 **Impact**: Validator downtime, missed blocks, network degradation
@@ -119,7 +138,8 @@ Overwhelming validators or seed nodes with traffic.
 
 **Detection**: Traffic pattern analysis, latency spikes
 
-#### Sybil Attacks
+#### Sybil attacks
+
 Creating many fake identities to gain disproportionate influence.
 
 **Impact**: Vote manipulation, eclipse attacks
@@ -131,9 +151,44 @@ Creating many fake identities to gain disproportionate influence.
 
 **Detection**: On-chain stake analysis
 
-### Economic Attacks
+#### Block withholding and forks
 
-#### MEV Extraction
+A peer withholds a block, or two nodes produce at the same height.
+
+**Impact**: A node stalls at a height, or the chain splits with no recovery.
+
+**Current behaviour**: Gossip is best-effort and there is no block sync, so a node
+that misses a block cannot request it. `accept_block` only accepts the exact child
+of the local tip; a competing block at the same height is rejected and dropped
+permanently. Blocks that arrive early are buffered for at most 64 heights.
+
+**Mitigation**: None at the protocol level. Run a single producer, and keep the
+gossip mesh small and well connected. This is a known gap, not a defended
+property.
+
+**Detection**: Compare `eth_blockNumber` and `state_root` across nodes.
+
+#### IBC counterparty impersonation
+
+A relayer delivers a packet that the counterparty chain never committed.
+
+**Impact**: Minted or released funds on the receiving chain.
+
+**Mitigation**: `receive_packet_with_proof` requires a header signed by the
+client's trusted key, a strictly increasing height and timestamp, and a Merkle
+inclusion proof for the exact `(port, channel, sequence)` key whose committed value
+equals the packet payload. The packet then passes the normal channel binding,
+timeout, ordering, and replay checks. The proof is checked against the trusted app
+hash, not against a hash supplied in the message.
+
+**Residual risk**: The client trusts one key with no rotation, no multisig, and no
+non-membership proofs. Compromise of that key compromises the bridge, and packet
+absence cannot be proven. Do not treat this as a trust-minimized bridge.
+
+### Economic attacks
+
+#### MEV extraction
+
 Validators reorder, insert, or censor transactions for profit.
 
 **Impact**: User harm, fairness violations
@@ -146,7 +201,8 @@ Validators reorder, insert, or censor transactions for profit.
 
 **Detection**: Block content analysis, transaction timing studies
 
-#### Flash Loan Attacks
+#### Flash loan attacks
+
 Borrowing large amounts to manipulate protocol state atomically.
 
 **Impact**: Price oracle manipulation, arbitrage exploits
@@ -159,9 +215,10 @@ Borrowing large amounts to manipulate protocol state atomically.
 
 **Detection**: Oracle deviation monitoring, profit analysis
 
-### Smart Contract Vulnerabilities
+### Smart contract vulnerabilities
 
 #### Reentrancy
+
 Contracts calling external contracts before updating state.
 
 **Impact**: Fund draining, state corruption
@@ -174,7 +231,8 @@ Contracts calling external contracts before updating state.
 
 **Detection**: Bytecode analysis, transaction simulation
 
-#### Integer Overflow/Underflow
+#### Integer overflow and underflow
+
 Arithmetic operations exceeding type bounds.
 
 **Impact**: Unexpected behavior, potential fund loss
@@ -186,9 +244,10 @@ Arithmetic operations exceeding type bounds.
 
 **Detection**: Fuzzing, symbolic execution
 
-### Infrastructure Attacks
+### Infrastructure attacks
 
-#### Key Compromise
+#### Key compromise
+
 Validator or user private keys stolen.
 
 **Impact**: Unauthorized transactions, slashing evasion
@@ -201,7 +260,8 @@ Validator or user private keys stolen.
 
 **Detection**: Unusual transaction patterns, key rotation events
 
-#### Supply Chain Attacks
+#### Supply chain attacks
+
 Malicious code in dependencies or build process.
 
 **Impact**: Backdoors, compromised binaries
@@ -214,7 +274,7 @@ Malicious code in dependencies or build process.
 
 **Detection**: Build hash mismatches, CVE monitoring
 
-## Risk Assessment Matrix
+## Risk assessment matrix
 
 | Threat | Likelihood | Impact | Priority |
 |--------|-----------|--------|----------|
@@ -227,12 +287,12 @@ Malicious code in dependencies or build process.
 | Reentrancy | Low | High | Medium |
 | Key compromise | Medium | Critical | High |
 
-## Planned Monitoring and Response
+## Planned monitoring and response
 
 The repository does not deploy a production monitoring or incident-response
 system. The items below are operational goals for a future network.
 
-### What We Monitor
+### What we monitor
 
 - Validator uptime and participation rates
 - Peer counts and network health
@@ -241,7 +301,7 @@ system. The items below are operational goals for a future network.
 - Block finality times
 - Token flow anomalies
 
-### Response Procedures
+### Response procedures
 
 **Severity 1 (Critical)**: Active exploit in progress
 - Emergency halt if possible
@@ -259,14 +319,14 @@ system. The items below are operational goals for a future network.
 - Additional monitoring
 - Documentation updates
 
-## Reporting Security Issues
+## Reporting security issues
 
 There is **no bug bounty program** and no reward pool. If you find a suspected
-vulnerability, report it privately to `security@subhost.xyz` — include the affected
+vulnerability, report it privately to `security@subhost.xyz`. Include the affected
 commit, exact file and line, impact, and reproduction steps. Please do not open a
 public issue for an undisclosed vulnerability.
 
-## Audit Status
+## Audit status
 
 No completed third-party audit report is checked into this repository. Do not
 interpret previously proposed auditor names or dates as evidence of an engagement
@@ -274,4 +334,5 @@ or completed review.
 
 ---
 
-This document is maintained by the Subhost security team. Questions or concerns should be directed to security@subhost.xyz.
+This document is maintained by the Subhost security team. Questions or concerns
+should be directed to security@subhost.xyz.

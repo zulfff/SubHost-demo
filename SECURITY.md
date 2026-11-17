@@ -1,16 +1,16 @@
-# Security Policy
+# Security policy
 
 ## Supported versions
 
 This repository is a pre-production codebase. Security fixes land on the default
-branch; there is no supported release branch and no version is intended for a
+branch. There is no supported release branch, and no version is intended for a
 production network.
 
 ## Reporting a vulnerability
 
 Do not open a public issue for a suspected vulnerability.
 
-Report privately through either channel:
+Report it privately through either channel:
 
 - GitHub Security Advisories: <https://github.com/zulfff/SubHost-demo/security/advisories>
 - Email: `security@subhost.xyz`
@@ -39,9 +39,17 @@ warning when it binds a non-loopback address.
 using a password taken from the request body. The explorer refuses to bind to a
 non-loopback address for that reason. Do not expose it.
 
-**No consensus.** Block production is single-node. There is no fork choice, no
-block propagation, and no validator attestation. A `Block` carries an empty
-`signatures` vector and the zero address as its validator.
+**No consensus in the node.** Block production still comes from whichever node
+receives the transaction, even though `subhost-consensus` contains a tested
+in-process `2f + 1` driver. There is no fork choice, no reorg handling, no block
+sync, and no leader rotation. A `Block` carries an empty `signatures` vector and
+the zero address as its validator.
+
+**Block gossip is best-effort and unauthenticated beyond libp2p.** With
+`--p2p-listen`, a node publishes blocks it sealed and applies peer blocks that
+extend its tip. There is no peer scoring, no rate limiting per peer, and no way to
+request a missed block: a node that was offline cannot catch up. Two producers at
+the same height fork permanently.
 
 **BLS hash-to-curve is non-standard.** `subhost-crypto` uses a domain-separated,
 length-prefixed hash-and-multiply onto the prime-order G2 subgroup, not an RFC 9380
@@ -54,24 +62,41 @@ key is registered with a verified proof of possession.
 `ValidatorRegistry::register` enforces that; a caller assembling keys by hand must
 do the same.
 
-**IBC packets are not proof-verified.** `subhost-ibc` enforces channel binding,
-sequencing, timeouts, and replay rejection on the local side only. It does not
-verify light-client or commitment proofs, so a packet is trusted exactly as far as
-the relayer that delivered it.
+**The IBC light client trusts one key.** `subhost-ibc` enforces channel binding,
+sequencing, timeouts, and replay rejection locally, and
+`receive_packet_with_proof` additionally requires an ed25519-signed counterparty
+header with strictly increasing height and time plus a Merkle inclusion proof for
+the exact packet key and value. There is no validator-set rotation, no multisig or
+Tendermint quorum certificate, and no non-membership proof. The plain
+`receive_packet` path verifies nothing and trusts the relayer completely, so use it
+only for local testing. If the trusted key is compromised, the bridge is
+compromised.
 
-**The state root is not a Merkle root.** It is a BLAKE3 hash over the sorted
-account list. It detects divergence but supports no inclusion proofs.
+**The state tree proves membership only.** `state_root` is a Merkle root over
+address-sorted account leaves with the chain ID mixed into each leaf. It detects
+divergence and supports inclusion proofs (`eth_getProof`), but a plain Merkle tree
+cannot prove that an account is absent. An unknown address returns an error rather
+than an empty proof.
 
-**One transaction per block.** The producer seals each accepted transaction into
-its own block. The ledger validator enforces that invariant on load.
+**Blocks may hold many transactions.** One submission seals one block containing
+every pending transaction that is currently executable, bounded by the 30M block
+gas limit, with senders visited in address order. The ledger validator enforces
+per-sender nonce contiguity, per-block signature validity, transaction uniqueness,
+gas accounting, and the receipt index/cumulative-gas commitments on load.
 
-## Security properties that are enforced
+## Security properties the code enforces
 
-Regressions in any of these are genuine vulnerabilities and worth reporting.
+A regression in any of these is a genuine vulnerability and worth reporting.
 
 - `eth_sendTransaction` requires an ed25519 signature over the unsigned
   transaction encoding, and the supplied public key must hash to the `from`
-  address. The node holds no user keys.
+  address. The key travels with the transaction, so the binding is checked again
+  at execution and on every ledger replay. The node holds no user keys.
+- `RpcState::accept_block` re-validates a peer block before any state change:
+  parent, height, chain ID, block gas limit, every signature, transaction
+  uniqueness, transaction and receipt Merkle commitments, the state transition,
+  and the resulting state root. Receipts are derived locally and never trusted
+  from the wire. A rejected block leaves state, receipts, and the pool untouched.
 - A transaction is rejected unless the chain ID matches, the nonce is exactly the
   account's current nonce, and the balance covers `value + gas_price * gas_limit`.
 - Every balance and nonce operation uses checked arithmetic; overflow is an error.
@@ -90,6 +115,12 @@ Regressions in any of these are genuine vulnerabilities and worth reporting.
 - Quorum certificates are accepted only when the required number of distinct,
   registered validators each contribute a signature that verifies over a payload
   binding both the view and the block hash.
+- The consensus driver commits only on a `2f + 1` quorum for one proposal, counts
+  each validator once per view, and refuses a proposal that does not extend the
+  committed tip by exactly one height.
+- Merkle leaves, internal nodes, and padding use separate domain tags, so a leaf
+  digest cannot be reinterpreted as an internal node and `[a, b, c]` cannot share
+  a root with `[a, b, c, c]`.
 - Slashing actually deducts stake and ejects a fully slashed validator; the
   evidence is recorded before any mutation.
 - The faucet rate limits per lowercased address, so letter case cannot bypass the
