@@ -1,0 +1,304 @@
+//! Shared node state, its errors, and the lock helpers that guard it.
+
+use jsonrpsee::types::error::ErrorObject;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
+use subhost_core::{Address, Amount, Block, ChainId, Hash, Nonce, Receipt, TransactionType};
+use subhost_mempool::Mempool;
+use subhost_state::{AccountProof, State};
+use subhost_storage::{LedgerStore, StorageError};
+use tokio::sync::broadcast;
+
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    #[error("invalid address")]
+    InvalidAddress,
+
+    #[error("invalid transaction hash")]
+    InvalidTxHash,
+
+    #[error("invalid params")]
+    InvalidParams,
+
+    #[error("invalid chain ID")]
+    InvalidChainId,
+
+    #[error("transaction signature is required and must be valid")]
+    InvalidSignature,
+
+    #[error("unsupported transaction type: {0}")]
+    UnsupportedTransactionType(TransactionType),
+
+    #[error("transaction rejected: {0}")]
+    TransactionRejected(String),
+
+    #[error("block rejected: {0}")]
+    BlockRejected(String),
+
+    #[error("account has no state proof at the latest height")]
+    UnknownAccount,
+
+    #[error("state persistence failed: {0}")]
+    Persistence(String),
+
+    #[error("internal error")]
+    Internal,
+}
+
+impl From<RpcError> for ErrorObject<'static> {
+    fn from(error: RpcError) -> Self {
+        // Client mistakes get -32602/-32000 with detail; internal failures get
+        // -32603 with no detail so the node does not leak local paths or state.
+        let message = error.to_string();
+        match error {
+            RpcError::InvalidAddress
+            | RpcError::InvalidTxHash
+            | RpcError::InvalidParams
+            | RpcError::InvalidChainId
+            | RpcError::InvalidSignature => ErrorObject::owned(-32602, message, None::<()>),
+            RpcError::UnsupportedTransactionType(_) | RpcError::TransactionRejected(_) => {
+                ErrorObject::owned(-32000, message, None::<()>)
+            }
+            RpcError::BlockRejected(_) | RpcError::UnknownAccount => {
+                ErrorObject::owned(-32000, message, None::<()>)
+            }
+            RpcError::Persistence(_) => {
+                ErrorObject::owned(-32603, "state persistence failed", None::<()>)
+            }
+            RpcError::Internal => ErrorObject::owned(-32603, "internal error", None::<()>),
+        }
+    }
+}
+
+impl From<StorageError> for RpcError {
+    fn from(error: StorageError) -> Self {
+        Self::Persistence(error.to_string())
+    }
+}
+
+/// Shared node state behind the RPC surface.
+///
+/// Cloning is cheap and shares the same ledger: every field is behind an `Arc`.
+/// A block commit this node observed, published so the network layer can relay
+/// only blocks this node actually produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlockEvent {
+    /// A block sealed by this node's own producer.
+    Sealed(Block),
+    /// A block accepted from a peer and re-validated locally.
+    Accepted(Block),
+}
+
+#[derive(Clone)]
+pub struct RpcState {
+    pub(crate) chain_id: ChainId,
+    /// Height of the newest committed block, backing `eth_blockNumber`.
+    pub(crate) block_height: Arc<AtomicU64>,
+    /// Pending transaction pool.
+    pub(crate) mempool: Arc<RwLock<Mempool>>,
+    /// Account world state backing `eth_getBalance`.
+    pub(crate) state: Arc<RwLock<State>>,
+    /// Blocks produced by this node, index `n` holding height `n + 1`.
+    pub(crate) blocks: Arc<RwLock<Vec<Block>>>,
+    /// Confirmed receipts keyed by transaction hash.
+    pub(crate) receipts: Arc<RwLock<HashMap<Hash, Receipt>>>,
+    pub(crate) store: LedgerStore,
+    /// Serializes the read-execute-persist-swap sequence.
+    pub(crate) commit_lock: Arc<Mutex<()>>,
+    /// Block commits, for relay and tests. A lagging receiver only loses events;
+    /// it never blocks the producer.
+    pub(crate) block_events: broadcast::Sender<BlockEvent>,
+}
+
+/// Buffered block events per subscriber. A node only needs the newest few.
+const BLOCK_EVENT_CAPACITY: usize = 64;
+
+impl RpcState {
+    /// In-memory node, used by tests and ephemeral deployments.
+    pub fn in_memory(chain_id: ChainId) -> Result<Self, StorageError> {
+        Self::with_store(LedgerStore::ephemeral(chain_id)?)
+    }
+
+    /// Node persisted under `data_dir`, restoring any existing ledger.
+    pub fn with_data_dir(
+        chain_id: ChainId,
+        data_dir: impl AsRef<std::path::Path>,
+    ) -> Result<Self, StorageError> {
+        Self::with_store(LedgerStore::open(chain_id, data_dir)?)
+    }
+
+    /// Build node state from an already-configured store.
+    pub fn with_store(store: LedgerStore) -> Result<Self, StorageError> {
+        let restored = store.load()?;
+        let height = restored.height();
+        let receipts =
+            restored.receipts.into_iter().map(|receipt| (receipt.tx_hash, receipt)).collect();
+        Ok(Self {
+            chain_id: store.chain_id(),
+            block_height: Arc::new(AtomicU64::new(height)),
+            mempool: Arc::new(RwLock::new(Mempool::default())),
+            state: Arc::new(RwLock::new(restored.state)),
+            blocks: Arc::new(RwLock::new(restored.blocks)),
+            receipts: Arc::new(RwLock::new(receipts)),
+            store,
+            commit_lock: Arc::new(Mutex::new(())),
+            block_events: broadcast::channel(BLOCK_EVENT_CAPACITY).0,
+        })
+    }
+
+    pub fn chain_id(&self) -> ChainId {
+        self.chain_id
+    }
+
+    /// Observe blocks this node seals or accepts.
+    pub fn subscribe_blocks(&self) -> broadcast::Receiver<BlockEvent> {
+        self.block_events.subscribe()
+    }
+
+    pub fn block_height(&self) -> u64 {
+        self.block_height.load(Ordering::SeqCst)
+    }
+
+    /// Whether a ledger file already exists on disk.
+    pub fn has_persisted_state(&self) -> bool {
+        self.store.exists()
+    }
+
+    /// Minimum gas price the pool accepts, reported by `eth_gasPrice`.
+    pub fn min_gas_price(&self) -> Amount {
+        read(&self.mempool).config().min_gas_price
+    }
+
+    pub fn balance(&self, address: &Address) -> Amount {
+        read(&self.state).balance(address)
+    }
+
+    pub fn nonce(&self, address: &Address) -> Nonce {
+        read(&self.state).nonce(address)
+    }
+
+    /// Merkle root over the current account set, bound to the chain ID.
+    pub fn state_root(&self) -> Hash {
+        read(&self.state).root()
+    }
+
+    /// Merkle inclusion proof for one account at the current state root.
+    pub fn account_proof(&self, address: &Address) -> Option<AccountProof> {
+        read(&self.state).account_proof(address)
+    }
+
+    pub fn receipt(&self, tx_hash: &Hash) -> Option<Receipt> {
+        read(&self.receipts).get(tx_hash).cloned()
+    }
+
+    pub fn block_at_height(&self, height: u64) -> Option<Block> {
+        let index = usize::try_from(height.checked_sub(1)?).ok()?;
+        read(&self.blocks).get(index).cloned()
+    }
+
+    pub fn block_count(&self) -> usize {
+        read(&self.blocks).len()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        read(&self.mempool).len()
+    }
+
+    /// Apply genesis (or faucet) allocations and persist them.
+    ///
+    /// Balances are *set*, not credited, so re-running genesis is idempotent.
+    pub fn seed_accounts<I>(&self, allocations: I) -> Result<(), RpcError>
+    where
+        I: IntoIterator<Item = (Address, Amount)>,
+    {
+        let _commit_guard = lock(&self.commit_lock);
+        let mut candidate = read(&self.state).clone();
+        for (address, balance) in allocations {
+            candidate.set_balance(address, balance);
+        }
+
+        self.persist(&candidate, &read(&self.blocks), &read(&self.receipts))?;
+        *write(&self.state) = candidate;
+        Ok(())
+    }
+}
+
+/// Lock helpers that recover from a poisoned lock instead of panicking.
+///
+/// A panic elsewhere must not turn every later RPC call into a crash: the
+/// protected data is a plain snapshot with no torn-state invariant.
+pub(crate) fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{signed_transfer, signing_key};
+    use tempfile::tempdir;
+
+    #[test]
+    fn seeding_is_idempotent_and_survives_a_restart() {
+        let dir = tempdir().unwrap();
+        let address = Address::new([1; 20]);
+        let state = RpcState::with_data_dir(1, dir.path()).unwrap();
+        assert!(!state.has_persisted_state());
+
+        state.seed_accounts([(address, 42)]).unwrap();
+        state.seed_accounts([(address, 42)]).unwrap();
+        assert!(state.has_persisted_state());
+        assert_eq!(state.balance(&address), 42);
+        drop(state);
+
+        let restored = RpcState::with_data_dir(1, dir.path()).unwrap();
+        assert_eq!(restored.block_height(), 0);
+        assert!(restored.has_persisted_state());
+        assert_eq!(restored.balance(&address), 42);
+    }
+
+    #[test]
+    fn persisted_ledger_restores_blocks_receipts_and_state() {
+        let dir = tempdir().unwrap();
+        let key = signing_key(7);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = RpcState::with_data_dir(1, dir.path()).unwrap();
+        state.seed_accounts([(sender, 100_000)]).unwrap();
+        let hash = state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        drop(state);
+
+        let restored = RpcState::with_data_dir(1, dir.path()).unwrap();
+        assert_eq!(restored.block_height(), 1);
+        assert_eq!(restored.block_count(), 1);
+        assert!(restored.receipt(&hash).is_some());
+        assert_eq!(restored.balance(&Address::new([2; 20])), 10);
+        assert_eq!(restored.nonce(&sender), 1);
+    }
+
+    #[test]
+    fn corrupted_ledger_is_rejected_on_startup() {
+        let dir = tempdir().unwrap();
+        let key = signing_key(7);
+        let state = RpcState::with_data_dir(1, dir.path()).unwrap();
+        state
+            .seed_accounts([(Address::from_public_key(&key.verifying_key().to_bytes()), 100_000)])
+            .unwrap();
+        state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        drop(state);
+
+        let path = dir.path().join(subhost_storage::LEDGER_FILE_NAME);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(RpcState::with_data_dir(1, dir.path()).is_err());
+    }
+}
