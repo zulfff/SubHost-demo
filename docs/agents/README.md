@@ -1,21 +1,29 @@
 # Inter-agent protocol
 
-Two agents work this repository at the same time. They do not share a chat window,
-so the repository **is** the channel. This document defines how they ask, answer,
-disagree, and record decisions.
+Two agents work this repository at the same time, in the same working tree. The
+checkout **is** the channel: questions, replies, and follow-ups are local files they
+write and read directly. This document defines how they ask, answer, disagree, and
+record decisions.
 
 The short version for daily use is `AGENTS.md`. This file is the full protocol.
 
 ---
 
-## 1. Why files
+## 1. Why the workspace
 
-- Everything is reviewable, timestamped by git, and survives a lost session.
+Both agents run in this same working tree, so the checkout itself is the channel: a
+question and its replies are plain files on disk, written and read directly.
+
+- No branch, commit, push, or PR for coordination. Discussion is not a deliverable.
+- The thread files are gitignored, so they never appear in a diff, a PR, or CI.
+- The exchange stays readable for the maintainer and survives a lost session, because
+  it lives on disk until the maintainer clears it.
 - No shared mutable file is edited by both sides, so there are no conflicts.
-- The maintainer can read the whole discussion after the fact.
 
-Do not coordinate over private messages or terminal history. If it is not in
-`docs/agents/`, it did not happen.
+Do not paste the exchange into a PR description and do not re-create it in git
+history. `git log` is for code; `docs/agents/` is the chat.
+
+Only the ADR is committed, and it rides with the code change it describes.
 
 ---
 
@@ -29,7 +37,7 @@ docs/agents/
 │   ├── review/               replied; awaiting the author
 │   ├── agreed/               closed with agreement
 │   └── escalated/            needs the maintainer
-├── replies/                  one file per reply, never edited by the author
+├── replies/                  one file per replying track, appended to as you talk
 └── decisions/                ADR-<nnn>-<slug>.md, written after agreement
 ```
 
@@ -38,6 +46,10 @@ file**. Neither ever edits the other's file. Moving a question between directori
 is the only status change, and only the author does it.
 
 `ls docs/agents/questions/open/` is the inbox. There is no index file to conflict on.
+
+`questions/**` and `replies/**` are listed in `.gitignore`. They are workspace state,
+not repository content: never stage them, even with `-f`. Only `README.md` and
+`decisions/ADR-*.md` are tracked from this tree.
 
 ---
 
@@ -60,6 +72,10 @@ is the only status change, and only the author does it.
    `escalated/`, stop the blocked task, and ask the maintainer in chat with both
    options and a recommendation. The task does not resume until the decision is
    recorded.
+
+The whole loop happens in the working tree, in minutes, with plain edits: no branch,
+no commit, no PR, no review queue. A follow-up is another `## Follow-up <date>`
+section appended to the same reply file — the thread reads top to bottom like a chat.
 
 A question with `blocks: none` does not stop anyone; it is a review request with a
 `review_by` stage. A question with `blocks: [S1.2]` stops whoever owns `S1.2`.
@@ -137,6 +153,12 @@ Why. Reference code paths and documents, not vibes.
 
 The alternative you want, what it costs, and what would make you accept the
 author's option instead.
+
+## Follow-up 2026-11-18
+
+Appended later, same file, newest at the bottom. Short is fine: this is a
+conversation, not a report. Say what changed your mind, or restate the one thing
+that still blocks agreement.
 ```
 
 A reply that says only "agree" is not a reply. State the reason or the objection.

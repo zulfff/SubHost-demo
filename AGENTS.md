@@ -34,6 +34,23 @@ lists the task you are about to start, you **must**:
 This gate is not optional. It is the only thing that keeps two agents from building
 incompatible contracts in parallel.
 
+### The channel is the workspace, not a branch
+
+Both agents run in this same working tree, so a question or reply is just a local
+file, not git work:
+
+- Write the question or reply straight into the working tree, then move the question
+  file between `open/`, `review/`, `agreed/`, `escalated/`.
+- **Never** create a branch, commit, push, or open a PR for a question, a reply, or a
+  follow-up. Discussion is not code.
+- `docs/agents/questions/**` and `docs/agents/replies/**` are gitignored on purpose.
+  Do not `git add` them, do not force-add them, and do not sweep them into a commit.
+- Keep it conversational. Append to your own reply file as the exchange continues
+  instead of opening a new document per thought; a few lines that state a position
+  and a reason are enough.
+- The only artifact of a discussion that reaches git is the ADR, and it lands with
+  the code change that implements it — never in a PR of its own.
+
 ## 3. Research before you ask
 
 - Use the internet before opening a question or guessing: official docs first
@@ -58,6 +75,8 @@ Silent compliance is worse than a resolved argument.
 
 - One stage = one branch = one PR, branched from a freshly rebased `main`.
 - `git add` explicit paths. **Never `git add -A`.**
+- Keep `docs/agents/questions/**` and `docs/agents/replies/**` out of the index.
+  Stage only code, docs, and `docs/agents/decisions/ADR-*.md`.
 - Do not edit a file owned by the other track without a contract commit.
 - Do not rewrite, rebase, or force-push another agent's branch or commits.
 - No `todo!`, `unimplemented!`, `dbg!`, or `unsafe`.
@@ -84,3 +103,11 @@ cargo deny --all-features check
 
 Then rebase onto `main`, resolve only your own conflicts, and confirm the seven CI
 jobs are green. A red CI is never "someone else's problem".
+
+Finally, check the index holds only code and docs:
+
+```sh
+git diff --cached --name-only | grep -E '^docs/agents/(questions|replies)/' || echo 'ok: no chat files staged'
+```
+
+The only allowed hit is the one-time commit that removes the threads from tracking.

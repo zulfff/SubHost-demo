@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `4a747b1` · S0.1 merged · S0.2 in review
+Status: 2026-11-18 · baseline `main` = `6be9cc4` · S0.1 and S0.2 merged · `Q-001` agreed · S1 unblocked
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -64,8 +64,9 @@ track is free. Do not start it before S3 lands.
 
 ### Communication is a hard gate
 
-The two tracks do not share a chat window, so the repository is the channel. The
-protocol is `docs/agents/README.md`; the daily rules are `AGENTS.md`.
+Both tracks run in the same working tree, so the checkout is the channel: questions
+and replies are plain untracked files under `docs/agents/`, never a branch, a commit,
+or a PR. The protocol is `docs/agents/README.md`; the daily rules are `AGENTS.md`.
 
 - Questions live in `docs/agents/questions/open/` and replies in
   `docs/agents/replies/`. `ls docs/agents/questions/open/` is the inbox.
@@ -78,19 +79,21 @@ protocol is `docs/agents/README.md`; the daily rules are `AGENTS.md`.
 - Open a question proactively for any shared contract change, even when it does not
   block you (`blocks: none`, `review_by: <stage>`). Disagreement in writing is
   expected; silent compliance is not.
+- Keep the exchange conversational: append `## Follow-up <date>` to the same reply
+  file instead of opening a formal document per round. No PR is needed to talk.
 - Unresolved disagreement escalates to the maintainer through
   `docs/agents/questions/escalated/`, and the blocked task stops until an ADR in
-  `docs/agents/decisions/` records the decision.
+  `docs/agents/decisions/` records the decision. The ADR is the only piece of the
+  discussion that gets committed, and it lands with the code change it governs.
 
-`Q-001` (block signature scheme) is open and blocks S1.2–S1.4. Track B replies
-before Track A starts.
+`Q-001` (block signature scheme) is agreed; `ADR-001` is the contract for S1.
 
 ### Rules that keep you out of each other's diffs
 
 1. **One stage = one branch = one PR.** Branch names: `s1/signed-blocks`,
    `s4/storage-scaling`, … Branch from `main` after rebasing.
-2. **Never `git add -A`.** Stage explicit paths. Untracked audit/scratch files must
-   never be swept into a commit.
+2. **Never `git add -A`.** Stage explicit paths. Untracked audit/scratch files and
+   the `docs/agents/` question and reply threads must never be swept into a commit.
 3. **Respect the ownership matrix.** If a task needs a file owned by the other
    track, land a tiny "contract PR" that only adds the type/signature, then both
    sides build on it.
@@ -161,7 +164,10 @@ who may produce, what the ledger guarantees, which component owns which decision
 
 ### S1 — Signed blocks and validator identity (Track A)
 
-Blocked by `Q-001` until Track B replies.
+`Q-001` is agreed (see `docs/agents/decisions/ADR-001-block-signature.md`):
+BLS12-381, a dedicated producer key file, and a mandatory proof of possession on its
+own domain tag. S1.1 and S1.4 land together so a genesis file without real proofs
+cannot load quietly.
 
 **S1.1 Registry from genesis** (`subhost-consensus`)
 - `ValidatorRegistry::from_genesis(&[ValidatorInfo]) -> Result<Self, ConsensusError>`
@@ -408,7 +414,7 @@ incident log.
 If both agents start today, do this and nothing else:
 
 0. **Both:** `ls docs/agents/questions/open/` and clear anything addressed to your
-   track. Right now that is `Q-001` for Track B, and it blocks S1.2–S1.4.
+   track. `Q-001` is agreed; its ADR is the contract for S1.
 1. **Agent A:** S0.1 → S0.2 → S1.1 → S1.2 → S1.3. Do not touch `subhost-storage`,
   `subhost-cli`, `explorer`, `.github/`.
 - **Agent B:** S4.1 → S4.2 (storage crate only) and `docs/operations/backup-restore.md`.

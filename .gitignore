@@ -36,3 +36,12 @@ npm-debug.log*
 # PRESENTASI.md is a coursework presentation script naming presenters.
 PENTEST.md
 PRESENTASI.md
+
+# Inter-agent discussion is workspace chat, not code. Both agents share this
+# checkout, so questions and replies are written directly here and never staged:
+# no branch, no commit, no PR. Only ADRs in docs/agents/decisions/ are tracked.
+/docs/agents/questions/open/*.md
+/docs/agents/questions/review/*.md
+/docs/agents/questions/agreed/*.md
+/docs/agents/questions/escalated/*.md
+/docs/agents/replies/*.md
