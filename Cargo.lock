@@ -3737,6 +3737,7 @@ dependencies = [
  "serde_json",
  "subhost-core",
  "subhost-node",
+ "subhost-storage",
  "subhost-telemetry",
  "subhost-wallet",
  "tempfile",

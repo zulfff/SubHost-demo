@@ -15,6 +15,7 @@ use subhost_core::{
     ValidatorInfo,
 };
 use subhost_node::{Node, NodeConfig, P2pConfig, GENESIS_FILE_NAME};
+use subhost_storage::{LedgerStore, MigrationOutcome};
 use subhost_telemetry::{TelemetryConfig, Verbosity};
 use subhost_wallet::Wallet;
 
@@ -116,6 +117,27 @@ enum Commands {
     Query {
         #[command(subcommand)]
         cmd: QueryCommands,
+    },
+
+    /// Inspect and maintain the on-disk ledger without starting a node.
+    Db {
+        #[command(subcommand)]
+        cmd: DbCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbCommands {
+    /// Migrate a version 2 `node-state.bin` to the segmented format.
+    ///
+    /// The legacy file is validated and kept as `node-state.bin.v2-backup`.
+    /// Running this on an already-segmented ledger is a no-op.
+    Migrate {
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        #[arg(long, default_value_t = 1)]
+        chain_id: ChainId,
     },
 }
 
@@ -280,6 +302,7 @@ fn main() -> Result<()> {
             Commands::Wallet { cmd } => handle_wallet(cmd),
             Commands::Tx { cmd } => handle_transaction(cmd).await,
             Commands::Query { cmd } => handle_query(cmd).await,
+            Commands::Db { cmd } => handle_db(cmd),
         }
     })
 }
@@ -675,6 +698,42 @@ async fn handle_query(cmd: QueryCommands) -> Result<()> {
             .context("node returned an invalid height")?;
             println!("chain_id\t{chain_id}");
             println!("height\t{height}");
+        }
+    }
+    Ok(())
+}
+
+fn handle_db(cmd: DbCommands) -> Result<()> {
+    match cmd {
+        DbCommands::Migrate { data_dir, chain_id } => {
+            let data_dir = match data_dir {
+                Some(dir) => dir,
+                None => default_data_dir()?,
+            };
+            let store = LedgerStore::open(chain_id, &data_dir)
+                .with_context(|| format!("cannot open the ledger in {}", data_dir.display()))?;
+            let outcome = store
+                .migrate()
+                .with_context(|| format!("cannot migrate the ledger in {}", data_dir.display()))?;
+            match outcome {
+                MigrationOutcome::AlreadySegmented => {
+                    println!("{} is already segmented; nothing to do", data_dir.display());
+                }
+                MigrationOutcome::NothingToMigrate => {
+                    println!(
+                        "no version 2 {} in {}; nothing to do",
+                        subhost_storage::LEDGER_FILE_NAME,
+                        data_dir.display()
+                    );
+                }
+                MigrationOutcome::Migrated { height } => {
+                    println!(
+                        "migrated {} to segments at height {height}; backup: {}",
+                        data_dir.display(),
+                        subhost_storage::LEDGER_BACKUP_FILE_NAME
+                    );
+                }
+            }
         }
     }
     Ok(())

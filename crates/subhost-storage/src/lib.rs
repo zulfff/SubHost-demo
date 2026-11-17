@@ -74,6 +74,18 @@ impl RestoredLedger {
     }
 }
 
+/// Result of [`LedgerStore::migrate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// The ledger is already segmented; nothing was written. Migration is
+    /// idempotent, so a second run is not an error.
+    AlreadySegmented,
+    /// There is no version 2 `node-state.bin` to migrate.
+    NothingToMigrate,
+    /// The legacy file was migrated and verified by a full replay.
+    Migrated { height: u64 },
+}
+
 /// A ledger store bound to one chain ID and one data directory.
 ///
 /// [`LedgerStore::ephemeral`] yields a store that validates exactly like the
@@ -199,6 +211,51 @@ impl LedgerStore {
         segment_max_bytes: u64,
     ) -> Result<(), StorageError> {
         self.persist_with_limits(snapshot, segment_max_bytes, segmented::SNAPSHOT_INTERVAL_BLOCKS)
+    }
+
+    /// Migrate a version 2 `node-state.bin` to the segmented format.
+    ///
+    /// The legacy file is fully validated before anything is written, the
+    /// migrated ledger is loaded back and compared with the legacy head, and the
+    /// original file is kept as `node-state.bin.v2-backup`. A second call is a
+    /// no-op once the manifest exists, so an interrupted run can simply be
+    /// repeated.
+    pub fn migrate(&self) -> Result<MigrationOutcome, StorageError> {
+        let Some(path) = &self.path else {
+            return Err(StorageError::Invalid(
+                "an ephemeral store has no ledger to migrate".into(),
+            ));
+        };
+        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
+        if segmented::manifest_path(data_dir).is_file() {
+            return Ok(MigrationOutcome::AlreadySegmented);
+        }
+        if !path.is_file() {
+            return Ok(MigrationOutcome::NothingToMigrate);
+        }
+
+        let legacy = self.restore(legacy::read(path)?)?;
+        let height = legacy.height();
+        let state_root = legacy.state.root();
+        let snapshot = LedgerSnapshot {
+            chain_id: self.chain_id,
+            state: legacy.state.snapshot(),
+            blocks: legacy.blocks,
+            receipts: legacy.receipts,
+        };
+
+        self.persist(&snapshot)?;
+
+        // Re-read through the normal loader: the migration only counts if the
+        // segmented history replays to the same head.
+        let migrated = self.load()?;
+        if migrated.height() != height || migrated.state.root() != state_root {
+            return Err(StorageError::Invalid(
+                "migrated ledger does not replay to the same head".into(),
+            ));
+        }
+        debug!(height, "migrated the legacy ledger to segments");
+        Ok(MigrationOutcome::Migrated { height })
     }
 
     fn empty(&self) -> RestoredLedger {

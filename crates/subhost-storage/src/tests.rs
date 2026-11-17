@@ -701,3 +701,98 @@ fn segment_header_must_carry_the_configured_chain() {
     fs::write(&segment, &bytes).unwrap();
     assert!(matches!(store.load(), Err(StorageError::ChainMismatch { expected: 1, got: 99 })));
 }
+
+#[test]
+fn migrate_converts_a_version_two_file_and_verifies_the_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (snapshot, state) = ledger(3);
+    let legacy_path = dir.path().join(LEDGER_FILE_NAME);
+    fs::write(&legacy_path, legacy::encode(&snapshot)).unwrap();
+
+    let store = open(dir.path());
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::Migrated { height: 3 });
+    assert!(segmented::manifest_path(dir.path()).is_file());
+    assert!(!legacy_path.exists());
+    assert!(dir.path().join(LEDGER_BACKUP_FILE_NAME).is_file());
+
+    let restored = store.load().unwrap();
+    assert_eq!(restored.height(), 3);
+    assert_eq!(restored.state.root(), state.root());
+    assert_eq!(restored.receipts.len(), 3);
+}
+
+#[test]
+fn migrate_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (snapshot, _) = ledger(2);
+    fs::write(dir.path().join(LEDGER_FILE_NAME), legacy::encode(&snapshot)).unwrap();
+
+    let store = open(dir.path());
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::Migrated { height: 2 });
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::AlreadySegmented);
+    assert_eq!(store.load().unwrap().height(), 2);
+    assert_eq!(manifest_value(dir.path())["segments"][0]["records"], 2);
+}
+
+#[test]
+fn migrate_reports_a_fresh_directory_as_nothing_to_migrate() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::NothingToMigrate);
+    assert!(!segmented::manifest_path(dir.path()).exists());
+    assert!(!store.exists());
+}
+
+#[test]
+fn migrate_refuses_a_corrupt_legacy_file_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (snapshot, _) = ledger(2);
+    let mut bytes = legacy::encode(&snapshot);
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    let legacy_path = dir.path().join(LEDGER_FILE_NAME);
+    fs::write(&legacy_path, &bytes).unwrap();
+
+    let store = open(dir.path());
+    assert!(matches!(store.migrate(), Err(StorageError::ChecksumMismatch)));
+    assert!(!segmented::manifest_path(dir.path()).exists(), "a failed migration must not commit");
+    assert!(legacy_path.is_file(), "the legacy file must survive a failed migration");
+}
+
+#[test]
+fn migrate_refuses_an_unknown_legacy_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let (snapshot, _) = ledger(1);
+    let mut bytes = legacy::encode(&snapshot);
+    // magic(8) || version(u32 LE) starts at byte 8.
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    fs::write(dir.path().join(LEDGER_FILE_NAME), &bytes).unwrap();
+
+    let store = open(dir.path());
+    assert!(matches!(store.migrate(), Err(StorageError::UnsupportedVersion(1))));
+    assert!(!segmented::manifest_path(dir.path()).exists());
+}
+
+#[test]
+fn migrate_recovers_from_a_partial_previous_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (snapshot, _) = ledger(2);
+    fs::write(dir.path().join(LEDGER_FILE_NAME), legacy::encode(&snapshot)).unwrap();
+
+    // Leftovers from a run that died before the manifest commit.
+    let ledger = dir.path().join(LEDGER_DIR_NAME);
+    fs::create_dir_all(ledger.join("segments")).unwrap();
+    fs::write(ledger.join("snapshot-0000000009.bin"), b"partial").unwrap();
+    fs::write(ledger.join("segments").join("000000.log"), b"partial").unwrap();
+
+    let store = open(dir.path());
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::Migrated { height: 2 });
+    assert_eq!(store.load().unwrap().height(), 2);
+    assert!(!ledger.join("snapshot-0000000009.bin").exists());
+}
+
+#[test]
+fn ephemeral_store_cannot_be_migrated() {
+    let store = LedgerStore::ephemeral(1).unwrap();
+    assert!(matches!(store.migrate(), Err(StorageError::Invalid(_))));
+}

@@ -287,7 +287,23 @@ tracks mempool depth. The registry also defines `subhost_rpc_requests_total`,
 `subhost_rpc_errors_total`, and a request-duration histogram, but the node does
 not increment them yet, so they stay at zero.
 
-## 14. Clean up
+## 14. Optional: migrate a version 2 ledger
+
+A node built before S4 stores its history in one `node-state.bin`. Point the
+maintenance command at that data directory while the node is stopped:
+
+```bash
+subhost db migrate --data-dir "$SUBHOST_TEST_DATA" --chain-id 1
+```
+
+It validates the whole version 2 file before writing anything, converts it to
+`ledger/manifest.json` plus `ledger/segments/`, re-reads the result and compares
+the head, and keeps the original as `node-state.bin.v2-backup`. Running it again
+prints `is already segmented; nothing to do`; a fresh directory prints `nothing to
+do` as well. If the legacy file is corrupt or an unknown version, the command
+fails and leaves the directory untouched.
+
+## 15. Clean up
 
 Stop the node with `Ctrl-C` first.
 
