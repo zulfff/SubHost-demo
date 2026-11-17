@@ -60,13 +60,7 @@ fn oversized_block_is_accepted_and_then_breaks_restart() {
     for (index, tx) in transactions.iter().enumerate() {
         gas_used += tx.gas_limit;
         hashes.push(tx.hash());
-        commitments.push(receipt_commitment(
-            tx.hash(),
-            1,
-            index as u32,
-            tx.gas_limit,
-            gas_used,
-        ));
+        commitments.push(receipt_commitment(tx.hash(), 1, index as u32, tx.gas_limit, gas_used));
     }
 
     let block = Block {
