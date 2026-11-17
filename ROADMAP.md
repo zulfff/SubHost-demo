@@ -62,6 +62,29 @@ fixed or written down as an explicit, reviewed limitation.
 Track C (execution, IBC) is deliberately deferred to S10/S11 and goes to whichever
 track is free. Do not start it before S3 lands.
 
+### Communication is a hard gate
+
+The two tracks do not share a chat window, so the repository is the channel. The
+protocol is `docs/agents/README.md`; the daily rules are `AGENTS.md`.
+
+- Questions live in `docs/agents/questions/open/` and replies in
+  `docs/agents/replies/`. `ls docs/agents/questions/open/` is the inbox.
+- **Before starting a task, check the inbox.** If an open question names your track
+  and its `blocks:` field lists that task, you must write a reply first and wait for
+  the author to move it to `agreed/` (or escalate it). Starting the task anyway is a
+  process violation, not initiative.
+- Research first: official docs, the crate repository, RustSec, RFCs. Cite the URL
+  and the claim you verified in `## Evidence`. Do not ask what a document answers.
+- Open a question proactively for any shared contract change, even when it does not
+  block you (`blocks: none`, `review_by: <stage>`). Disagreement in writing is
+  expected; silent compliance is not.
+- Unresolved disagreement escalates to the maintainer through
+  `docs/agents/questions/escalated/`, and the blocked task stops until an ADR in
+  `docs/agents/decisions/` records the decision.
+
+`Q-001` (block signature scheme) is open and blocks S1.2–S1.4. Track B replies
+before Track A starts.
+
 ### Rules that keep you out of each other's diffs
 
 1. **One stage = one branch = one PR.** Branch names: `s1/signed-blocks`,
@@ -137,6 +160,8 @@ Size is relative effort, not calendar time. S10 alone is larger than S0–S9 com
 who may produce, what the ledger guarantees, which component owns which decision.
 
 ### S1 — Signed blocks and validator identity (Track A)
+
+Blocked by `Q-001` until Track B replies.
 
 **S1.1 Registry from genesis** (`subhost-consensus`)
 - `ValidatorRegistry::from_genesis(&[ValidatorInfo]) -> Result<Self, ConsensusError>`
@@ -382,7 +407,9 @@ incident log.
 
 If both agents start today, do this and nothing else:
 
-- **Agent A:** S0.1 → S0.2 → S1.1 → S1.2 → S1.3. Do not touch `subhost-storage`,
+0. **Both:** `ls docs/agents/questions/open/` and clear anything addressed to your
+   track. Right now that is `Q-001` for Track B, and it blocks S1.2–S1.4.
+1. **Agent A:** S0.1 → S0.2 → S1.1 → S1.2 → S1.3. Do not touch `subhost-storage`,
   `subhost-cli`, `explorer`, `.github/`.
 - **Agent B:** S4.1 → S4.2 (storage crate only) and `docs/operations/backup-restore.md`.
   Do not touch `subhost-core`, `subhost-consensus`, `subhost-node`, or
