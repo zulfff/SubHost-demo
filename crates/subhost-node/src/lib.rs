@@ -489,6 +489,7 @@ mod tests {
             address: Address::new([9; 20]),
             public_key: vec![1, 2, 3],
             power: 100,
+            proof_of_possession: Vec::new(),
         }];
         genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
         let node = Node::bootstrap(config).unwrap();

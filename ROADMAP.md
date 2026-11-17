@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `ca8cbe0` · PR #19 and #20 merged · S0.1 in review
+Status: 2026-11-18 · baseline `main` = `4a747b1` · S0.1 merged · S0.2 in review
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -22,7 +22,7 @@ editing the same files.
 | IBC | State machine + single-key ed25519 light client. No validator-set rotation, no multisig QC, no non-membership proof. |
 | Release | `0.1.0`, no tag, no release workflow, no signed binaries or SBOM. |
 
-Measured baseline: 248 tests, clippy/rustfmt/rustdoc clean, `cargo deny` clean.
+Measured baseline: 251 tests, clippy/rustfmt/rustdoc clean, `cargo deny` clean.
 
 ---
 
