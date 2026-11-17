@@ -351,9 +351,10 @@ fn empty_history_is_valid() {
 fn persist_keeps_the_current_and_previous_snapshot_only() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
-    store.persist(&ledger(1).0).unwrap();
-    store.persist(&ledger(3).0).unwrap();
-    store.persist(&ledger(5).0).unwrap();
+    // Shrink the interval so each of the three heads writes a snapshot.
+    for height in [1, 3, 5] {
+        store.persist_with_limits(&ledger(height).0, segmented::SEGMENT_MAX_BYTES, 2).unwrap();
+    }
 
     assert_eq!(store.load().unwrap().height(), 5);
     assert_eq!(
@@ -372,6 +373,83 @@ fn persist_keeps_the_current_and_previous_snapshot_only() {
         .filter(|name| name.starts_with(".tmp"))
         .collect();
     assert!(leftovers.is_empty(), "unexpected temporaries: {leftovers:?}");
+}
+
+#[test]
+fn snapshot_interval_defers_the_snapshot_and_replays_the_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let interval = 4;
+
+    store.persist_with_limits(&ledger(1).0, segmented::SEGMENT_MAX_BYTES, interval).unwrap();
+    assert_eq!(manifest_value(dir.path())["snapshot"]["height"], 1);
+
+    // Below the next boundary: the height-1 snapshot is reused, not rewritten.
+    store.persist_with_limits(&ledger(4).0, segmented::SEGMENT_MAX_BYTES, interval).unwrap();
+    let manifest = manifest_value(dir.path());
+    assert_eq!(manifest["snapshot"]["height"], 1);
+    assert_eq!(manifest["head_height"], 4);
+    assert!(!snapshot_path(dir.path(), 4).exists());
+    assert!(snapshot_path(dir.path(), 1).is_file());
+
+    // Loading replays blocks 2..=4 on top of the height-1 snapshot.
+    let restored = store.load().unwrap();
+    assert_eq!(restored.height(), 4);
+    assert_eq!(restored.receipts.len(), 4);
+    assert_eq!(restored.state.balance(&Address::new([2; 20])), 40);
+
+    // The next block lands exactly on the interval boundary.
+    store.persist_with_limits(&ledger(5).0, segmented::SEGMENT_MAX_BYTES, interval).unwrap();
+    let manifest = manifest_value(dir.path());
+    assert_eq!(manifest["snapshot"]["height"], 5);
+    assert!(snapshot_path(dir.path(), 5).is_file());
+    // The superseded snapshot is kept until the next commit, so a manifest that
+    // was never replaced still points at live data.
+    assert!(snapshot_path(dir.path(), 1).is_file());
+
+    store.persist_with_limits(&ledger(6).0, segmented::SEGMENT_MAX_BYTES, interval).unwrap();
+    assert!(!snapshot_path(dir.path(), 1).exists(), "the superseded snapshot must be pruned");
+    assert!(snapshot_path(dir.path(), 5).is_file());
+    assert_eq!(store.load().unwrap().height(), 6);
+}
+
+#[test]
+fn snapshot_state_root_must_match_the_block_at_its_height() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist_with_limits(&ledger(1).0, segmented::SEGMENT_MAX_BYTES, 4).unwrap();
+
+    // A snapshot that is internally consistent (correct checksum and its own
+    // state root) but does not describe the state after block 1.
+    let mut state = State::from_snapshot(ledger(1).0.state).unwrap();
+    state.credit(Address::new([9; 20]), 1).unwrap();
+    let doctored = state.snapshot();
+    let checksum = segmented::overwrite_snapshot(dir.path(), 1, &doctored).unwrap();
+
+    let mut manifest = manifest_value(dir.path());
+    manifest["snapshot"]["state_root"] = serde_json::json!(state.root().to_string());
+    manifest["snapshot"]["checksum"] = serde_json::json!(checksum.to_string());
+    write_manifest_value(dir.path(), &manifest);
+
+    let error = store.load().unwrap_err();
+    assert!(matches!(error, StorageError::Snapshot(_)), "unexpected error: {error:?}");
+    assert!(error.to_string().contains("does not match block 1"), "{error}");
+}
+
+#[test]
+fn snapshot_height_ahead_of_the_head_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist_with_limits(&ledger(1).0, segmented::SEGMENT_MAX_BYTES, 4).unwrap();
+
+    let mut manifest = manifest_value(dir.path());
+    manifest["snapshot"]["height"] = serde_json::json!(2);
+    manifest["snapshot"]["file"] = serde_json::json!("snapshot-0000000002.bin");
+    write_manifest_value(dir.path(), &manifest);
+
+    let error = store.load().unwrap_err();
+    assert!(matches!(error, StorageError::Manifest(_)), "unexpected error: {error:?}");
+    assert!(error.to_string().contains("ahead of the head"), "{error}");
 }
 
 #[test]

@@ -165,23 +165,40 @@ impl LedgerStore {
         let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
         fs::create_dir_all(data_dir)
             .map_err(|source| StorageError::Io { path: data_dir.to_path_buf(), source })?;
-        segmented::persist(self.chain_id, data_dir, snapshot, segmented::SEGMENT_MAX_BYTES)
+        segmented::persist(
+            self.chain_id,
+            data_dir,
+            snapshot,
+            segmented::SEGMENT_MAX_BYTES,
+            segmented::SNAPSHOT_INTERVAL_BLOCKS,
+        )
     }
 
-    /// Test-only entry point that shrinks the segment roll-over threshold so
-    /// multi-segment behaviour can be exercised without 64 MiB fixtures.
+    /// Test-only entry point that shrinks the segment roll-over threshold and the
+    /// snapshot interval so both can be exercised without huge fixtures.
     #[cfg(test)]
-    pub(crate) fn persist_with_segment_limit(
+    pub(crate) fn persist_with_limits(
         &self,
         snapshot: &LedgerSnapshot,
         segment_max_bytes: u64,
+        snapshot_interval: u64,
     ) -> Result<(), StorageError> {
         validate_snapshot(snapshot, self.chain_id)?;
         let Some(path) = &self.path else {
             return Ok(());
         };
         let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
-        segmented::persist(self.chain_id, data_dir, snapshot, segment_max_bytes)
+        segmented::persist(self.chain_id, data_dir, snapshot, segment_max_bytes, snapshot_interval)
+    }
+
+    /// Test-only: keep the default interval but shrink only the segment target.
+    #[cfg(test)]
+    pub(crate) fn persist_with_segment_limit(
+        &self,
+        snapshot: &LedgerSnapshot,
+        segment_max_bytes: u64,
+    ) -> Result<(), StorageError> {
+        self.persist_with_limits(snapshot, segment_max_bytes, segmented::SNAPSHOT_INTERVAL_BLOCKS)
     }
 
     fn empty(&self) -> RestoredLedger {

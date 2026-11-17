@@ -185,18 +185,28 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Periodic state snapshots.** `persist` writes a fresh
+  `ledger/snapshot-<height>.bin` on the first commit and then once every
+  `SNAPSHOT_INTERVAL_BLOCKS` (1024) blocks instead of at every commit, and keeps
+  the previous snapshot for one more commit. `load` checks that the snapshot's
+  state root equals the `state_root` of the block at its own height, then replays
+  only the blocks after it with `State::apply_transaction`, so start-up executes
+  at most one interval of transactions. Still outstanding and recorded in
+  `ROADMAP.md`: segments are still read in full on start-up, the snapshot holds no
+  receipt index, and history is not pruned.
 - **Segmented ledger store.** `subhost-storage` keeps history in
   `ledger/manifest.json` plus append-only `ledger/segments/NNNNNN.log` (framed
   records, BLAKE3 per record) and account state in
   `ledger/snapshot-<height>.bin`. `persist` validates the snapshot, appends only
-  the new block records, fsyncs the segment, rewrites the bounded state snapshot,
+  the new block records, fsyncs the segment, writes the state snapshot when due,
   and replaces the manifest atomically last, so bytes the manifest does not
   reference are an interrupted append that is ignored and truncated. The public
-  `LedgerStore` API is unchanged. Covered by 15 new tests: round trip, multi-segment
+  `LedgerStore` API is unchanged. Covered by 18 new tests: round trip, multi-segment
   roll-over, append-only writes, torn tail, corrupt record, missing segment,
   truncated segment, stale manifest length, manifest path traversal, snapshot
   corruption, crash between snapshot and manifest commit, v2 migration, non-append
-  refusal, and funded-state-at-height-zero.
+  refusal, funded-state-at-height-zero, deferred snapshots with trailing replay,
+  snapshot-root anchoring, and a snapshot ahead of the head.
 - **`StorageError::NonAppendPersist`.** Persisting a history that does not extend
   the committed head is refused until fork choice (S3) can express a reorg.
 - **Public layout constants.** `LEDGER_DIR_NAME`, `MANIFEST_FILE_NAME`, and
@@ -306,10 +316,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `node-state.bin` is still read and validated, and the first `persist` migrates it
   to segments and renames it to `node-state.bin.v2-backup`; it is never loaded again
   once `ledger/manifest.json` exists. This removes the 64 MiB total-history cap and
-  turns each block commit from a full-history rewrite into an append. Still
-  outstanding and recorded in `ROADMAP.md`: the state snapshot is rewritten at the
-  head on every persist, loading still reads the whole segment history, and there
-  is no pruning command yet (S4.2–S4.4).
+  turns each block commit from a full-history rewrite into an append. State is also
+  snapshotted every 1024 blocks rather than at every commit. Still outstanding and
+  recorded in `ROADMAP.md`: loading reads every segment byte, the snapshot holds no
+  receipt index, and there is no pruning command yet (S4.3–S4.4).
 - **Proofs of possession use their own domain tag.** `BLSScheme::proof_of_possession`
   now hashes under `subhost-bls-pop-01` instead of reusing the protocol signature
   domain, so a proof can no longer be replayed as a signature over the encoded

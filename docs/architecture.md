@@ -89,10 +89,11 @@ instead of writing a block.
 ### 2.5 Persist, then publish
 
 Durability comes before visibility. The node builds the next block list and receipt
-map in memory, appends the new block record to the ledger, rewrites the state
-snapshot, commits the manifest, and only then swaps the new state, blocks, and
-receipts into place and stores the new height. If persistence fails, none of the
-swaps happen and no block event is emitted.
+map in memory, appends the new block record to the ledger, writes a fresh state
+snapshot when one is due (every `SNAPSHOT_INTERVAL_BLOCKS`), commits the manifest,
+and only then swaps the new state, blocks, and receipts into place and stores the
+new height. If persistence fails, none of the swaps happen and no block event is
+emitted.
 
 On success the node removes the mined transactions from the pool, emits
 `BlockEvent::Sealed`, and the network task relays only locally sealed blocks. A block
@@ -154,18 +155,24 @@ Durability and integrity:
   `magic || version || length || BLAKE3 || payload` and fsynced before the manifest
   that references it;
 - account state is `ledger/snapshot-<height>.bin`, written to a temporary file,
-  fsynced, atomically renamed, and only then referenced by the manifest;
-- the manifest itself is replaced the same way (temporary file, fsync, atomic rename,
+  fsynced, atomically renamed, and only then referenced by the manifest. A snapshot
+  is written on the first persist and then every `SNAPSHOT_INTERVAL_BLOCKS` (1024)
+  blocks, so the committed snapshot height may lag the head;
+- the manifest is replaced the same way (temporary file, fsync, atomic rename,
   directory fsync), so a persist either moves the head or leaves the previous one;
+- the previous snapshot is kept until the following commit, so a manifest that was
+  never replaced still points at live data;
 - bytes past the manifest's committed segment length are an interrupted append: they
   are never read and are truncated before the next append;
 - a segment rolls to a new file at 64 MiB instead of refusing history, and one record
   is capped at 16 MiB;
 - every read is validated before it is trusted: size bounds, magic, versions,
   checksums, manifest consistency (expected file names, record counts, snapshot name
-  and height), chain binding, then a full replay of the block and receipt commitments
-  against the restored state;
-- the replay checks contiguous heights from 1, parent links, chain ID, gas totals,
+  and height), and chain binding;
+- the snapshot's state root must equal the `state_root` of the block at the
+  snapshot's own height, so a snapshot cannot be replayed onto a different history;
+- blocks after the snapshot are executed again with `State::apply_transaction`, then
+  a full replay checks contiguous heights from 1, parent links, chain ID, gas totals,
   unique blocks and transactions, every transaction signature, both commitments per
   block, exactly one `Success` receipt per transaction, and that the restored state
   root equals the newest block's `state_root`;
@@ -202,9 +209,10 @@ What the ledger does not guarantee:
 - no reorg: `persist` refuses a snapshot that does not extend the committed head
   (`StorageError::NonAppendPersist`), so a competing branch can only replace the
   chain by deleting the ledger directory and replaying from genesis;
-- no pruning and no bounded start-up: the state snapshot is rewritten at the head on
-  every persist and loading reads every segment, so start-up cost grows with history
-  until S4.2–S4.3 add periodic snapshots and retention;
+- no pruning and no bounded start-up I/O: a fresh snapshot is written every 1024
+  blocks and start-up executes at most that many blocks on top of it, but every
+  segment is still read and scanned, and old segments are never dropped, so
+  start-up I/O and disk use still grow with history until S4.3–S4.4;
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
 - no authentication for JSON-RPC or metrics clients, and no producer authorization

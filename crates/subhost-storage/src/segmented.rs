@@ -33,6 +33,10 @@ use crate::{
 /// exceed this by at most one record. Total history is not capped.
 pub(crate) const SEGMENT_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Write a fresh state snapshot once this many blocks have accumulated past the
+/// last one. Load replays at most this many blocks on top of the snapshot.
+pub(crate) const SNAPSHOT_INTERVAL_BLOCKS: u64 = 1024;
+
 const SEGMENT_MAGIC: [u8; 8] = *b"SUBSEG01";
 const SEGMENT_VERSION: u32 = 1;
 const SEGMENT_HEADER_LEN: u64 = 28;
@@ -227,9 +231,9 @@ pub(crate) fn read_manifest(
         ));
     }
     if let Some(snapshot) = &committed.snapshot {
-        if snapshot.height != committed.head_height {
+        if snapshot.height > committed.head_height {
             return Err(StorageError::Manifest(format!(
-                "snapshot height {} does not match the head height {}",
+                "snapshot height {} is ahead of the head height {}",
                 snapshot.height, committed.head_height
             )));
         }
@@ -249,7 +253,7 @@ pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger,
         .snapshot
         .as_ref()
         .ok_or_else(|| StorageError::Manifest("manifest has no snapshot".into()))?;
-    let state = read_snapshot(data_dir, chain_id, snapshot)?;
+    let mut state = read_snapshot(data_dir, chain_id, snapshot)?;
     let (blocks, receipts) = read_segments(data_dir, chain_id, &committed)?;
 
     let height = u64::try_from(blocks.len()).ok().filter(|height| *height == committed.head_height);
@@ -260,8 +264,48 @@ pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger,
         ));
     }
 
+    // The snapshot must be rooted in the block at its own height, not merely be
+    // internally consistent: otherwise a stale or mismatched snapshot could pass
+    // the manifest checksum and still replay onto the wrong history.
+    if snapshot.height > 0 {
+        let index = usize::try_from(snapshot.height - 1)
+            .map_err(|_| StorageError::Manifest("snapshot height does not fit in memory".into()))?;
+        let anchored = blocks.get(index).ok_or_else(|| {
+            StorageError::Manifest(format!(
+                "snapshot height {} is beyond the committed history",
+                snapshot.height
+            ))
+        })?;
+        if anchored.header.state_root != snapshot.state_root {
+            return Err(StorageError::Snapshot(format!(
+                "snapshot state root does not match block {}",
+                snapshot.height
+            )));
+        }
+    }
+
+    // Replay only the blocks after the snapshot. `validate_chain` still checks the
+    // full history's commitments, so a truncated prefix cannot hide a rewrite.
+    let replay_from = usize::try_from(snapshot.height)
+        .map_err(|_| StorageError::Manifest("snapshot height does not fit in memory".into()))?;
+    for block in blocks.iter().skip(replay_from) {
+        for transaction in &block.transactions {
+            state.apply_transaction(transaction).map_err(|error| {
+                StorageError::Snapshot(format!(
+                    "cannot replay block {} on the snapshot: {error}",
+                    block.header.height
+                ))
+            })?;
+        }
+    }
+
     crate::validate_chain(&blocks, &receipts, chain_id, &state)?;
-    debug!(blocks = blocks.len(), receipts = receipts.len(), "restored segmented ledger");
+    debug!(
+        blocks = blocks.len(),
+        receipts = receipts.len(),
+        replayed = blocks.len().saturating_sub(replay_from),
+        "restored segmented ledger"
+    );
     Ok(RestoredLedger { state, blocks, receipts })
 }
 
@@ -477,12 +521,27 @@ fn take<'a>(bytes: &'a [u8], cursor: &mut usize, len: u64) -> Result<&'a [u8], S
     Ok(slice)
 }
 
-/// Append new block records, write the state snapshot, then commit the manifest.
+/// Whether a fresh state snapshot should be written at `head`.
+///
+/// A snapshot is written when the manifest has none (first persist or a legacy
+/// migration) and once `interval` blocks have accumulated past the current one.
+/// An interval of zero snapshots on every persist, which the tests use to get a
+/// snapshot at an exact height.
+fn snapshot_due(head: u64, current: Option<&SnapshotRef>, interval: u64) -> bool {
+    match current {
+        None => true,
+        Some(snapshot) => head >= snapshot.height.saturating_add(interval),
+    }
+}
+
+/// Append new block records, write the state snapshot when one is due, then
+/// commit the manifest.
 pub(crate) fn persist(
     chain_id: ChainId,
     data_dir: &Path,
     snapshot: &LedgerSnapshot,
     segment_max_bytes: u64,
+    snapshot_interval: u64,
 ) -> Result<(), StorageError> {
     let previous = read_previous(chain_id, data_dir)?;
     let new_height = snapshot.blocks.last().map_or(0, |block| block.header.height);
@@ -512,9 +571,17 @@ pub(crate) fn persist(
             .map_err(|source| StorageError::Io { path: dir.clone(), source })?;
     }
 
-    let state = State::from_snapshot(snapshot.state.clone())
-        .map_err(|error| StorageError::Snapshot(error.to_string()))?;
-    let snapshot_ref = write_snapshot(data_dir, snapshot, &state)?;
+    let previous_snapshot = previous.as_ref().and_then(|best| best.snapshot.clone());
+    let snapshot_ref = if snapshot_due(new_height, previous_snapshot.as_ref(), snapshot_interval) {
+        let state = State::from_snapshot(snapshot.state.clone())
+            .map_err(|error| StorageError::Snapshot(error.to_string()))?;
+        write_snapshot(data_dir, new_height, &snapshot.state, state.root())?
+    } else {
+        // Reuse the committed snapshot and replay the blocks after it on load.
+        previous_snapshot
+            .clone()
+            .ok_or_else(|| StorageError::Manifest("manifest has no snapshot".into()))?
+    };
     let committed = CommittedLedger {
         head_height: new_height,
         head_hash: snapshot.blocks.last().map_or(Hash::ZERO, Block::hash),
@@ -522,7 +589,7 @@ pub(crate) fn persist(
         segments,
     };
     write_manifest(data_dir, chain_id, &committed)?;
-    cleanup(data_dir, &committed, previous.as_ref().and_then(|best| best.snapshot.as_ref()));
+    cleanup(data_dir, &committed, previous_snapshot.as_ref());
     Ok(())
 }
 
@@ -759,14 +826,10 @@ fn create_segment(
     Ok(CurrentSegment { index, records: 0, bytes: SEGMENT_HEADER_LEN, file })
 }
 
-fn write_snapshot(
-    data_dir: &Path,
-    snapshot: &LedgerSnapshot,
-    state: &State,
-) -> Result<SnapshotRef, StorageError> {
-    let height = snapshot.blocks.last().map_or(0, |block| block.header.height);
-    let payload = bincode::serialize(&snapshot.state)
-        .map_err(|error| StorageError::Encode(error.to_string()))?;
+/// Serialize a state snapshot into the envelope: magic, version, BLAKE3, payload.
+fn encode_snapshot(state: &StateSnapshot) -> Result<(Vec<u8>, Hash), StorageError> {
+    let payload =
+        bincode::serialize(state).map_err(|error| StorageError::Encode(error.to_string()))?;
     let checksum = *blake3::hash(&payload).as_bytes();
     let mut bytes = Vec::with_capacity(44 + payload.len());
     bytes.extend_from_slice(&SNAPSHOT_MAGIC);
@@ -778,10 +841,33 @@ fn write_snapshot(
     if size > MAX_SNAPSHOT_BYTES {
         return Err(StorageError::TooLarge { size, max: MAX_SNAPSHOT_BYTES });
     }
+    Ok((bytes, Hash::new(checksum)))
+}
 
+fn write_snapshot(
+    data_dir: &Path,
+    height: u64,
+    state: &StateSnapshot,
+    state_root: Hash,
+) -> Result<SnapshotRef, StorageError> {
+    let (bytes, checksum) = encode_snapshot(state)?;
     let file = snapshot_file_name(height);
     write_atomic(&ledger_dir(data_dir).join(&file), &bytes)?;
-    Ok(SnapshotRef { file, height, state_root: state.root(), checksum: Hash::new(checksum) })
+    Ok(SnapshotRef { file, height, state_root, checksum })
+}
+
+/// Test-only: replace the snapshot payload at `height` and return its new
+/// checksum, so a test can keep a manifest internally consistent while making
+/// the snapshot disagree with its block.
+#[cfg(test)]
+pub(crate) fn overwrite_snapshot(
+    data_dir: &Path,
+    height: u64,
+    state: &StateSnapshot,
+) -> Result<Hash, StorageError> {
+    let (bytes, checksum) = encode_snapshot(state)?;
+    write_atomic(&ledger_dir(data_dir).join(snapshot_file_name(height)), &bytes)?;
+    Ok(checksum)
 }
 
 fn write_manifest(
