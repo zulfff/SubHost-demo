@@ -19,7 +19,7 @@ A node is one process assembled in `subhost-node`:
   `Node::bootstrap`. It contains no ledger logic.
 
 `Node::bootstrap` loads `genesis.json` when present, opens the ledger, and applies
-genesis allocations only when the ledger file does not exist yet. A restarted node
+genesis allocations only when no ledger exists yet. A restarted node
 restores the ledger and logs the restored height instead of re-applying allocations.
 The mempool is not persisted, so a restart loses pending transactions.
 
@@ -89,9 +89,10 @@ instead of writing a block.
 ### 2.5 Persist, then publish
 
 Durability comes before visibility. The node builds the next block list and receipt
-map in memory, writes the whole ledger snapshot, and only then swaps the new state,
-blocks, and receipts into place and stores the new height. If persistence fails,
-none of the swaps happen and no block event is emitted.
+map in memory, appends the new block record to the ledger, rewrites the state
+snapshot, commits the manifest, and only then swaps the new state, blocks, and
+receipts into place and stores the new height. If persistence fails, none of the
+swaps happen and no block event is emitted.
 
 On success the node removes the mined transactions from the pool, emits
 `BlockEvent::Sealed`, and the network task relays only locally sealed blocks. A block
@@ -147,26 +148,38 @@ node and CLI.
 
 Durability and integrity:
 
-- one versioned envelope per ledger file: magic, format version, BLAKE3 checksum, and
-  payload;
-- every write goes to a temporary file in the same directory, is fsynced, atomically
-  renamed over the target, and the directory is fsynced;
-- size is capped at 64 MiB; a larger snapshot is refused rather than truncated;
-- every read is validated before it is trusted: size bound, magic, version,
-  checksum, chain binding, then a full replay of the block and receipt commitments
+- `ledger/manifest.json` is the commit point: chain ID, head height and hash, the
+  state snapshot, and every segment with its committed record count and byte length;
+- history is an append-only `ledger/segments/NNNNNN.log`, with each record framed as
+  `magic || version || length || BLAKE3 || payload` and fsynced before the manifest
+  that references it;
+- account state is `ledger/snapshot-<height>.bin`, written to a temporary file,
+  fsynced, atomically renamed, and only then referenced by the manifest;
+- the manifest itself is replaced the same way (temporary file, fsync, atomic rename,
+  directory fsync), so a persist either moves the head or leaves the previous one;
+- bytes past the manifest's committed segment length are an interrupted append: they
+  are never read and are truncated before the next append;
+- a segment rolls to a new file at 64 MiB instead of refusing history, and one record
+  is capped at 16 MiB;
+- every read is validated before it is trusted: size bounds, magic, versions,
+  checksums, manifest consistency (expected file names, record counts, snapshot name
+  and height), chain binding, then a full replay of the block and receipt commitments
   against the restored state;
 - the replay checks contiguous heights from 1, parent links, chain ID, gas totals,
   unique blocks and transactions, every transaction signature, both commitments per
   block, exactly one `Success` receipt per transaction, and that the restored state
   root equals the newest block's `state_root`;
-- a tampered or truncated file is rejected, not silently loaded.
+- a tampered, truncated, or half-written ledger is rejected, not silently loaded. A
+  version 2 `node-state.bin` is still read; the first persist migrates it to segments
+  and keeps it as `node-state.bin.v2-backup`.
 
 Determinism:
 
 - `state_root` is a Merkle root over address-sorted account leaves, so insertion
   order does not affect it;
 - the chain ID is mixed into every leaf, binding the root to one chain;
-- receipt commitments sort by height before persistence, so the file is byte-stable;
+- receipts are grouped per block and sorted by transaction index before a record is
+  written, so the segment is byte-stable;
 - selection visits senders in address order, so the same pool and state produce the
   same block.
 
@@ -186,10 +199,12 @@ What the ledger does not guarantee:
   tip, and a competing branch is rejected because it does not extend that tip;
 - no block sync or backfill: a gap is only filled by blocks arriving through gossip
   within the 64-block window;
-- no reorg: once a block is persisted it can only be replaced by deleting the ledger
-  file and replaying from genesis;
-- no pruning: every block is persisted in full on every write, so the 64 MiB cap
-  bounds how much history a node can keep;
+- no reorg: `persist` refuses a snapshot that does not extend the committed head
+  (`StorageError::NonAppendPersist`), so a competing branch can only replace the
+  chain by deleting the ledger directory and replaying from genesis;
+- no pruning and no bounded start-up: the state snapshot is rewritten at the head on
+  every persist and loading reads every segment, so start-up cost grows with history
+  until S4.2–S4.3 add periodic snapshots and retention;
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
 - no authentication for JSON-RPC or metrics clients, and no producer authorization

@@ -17,6 +17,7 @@ subhost-state = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

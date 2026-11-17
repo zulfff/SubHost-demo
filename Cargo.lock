@@ -3930,6 +3930,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "serde",
+ "serde_json",
  "subhost-core",
  "subhost-state",
  "tempfile",

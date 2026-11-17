@@ -185,6 +185,23 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Segmented ledger store.** `subhost-storage` keeps history in
+  `ledger/manifest.json` plus append-only `ledger/segments/NNNNNN.log` (framed
+  records, BLAKE3 per record) and account state in
+  `ledger/snapshot-<height>.bin`. `persist` validates the snapshot, appends only
+  the new block records, fsyncs the segment, rewrites the bounded state snapshot,
+  and replaces the manifest atomically last, so bytes the manifest does not
+  reference are an interrupted append that is ignored and truncated. The public
+  `LedgerStore` API is unchanged. Covered by 15 new tests: round trip, multi-segment
+  roll-over, append-only writes, torn tail, corrupt record, missing segment,
+  truncated segment, stale manifest length, manifest path traversal, snapshot
+  corruption, crash between snapshot and manifest commit, v2 migration, non-append
+  refusal, and funded-state-at-height-zero.
+- **`StorageError::NonAppendPersist`.** Persisting a history that does not extend
+  the committed head is refused until fork choice (S3) can express a reorg.
+- **Public layout constants.** `LEDGER_DIR_NAME`, `MANIFEST_FILE_NAME`, and
+  `LEDGER_BACKUP_FILE_NAME` describe the segmented store; `LEDGER_FILE_NAME` and
+  `MAX_LEDGER_BYTES` now apply to the legacy single file only.
 - **Architecture overview.** `docs/architecture.md` explains the block lifecycle
   from submission to acceptance, who may produce a block today, what the ledger
   guarantees and what it does not, and which crate owns each decision. Every claim
@@ -271,6 +288,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Changed
 
+- **The on-disk ledger is now segmented (format v3).** A version 2
+  `node-state.bin` is still read and validated, and the first `persist` migrates it
+  to segments and renames it to `node-state.bin.v2-backup`; it is never loaded again
+  once `ledger/manifest.json` exists. This removes the 64 MiB total-history cap and
+  turns each block commit from a full-history rewrite into an append. Still
+  outstanding and recorded in `ROADMAP.md`: the state snapshot is rewritten at the
+  head on every persist, loading still reads the whole segment history, and there
+  is no pruning command yet (S4.2–S4.4).
 - **`subhost-rpc` is split into `state.rs`, `block.rs`, and `methods.rs`.** `lib.rs`
   now holds only crate docs and re-exports. No behaviour changed: the same 24 unit
   tests and 3 integration tests pass, and the gas-limit check from `cb062c0` lives

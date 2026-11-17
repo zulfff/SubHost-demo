@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `6be9cc4` · S0.1 and S0.2 merged · S0.3 in review · `Q-001` agreed
+Status: 2026-11-18 · baseline `main` = `2885435` · S0.1–S0.3 merged · `Q-001` agreed · S4.1 in review
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -15,7 +15,7 @@ editing the same files.
 | Block auth | `BlockHeader.validator` is `Address::ZERO` and `Block.signatures` is empty on produced blocks. `accept_block` does not check who produced a block. |
 | Consensus | `subhost-consensus` has a tested in-process `2f+1` driver (`propose`, `receive_proposal`, `receive_vote`, commit). **No crate depends on it**; the node never calls it. |
 | Networking | libp2p gossip publishes only locally sealed blocks. Messages for votes, DAG vertices and transactions are already defined but unused by the node. No block sync, peer scoring, per-peer limits, or tx gossip. |
-| Storage | One `node-state.bin`, hard cap 64 MiB, full replay on every start, format v2. No segments, snapshots, pruning, or migration tool. |
+| Storage | `ledger/manifest.json` + append-only `ledger/segments/NNNNNN.log` + `ledger/snapshot-<height>.bin`; v2 `node-state.bin` still read and migrated on first write. No pruning, no CLI migration tool, and loading still reads the full history. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
 | RPC | 11 methods, no auth, no TLS, no rate limit. RPC counters in the metrics registry are never incremented. |
 | Mempool | In memory only; fixed gas price 1. |
