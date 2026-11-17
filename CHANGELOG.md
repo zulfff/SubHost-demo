@@ -67,6 +67,34 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **`accept_block` accepted peer blocks over the block gas limit
+  (SUBHOST-2026-001).** The producer capped a block at `BLOCK_GAS_LIMIT` while
+  selecting transactions, but the peer path added the same gas figures without
+  ever comparing them to the limit. A gossip peer could publish a block with
+  `gas_limit = 30,000,000` and `gas_used = 40,000,000`; the node accepted,
+  applied, and persisted it, and its own ledger validator then refused that file
+  on the next restart, leaving the node down until the ledger was repaired. The
+  accept path now rejects any block whose running gas total exceeds the header
+  limit, before the transaction is applied. Three regression tests cover the
+  rejected cases and a block that uses exactly the limit.
+- **`cargo deny` failed on the 2026-11 advisory batch.** All 24 advisories were
+  cleared rather than ignored. `libp2p` moved from 0.56 to 0.57, which brings
+  `hickory-proto`/`hickory-resolver` 0.26.3 (15 DNS advisories),
+  `libp2p-gossipsub` 0.50.1 (the PRUNE backoff advisory), and patched `rustls`,
+  `rustls-webpki`, `webpki-roots`, and `tokio` releases. `chrono`
+  (RUSTSEC-2026-0543, unmaintained) was replaced by `time` in the explorer, and
+  the two stale `hickory` exceptions were removed from `deny.toml`.
+- **The manual-testing walkthrough could not complete step 8.** Bob started at
+  zero and received 100, which is less than the 21000 transfer fee, so his send
+  was rejected. The genesis now funds Bob, the expected balances are updated, and
+  the documented result for a stale nonce or an overdrawn sender now matches the
+  message the node actually returns.
+- **Several documentation claims did not match the code.** The README no longer
+  says two producers always fork: only producers that seal at the same height do.
+  The threat model now quotes the real `MIN_VALIDATOR_STAKE` of 10,000,000 SUB
+  instead of 10,000. The manual testing guide now records that the node updates
+  the block-height and pending-transaction gauges but leaves the RPC request
+  counters at zero.
 - **Faucet returned a fabricated transaction hash.** `handle_drip` hashed the
   address and the current time and returned that as `tx_hash`; no transfer was
   ever submitted and no balance changed. The faucet now loads an encrypted
@@ -245,13 +273,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   suite, the 1.89 MSRV, a release build, `cargo deny`, and warning-free rustdoc.
 - **`cargo deny` gates the supply chain** through `deny.toml`: denied advisories
   and yanked crates, a permissive-licence allow-list, banned `openssl`, and a
-  registry allow-list. Four advisories are ignored, each with a written reason and
-  an exit condition: `bincode` unmaintained (internal encoding only, the ledger is
-  separately checksum- and commitment-verified), and three
-  `hickory-proto`/`paste` advisories that arrive only through `libp2p 0.56`, which
-  pins the unfixed version. `cargo tree -i libp2p` confirms `subhost-network` is
-  its only dependant and no binary depends on `subhost-network`, so that code is
-  unreachable in a shipped artifact.
+  registry allow-list. Two maintenance notices are ignored, each with a written
+  reason and an exit condition: `bincode` unmaintained (internal encoding only, the
+  ledger is separately checksum- and commitment-verified) and `paste`
+  unmaintained (a build-time proc-macro reached only through
+  `libp2p-mdns`/`libp2p-tcp` -> `if-watch` -> `netlink-packet-*`). No advisory
+  affecting runtime code is ignored.
 - **`rust-toolchain.toml` pins the compiler** so every developer, CI runner, and
   container build uses one version.
 - **MSRV corrected from 1.75 to 1.89.** The manifest claimed 1.75, but the locked

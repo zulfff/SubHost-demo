@@ -665,4 +665,84 @@ mod tests {
         let node = Node::bootstrap(config).unwrap();
         assert!(node.config().network.is_some());
     }
+
+    /// Port 0 lets the OS choose, so the test never collides with a real service.
+    fn free_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// Two real nodes, real libp2p over loopback TCP, real gossip.
+    ///
+    /// The follower runs the production [`run_network`] task, so a pass covers
+    /// the whole path: swarm delivery, `decode_block`, the out-of-order buffer,
+    /// `apply_buffered`, and `RpcState::accept_block` with its full
+    /// re-validation. Blocks are re-published until the follower catches up,
+    /// which makes the test independent of when the gossip mesh forms; duplicate
+    /// heights are dropped by the follower rather than applied twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_nodes_exchange_blocks_over_real_gossip() {
+        let (producer, follower, sender) = chain_with_two_blocks();
+        let producer_port = free_loopback_port();
+        let follower_port = free_loopback_port();
+
+        let (manager, handle) = NetworkManager::new(NetworkConfig {
+            listen_addr: format!("/ip4/127.0.0.1/tcp/{producer_port}"),
+            enable_mdns: false,
+            ..NetworkConfig::default()
+        })
+        .unwrap();
+        let producer_task = tokio::spawn(manager.run());
+
+        let follower_task = tokio::spawn(run_network(
+            follower.clone(),
+            NetworkConfig {
+                listen_addr: format!("/ip4/127.0.0.1/tcp/{follower_port}"),
+                bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/{producer_port}")],
+                enable_mdns: false,
+                ..NetworkConfig::default()
+            },
+        ));
+
+        let first = producer.block_at_height(1).unwrap();
+        let second = producer.block_at_height(2).unwrap();
+
+        let mut caught_up = false;
+        for _ in 0..100 {
+            // Newest first: the follower must buffer height 2 until height 1
+            // arrives, then apply both.
+            for block in [&second, &first] {
+                let message = NetworkMessage::BlockProposal { data: encode_block(block) };
+                if handle.outbound.send(message).await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if follower.block_height() == 2 {
+                caught_up = true;
+                break;
+            }
+        }
+
+        assert!(
+            caught_up,
+            "the follower never applied both blocks; it is at height {}",
+            follower.block_height()
+        );
+        assert_eq!(follower.block_at_height(2).unwrap().hash(), second.hash());
+        assert_eq!(follower.state_root(), producer.state_root());
+        assert_eq!(follower.balance(&sender), producer.balance(&sender));
+        for block in [&first, &second] {
+            for tx in &block.transactions {
+                assert!(
+                    follower.receipt(&tx.hash()).is_some(),
+                    "the follower did not derive a receipt for {}",
+                    tx.hash()
+                );
+            }
+        }
+
+        follower_task.abort();
+        producer_task.abort();
+    }
 }

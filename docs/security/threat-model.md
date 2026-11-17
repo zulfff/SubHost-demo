@@ -146,7 +146,8 @@ Creating many fake identities to gain disproportionate influence.
 
 **Mitigation**:
 - Proof of stake: influence requires capital, not just identities
-- Minimum stake requirements (10,000 SUB)
+- Minimum stake requirements (10,000,000 SUB, the `MIN_VALIDATOR_STAKE`
+  constant)
 - Validator caps per entity
 
 **Detection**: On-chain stake analysis

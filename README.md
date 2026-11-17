@@ -28,7 +28,7 @@ with a single-signer light client, and an in-process BFT agreement driver.
 
 This is not a production network. Block production belongs to whichever node
 receives the transaction, and there is no fork choice, view change, or leader
-rotation. Run two producers over one chain and they fork instead of converging.
+rotation. Two producers that seal at the same height fork instead of converging.
 The table below lists what each crate does today, and nothing in this repository
 should be treated as production ready.
 
@@ -58,8 +58,8 @@ Not implemented anywhere in this repository: EVM execution, WASM contracts, zk
 proofs, on-chain governance, a Merkle Patricia Trie, erasure-coded storage, or a
 threshold-encrypted mempool. The network also lacks fork choice, reorg handling,
 block sync/backfill, peer scoring, and any multi-validator light-client
-verification. Two block producers on one chain will fork, because nothing
-arbitrates between competing tips.
+verification. Two block producers that seal at the same height will fork, because
+nothing arbitrates between competing tips.
 
 ---
 

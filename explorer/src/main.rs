@@ -148,7 +148,9 @@ impl ExplorerState {
             latest_hash: blocks.first().map(|block| block.hash.clone()).unwrap_or_default(),
             blocks,
             transactions,
-            updated_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
         })
     }
 

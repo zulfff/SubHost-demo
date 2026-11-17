@@ -473,10 +473,17 @@ impl RpcState {
                     block.header.height
                 )));
             }
+            let next_gas = gas_used.checked_add(tx.gas_limit).ok_or(RpcError::Internal)?;
+            if next_gas > block.header.gas_limit {
+                return Err(RpcError::BlockRejected(format!(
+                    "block {} uses more than its {} gas limit",
+                    block.header.height, block.header.gas_limit
+                )));
+            }
             candidate_state
                 .apply_transaction(tx)
                 .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
-            gas_used = gas_used.checked_add(tx.gas_limit).ok_or(RpcError::Internal)?;
+            gas_used = next_gas;
             hashes.push(tx.hash());
             commitments.push(receipt_commitment(
                 tx.hash(),
