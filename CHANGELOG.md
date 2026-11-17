@@ -256,6 +256,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Changed
 
+- **`subhost-rpc` is split into `state.rs`, `block.rs`, and `methods.rs`.** `lib.rs`
+  now holds only crate docs and re-exports. No behaviour changed: the same 24 unit
+  tests and 3 integration tests pass, and the gas-limit check from `cb062c0` lives
+  in `block.rs`.
 - **The block producer no longer rolls back by re-inserting evicted transactions.**
   Admission, replacement, eviction, and sealing all happen on a pool clone; the
   live pool is swapped only after the ledger write succeeds, so a failed commit
