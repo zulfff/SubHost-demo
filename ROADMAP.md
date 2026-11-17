@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `db308ca` · S0.1–S0.3 and S4.1 merged · S1.1 in review · `Q-001` agreed
+Status: 2026-11-18 · baseline `main` = `7475850` · S0.1–S0.3 and S4.1 merged · S4.2 in review · `Q-001` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -15,7 +15,7 @@ editing the same files.
 | Block auth | `BlockHeader.validator` is `Address::ZERO` and `Block.signatures` is empty on produced blocks. `accept_block` does not check who produced a block. |
 | Consensus | `subhost-consensus` has a tested in-process `2f+1` driver (`propose`, `receive_proposal`, `receive_vote`, commit). **No crate depends on it**; the node never calls it. |
 | Networking | libp2p gossip publishes only locally sealed blocks. Messages for votes, DAG vertices and transactions are already defined but unused by the node. No block sync, peer scoring, per-peer limits, or tx gossip. |
-| Storage | `ledger/manifest.json` + append-only `ledger/segments/NNNNNN.log` + `ledger/snapshot-<height>.bin`; v2 `node-state.bin` still read and migrated on first write. No pruning, no CLI migration tool, and loading still reads the full history. |
+| Storage | `ledger/manifest.json` + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks); v2 `node-state.bin` still read and migrated on first write. No pruning, no CLI migration tool, and loading still reads every segment byte. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
 | RPC | 11 methods, no auth, no TLS, no rate limit. RPC counters in the metrics registry are never incremented. |
 | Mempool | In memory only; fixed gas price 1. |
@@ -272,10 +272,15 @@ it is no longer true.
 - Each segment: magic, version, length, BLAKE3 checksum, records; fsync per append.
 - Manifest: chain id, format version, segment list, last height/hash.
 
-**S4.2 Snapshot**
-- Periodic `snapshot-<height>.bin` = serialized state + last block + receipt index.
-- Load = newest snapshot + replay of trailing segments.
-- Snapshot written to a temp file, fsynced, renamed.
+**S4.2 Periodic snapshots**
+- `snapshot-<height>.bin` = serialized account state, written on the first persist
+  and then every 1024 blocks, not at every commit; the previous snapshot is kept
+  until the next commit.
+- Load = newest snapshot + replay of the trailing blocks; the snapshot's state root
+  must match the block at its own height.
+- Snapshot written to a temp file, fsynced, renamed, then committed by the manifest.
+- Not done here: the snapshot carries no receipt index, and segments are still read
+  in full on start-up. Both belong with retention in S4.3.
 
 **S4.3 Pruning**
 - Retain the last `N` segments and the newest snapshot; refuse to prune below the
@@ -292,8 +297,9 @@ it is no longer true.
 - Crash between snapshot rename and manifest update.
 - Migration interrupted, then re-run.
 
-**Exit criteria:** a chain larger than 64 MiB loads in bounded time, and a corrupt
-tail never prevents start-up from the last good snapshot.
+**Exit criteria:** state is no longer rewritten at every commit, and a corrupt tail
+never prevents start-up from the last good snapshot. Bounded start-up time for a
+chain larger than 64 MiB needs the retention work in S4.3.
 
 ### S5 — RPC security and method gaps (Track B)
 
