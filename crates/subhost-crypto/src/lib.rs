@@ -255,12 +255,17 @@ impl SymmetricEncryption {
     }
 
     pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        let cipher = ChaCha20Poly1305::new(
+            &Key::try_from(&key[..]).map_err(|_| CryptoError::EncryptionFailed)?,
+        );
         let mut nonce_bytes = [0u8; AEAD_NONCE_BYTES];
         rand::fill(&mut nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .encrypt(
+                &Nonce::try_from(&nonce_bytes[..]).map_err(|_| CryptoError::EncryptionFailed)?,
+                plaintext,
+            )
             .map_err(|_| CryptoError::EncryptionFailed)?;
 
         let mut output = Vec::with_capacity(AEAD_NONCE_BYTES + ciphertext.len());
@@ -275,8 +280,8 @@ impl SymmetricEncryption {
             return Err(CryptoError::InvalidCiphertext);
         }
         let (nonce, body) = ciphertext.split_at(AEAD_NONCE_BYTES);
-        ChaCha20Poly1305::new(Key::from_slice(key))
-            .decrypt(Nonce::from_slice(nonce), body)
+        ChaCha20Poly1305::new(&Key::try_from(&key[..]).map_err(|_| CryptoError::DecryptionFailed)?)
+            .decrypt(&Nonce::try_from(nonce).map_err(|_| CryptoError::DecryptionFailed)?, body)
             .map_err(|_| CryptoError::DecryptionFailed)
     }
 }
