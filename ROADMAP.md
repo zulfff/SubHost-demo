@@ -233,6 +233,17 @@ latest voting state when restoring backups. See `docs/consensus.md` and
 - Do not relay votes for a view you have not seen.
 
 **S2.3 Commit path** (`subhost-rpc/src/block.rs`)
+
+Platform CLI consumer (Q-014): `--single-writer` and optional positive
+`--view-timeout-ms` map to the published node configuration contract. CLI startup
+rejects unsigned mode unless explicitly selected and rejects unsigned selection
+for validator genesis before invoking node bootstrap. Demo scripts and the
+Compose command carry the explicit demo flag. Authoritative node policy,
+phased timeout behavior and the standard-BLS public rollout remain S2.4b work.
+The Compose stack still requires the documented authenticated non-loopback RPC
+configuration; container runtime verification is part of the release/deployment
+stage rather than this CLI consumer change.
+
 - Rename the direct path to `commit_qc(block, qc)`; it verifies the QC before
   persisting. Remove the unauthenticated "submit and commit" path from validator
   mode, keep it behind an explicit `--single-writer` flag for demos/bench.

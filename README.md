@@ -83,7 +83,7 @@ cargo build -p subhost-cli
   --alloc 0x1111111111111111111111111111111111111111=1000000
 
 # Run the node.
-./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
+./target/debug/subhost node --single-writer --listen 127.0.0.1:8545 --data-dir ./data
 ```
 
 In another terminal:
@@ -103,7 +103,7 @@ real `~/.subhost` is never touched:
 cargo build -p subhost-cli
 scripts/two-user-setup.sh          # creates Alice and Bob, writes genesis
 # then, following the printed instructions:
-./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir /tmp/subhost-demo-data.XXXX
+./target/debug/subhost node --single-writer --listen 127.0.0.1:8545 --data-dir /tmp/subhost-demo-data.XXXX
 source /tmp/subhost-two-users-current.env && scripts/user1-alice.sh
 source /tmp/subhost-two-users-current.env && scripts/user2-bob.sh
 ```
@@ -135,7 +135,7 @@ subhost init --chain-id 1 --data-dir ./data \
   [--producer-key-file PATH]
 
 subhost node --listen 127.0.0.1:8545 --data-dir ./data \
-  [--validator [--producer-key-file PATH]] \
+  [--single-writer | --validator [--producer-key-file PATH]] [--view-timeout-ms N] \
   [--metrics-addr 127.0.0.1:9090] [--max-connections 1000] \
   [--rpc-auth-token-file PATH] [--rpc-rate-limit N] [--rpc-allow-public] \
   [--p2p-listen /ip4/0.0.0.0/tcp/30333 [--bootstrap-peer MULTIADDR] [--no-mdns] [--max-peers 50]]
@@ -159,6 +159,12 @@ subhost query chain
 Wallets live in `$SUBHOST_HOME/wallets` (default `~/.subhost/wallets`). The CLI
 queries `--nonce` and `--chain-id` from the node when you omit them. `--verbose`
 and `--quiet` control log level; `RUST_LOG` overrides both.
+
+Unsigned demo chains require `node --single-writer`. A genesis with validators
+uses consensus mode: `--validator` selects a registered local signing identity,
+and omitting it runs an observer. `--single-writer` is refused for a validator
+genesis. `--view-timeout-ms` must be positive; its default comes from the node
+configuration (2000 ms).
 
 `node --validator` is a validator node. It requires a genesis whose validator entries
 each carry a proof of possession, and it reads `<data-dir>/producer.key`: one

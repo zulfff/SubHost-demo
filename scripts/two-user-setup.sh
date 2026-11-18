@@ -60,7 +60,7 @@ Setup complete. The environment file below holds addresses only, no private keys
   source '$DEMO_ENV'
 
 Start the node:
-  '$SUBHOST_BIN' node --listen 127.0.0.1:8545 --data-dir '$DEMO_DATA'
+  '$SUBHOST_BIN' node --single-writer --listen 127.0.0.1:8545 --data-dir '$DEMO_DATA'
 
 Then, in two more terminals:
   source '$DEMO_ENV' && '$ROOT_DIR/scripts/user1-alice.sh'

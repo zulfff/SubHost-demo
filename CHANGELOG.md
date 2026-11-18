@@ -14,6 +14,11 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **Unsigned CLI demos require `--single-writer`.** The CLI refuses ambiguous
+  unsigned startup and rejects that flag for validator genesis. Validator and
+  observer modes remain normal consensus consumers. `--view-timeout-ms` accepts
+  positive values and retains the node-owned default when omitted (Q-014).
+
 - **Validator submissions return before commitment.** With a genesis validator
   set, a transaction hash precedes its receipt; clients must poll until a QC
   commits the block. Proposal/vote gossip gains view and signer fields, and

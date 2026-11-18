@@ -34,7 +34,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"$SUBHOST_BIN" node --listen "127.0.0.1:$RPC_PORT" --data-dir "$DEMO_DATA" &
+"$SUBHOST_BIN" node --single-writer --listen "127.0.0.1:$RPC_PORT" --data-dir "$DEMO_DATA" &
 NODE_PID=$!
 
 # Poll until the node answers, failing fast if it exited instead.
