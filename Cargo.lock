@@ -4039,6 +4039,7 @@ dependencies = [
  "subhost-core",
  "subhost-crypto",
  "subhost-mempool",
+ "subhost-metrics",
  "subhost-state",
  "subhost-storage",
  "subtle",

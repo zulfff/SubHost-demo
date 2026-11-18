@@ -14,6 +14,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **RPC metrics now carry a `method` label.** The request/error counters and
+  duration histogram keep their names, but unlabelled exposition consumers must
+  be updated. Legacy recording methods retain their Rust signatures and record
+  under `unattributed`.
 - **`ValidatorInfo` gained `proof_of_possession`.** Rust code that constructs the
   struct literally must set the field. JSON genesis files written without it still
   deserialize because the field is `#[serde(default)]`.
@@ -193,6 +197,13 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Opt-in JSON-RPC call metrics.** `RpcServer::with_metrics` records completed
+  HTTP/WebSocket calls, individual batch entries, RPC errors and execution
+  duration into a supplied exporter registry. Labels use registered method names
+  and one `unknown` fallback; caller strings never create time series. Tests
+  cover invalid parameters, batch errors, label cardinality, registry isolation
+  and transport rejections that bypass call metrics. The bundled node's registry
+  wiring follows this S5.3a contract; see `docs/operations/rpc-metrics.md`.
 - **Storage crash recovery coverage and an offline backup/restore runbook.**
   Eight new failure-path tests cover interrupted record headers and payloads,
   failed snapshot writes, damaged orphan segments/snapshots, migration before and

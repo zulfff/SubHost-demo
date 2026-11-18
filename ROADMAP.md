@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `96f0cd2` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.4 and S5.1a merged · S4.5 in review · `Q-001`–`Q-009` agreed
+Status: 2026-11-18 · baseline `main` = `0c81993` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5 and S5.1a merged · S5.3a in review · `Q-001`–`Q-010` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -275,7 +275,7 @@ it is no longer true.
 | Task | Status |
 | --- | --- |
 | S4.1–S4.4 | Merged |
-| S4.5 | In review on `s4/storage-failure-tests` |
+| S4.5 | Merged |
 
 **S4.1 Segmented log**
 - `node-state.bin` becomes `ledger/manifest.json` + `segments/000001.log`…
@@ -330,6 +330,13 @@ start-up time remains proportional to retained history even after pruning (S4.3)
 
 ### S5 — RPC security and method gaps (Track B)
 
+| Task | Status |
+| --- | --- |
+| S5.1a | Merged |
+| S5.2 | In progress on the separate `s5/rpc-methods` branch |
+| S5.3a | Server middleware and registry API contract in review on `s5/rpc-metrics` |
+| S5.3b | Node registry wiring pending the S5.3a contract landing (Track A) |
+
 **S5.1 Auth and transport** *(S5.1a shipped; S5.1b TLS posture is a documented
 reverse-proxy mode)*
 - Shipped: bearer token (`--rpc-auth-token-file` / `SUBHOST_RPC_AUTH_TOKEN_FILE`),
@@ -353,9 +360,17 @@ reverse-proxy mode)*
 - Full JSON-RPC 2.0 error-code conformance test matrix.
 
 **S5.3 Metrics**
-- Increment `subhost_rpc_requests_total`, `subhost_rpc_errors_total`, and the
-  duration histogram (currently defined but always zero).
-- Label by method only, never by caller input.
+- S5.3a implements opt-in `RpcServer::with_metrics(Metrics) -> Self` and RPC
+  middleware for completed decoded calls over HTTP/WebSocket, including individual
+  batch entries, errors and execution duration. Existing metric names gain a
+  `method` label; known names come from the module registry and arbitrary names
+  share `unknown`. Legacy recorder APIs use `unattributed`.
+- S5.3b must pass the node's existing metrics handle into the server after the
+  contract lands. Until then the bundled node's RPC counters still remain zero;
+  this stage is not complete. No node/state/block source is changed by S5.3a.
+- Notifications, malformed requests, guard/limit rejections and cancelled calls
+  bypass completion metrics; transport-level instrumentation remains S8 work.
+- Relevant doc: `docs/operations/rpc-metrics.md`.
 
 **Exit criteria:** an unauthenticated caller cannot reach a state-changing method;
 the metrics match a request-count test.

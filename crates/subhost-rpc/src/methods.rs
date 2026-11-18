@@ -1,16 +1,19 @@
 //! JSON-RPC surface: parameter parsing, response shaping, and method routing.
 
+use crate::observability::RpcMetricsLayer;
 use crate::security::{
     check_bind_policy, BindPolicyError, RpcGuardLayer, RpcSecurityConfig, SecurityError,
 };
 use crate::state::{RpcError, RpcState};
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
+use jsonrpsee::server::middleware::rpc::RpcServiceBuilder;
 use jsonrpsee::server::{BatchRequestConfig, RpcModule, Server, ServerHandle};
 use std::net::SocketAddr;
 use subhost_core::{
     Address, Amount, Block, ChainId, Gas, Hash, Receipt, Transaction, TransactionSignature,
     TransactionType,
 };
+use subhost_metrics::Metrics;
 use tracing::info;
 
 /// Largest JSON-RPC request body accepted.
@@ -262,11 +265,22 @@ impl Default for RpcServerConfig {
 #[derive(Clone)]
 pub struct RpcServer {
     state: RpcState,
+    metrics: Option<Metrics>,
 }
 
 impl RpcServer {
     pub fn new(state: RpcState) -> Self {
-        Self { state }
+        Self { state, metrics: None }
+    }
+
+    /// Record completed decoded calls in the supplied metrics registry.
+    ///
+    /// Pass the node's existing registry so the exporter observes these values.
+    /// Labels use registered method names or `unknown`; malformed payloads,
+    /// notifications and HTTP guard rejections bypass call instrumentation.
+    pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     pub fn state(&self) -> &RpcState {
@@ -288,11 +302,18 @@ impl RpcServer {
         config.security.validate()?;
         check_bind_policy(config.listen_addr, &config.security)?;
 
+        let module = self.build_module()?;
+        let metrics_layer = self
+            .metrics
+            .clone()
+            .map(|metrics| RpcMetricsLayer::new(metrics, module.method_names()));
+
         let server = Server::builder()
             .max_connections(config.max_connections.max(1))
             .max_request_body_size(MAX_REQUEST_BODY_BYTES)
             .max_response_body_size(MAX_RESPONSE_BODY_BYTES)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUESTS))
+            .set_rpc_middleware(RpcServiceBuilder::new().option_layer(metrics_layer))
             .set_http_middleware(
                 tower::ServiceBuilder::new().layer(RpcGuardLayer::new(&config.security)),
             )
@@ -303,7 +324,7 @@ impl RpcServer {
         let addr = server
             .local_addr()
             .map_err(|source| RpcServeError::Bind { addr: config.listen_addr, source })?;
-        let handle = server.start(self.build_module()?);
+        let handle = server.start(module);
 
         info!(
             %addr,
