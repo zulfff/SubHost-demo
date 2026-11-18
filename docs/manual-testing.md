@@ -423,3 +423,23 @@ That only removes the `/tmp` directories created above.
 - `cannot reach the node at …`: the node is not running on that port.
 - `a validator network requires at least one initial validator`: `node
   --validator` needs `init --validator`.
+
+## Validator quorum checks (S2)
+
+On a genesis containing validators, a successful submission returns a hash before
+its receipt exists. Poll `eth_getTransactionReceipt` until a QC commits the block;
+`eth_blockNumber` and balances stay unchanged while quorum is absent. Submit to a
+node with its producer key: transaction gossip is not implemented.
+
+For a four-validator set, three distinct valid votes commit; two votes leave the
+ledger unchanged. Two- and three-validator sets require all their validators,
+rather than a single signer. Run the node's loopback regression to exercise real
+proposal → vote → commit delivery:
+
+```sh
+cargo test -p subhost-node two_validators_commit_over_real_loopback_gossip
+```
+
+See [consensus wiring and limitations](consensus.md) before running a devnet.
+Timeout/view change and durable unfinished vote recovery remain pending; this
+slice does not establish production finality or long-offline catch-up.

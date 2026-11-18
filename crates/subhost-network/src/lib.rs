@@ -93,10 +93,19 @@ pub enum NetworkMessage {
     TransactionFluff { tx_hash: [u8; 32], data: Vec<u8> },
     /// A serialized DAG vertex.
     DagVertex { data: Vec<u8> },
-    /// A serialized block proposal.
-    BlockProposal { data: Vec<u8> },
-    /// A vote for a block hash.
-    Vote { block_hash: [u8; 32], signature: Vec<u8> },
+    /// A block proposal for one consensus view.
+    ///
+    /// `data` is the canonical block encoding; `view` lets a driver reject a
+    /// proposal that is not the next view before it spends time decoding.
+    BlockProposal { view: u64, data: Vec<u8> },
+    /// One validator's vote for a block in a view.
+    ///
+    /// `validator` is the 20-byte address the signature belongs to. Without it a
+    /// receiver cannot tell which registered key to verify against, and `view`
+    /// binds the vote to one proposal.
+    Vote { view: u64, validator: [u8; 20], block_hash: [u8; 32], signature: Vec<u8> },
+    /// A committed block and its independently verifiable quorum certificate.
+    BlockCommit { view: u64, data: Vec<u8>, signatures: Vec<([u8; 20], Vec<u8>)> },
 }
 
 impl NetworkMessage {
@@ -110,7 +119,22 @@ impl NetworkMessage {
                 data.len()
             }
             Self::TransactionFluff { data, .. } => data.len(),
-            Self::DagVertex { data } | Self::BlockProposal { data } => data.len(),
+            Self::DagVertex { data } | Self::BlockProposal { data, .. } => data.len(),
+            Self::BlockCommit { data, signatures, .. } => {
+                if data.is_empty() || signatures.is_empty() {
+                    return Err(NetworkError::InvalidMessage("empty block or certificate".into()));
+                }
+                signatures.iter().try_fold(data.len(), |size, (_, signature)| {
+                    if signature.len() != 96 {
+                        return Err(NetworkError::InvalidMessage(
+                            "malformed certificate signature".into(),
+                        ));
+                    }
+                    size.checked_add(20 + signature.len()).ok_or_else(|| {
+                        NetworkError::InvalidMessage("certificate size overflow".into())
+                    })
+                })?
+            }
             Self::Vote { signature, .. } => signature.len(),
         };
         if payload_len == 0 {
@@ -408,10 +432,22 @@ mod tests {
     }
 
     #[test]
+    fn certificate_messages_require_a_bounded_nonempty_signature_list() {
+        for (data, signatures) in [
+            (Vec::new(), vec![([1; 20], vec![2; 96])]),
+            (vec![1], Vec::new()),
+            (vec![1], vec![([1; 20], vec![2; 95])]),
+            (vec![1; MAX_TRANSMIT_BYTES], vec![([1; 20], vec![2; 96])]),
+        ] {
+            assert!(NetworkMessage::BlockCommit { view: 1, data, signatures }.validate().is_err());
+        }
+    }
+
+    #[test]
     fn message_validation_rejects_empty_oversized_and_exhausted_payloads() {
         assert!(NetworkMessage::DagVertex { data: vec![1] }.validate().is_ok());
         assert!(NetworkMessage::DagVertex { data: Vec::new() }.validate().is_err());
-        assert!(NetworkMessage::BlockProposal { data: vec![0; MAX_TRANSMIT_BYTES + 1] }
+        assert!(NetworkMessage::BlockProposal { view: 1, data: vec![0; MAX_TRANSMIT_BYTES + 1] }
             .validate()
             .is_err());
 
@@ -424,9 +460,14 @@ mod tests {
         assert!(NetworkMessage::TransactionFluff { tx_hash: [0; 32], data: vec![1] }
             .validate()
             .is_ok());
-        assert!(NetworkMessage::Vote { block_hash: [0; 32], signature: Vec::new() }
-            .validate()
-            .is_err());
+        assert!(NetworkMessage::Vote {
+            view: 1,
+            validator: [2; 20],
+            block_hash: [0; 32],
+            signature: Vec::new()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -435,8 +476,18 @@ mod tests {
             NetworkMessage::TransactionStem { data: vec![1, 2], ttl: 4 },
             NetworkMessage::TransactionFluff { tx_hash: [7; 32], data: vec![3] },
             NetworkMessage::DagVertex { data: vec![4] },
-            NetworkMessage::BlockProposal { data: vec![5] },
-            NetworkMessage::Vote { block_hash: [9; 32], signature: vec![6] },
+            NetworkMessage::BlockCommit {
+                view: 4,
+                data: vec![5],
+                signatures: vec![([8; 20], vec![6; 96])],
+            },
+            NetworkMessage::BlockProposal { view: 4, data: vec![5] },
+            NetworkMessage::Vote {
+                view: 4,
+                validator: [8; 20],
+                block_hash: [9; 32],
+                signature: vec![6],
+            },
         ];
         for message in messages {
             let encoded = serde_json::to_vec(&message).unwrap();
@@ -482,7 +533,7 @@ mod tests {
             NetworkManager::new(NetworkConfig { enable_mdns: false, ..Default::default() })
                 .unwrap();
 
-        let message = NetworkMessage::BlockProposal { data: vec![1, 2, 3] };
+        let message = NetworkMessage::BlockProposal { view: 1, data: vec![1, 2, 3] };
         manager.handle_gossip(&serde_json::to_vec(&message).unwrap());
         assert_eq!(handle.inbound.recv().await, Some(message));
 

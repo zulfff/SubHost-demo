@@ -14,6 +14,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **Validator submissions return before commitment.** With a genesis validator
+  set, a transaction hash precedes its receipt; clients must poll until a QC
+  commits the block. Proposal/vote gossip gains view and signer fields, and
+  certified-block gossip is new, so devnet peers must upgrade together.
 - **RPC metrics now carry a `method` label.** The request/error counters and
   duration histogram keep their names, but unlabelled exposition consumers must
   be updated. Legacy recording methods retain their Rust signatures and record
@@ -196,6 +200,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   with the monitoring configuration present.
 
 ### Added
+
+- **Validator consensus wiring (S2.1–S2.2 and the S2.3 commit API).** RPC admission
+  stays pending when genesis defines validators. Nodes exchange signed proposals,
+  votes and certified commits; `commit_qc` checks the certificate before the
+  ledger write. Observers verify without signing. A failed write retains the
+  certificate for retry and never advances the visible or driver tip. Quorums
+  require `n - f` validators, preventing single-signer commits for sets of two or
+  three. Demo chains without validators retain synchronous single-writer blocks.
+  Timeout/view change, durable unfinished votes/QCs, historical sync and the
+  explicit CLI single-writer flag remain deferred; see `docs/consensus.md`.
 
 - **Opt-in JSON-RPC call metrics.** `RpcServer::with_metrics` records completed
   HTTP/WebSocket calls, individual batch entries, RPC errors and execution

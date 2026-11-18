@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `0c81993` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5 and S5.1a merged · S5.3a in review · `Q-001`–`Q-010` agreed
+Status: 2026-11-18 · baseline `main` = `1043268` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5, S5.1a and S5.3a merged · S2.1–S2.2 and S2.3 QC API implemented on the S2 branch · `Q-001`–`Q-011` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -11,10 +11,10 @@ editing the same files.
 
 | Area | Reality |
 | --- | --- |
-| Chain | Single-writer node. One submission seals one block with every executable pending transaction. |
+| Chain | Validator deployments admit to the pool and commit with a QC. Demo chains without validators seal synchronously on submission. |
 | Block auth | A node with a configured authority signs each produced block with the validator's BLS key and verifies that signature on accept; a node without one still produces and accepts unsigned blocks. |
-| Consensus | `subhost-consensus` has a tested in-process `2f+1` driver (`propose`, `receive_proposal`, `receive_vote`, commit). **No crate depends on it**; the node never calls it. |
-| Networking | libp2p gossip publishes only locally sealed blocks. Messages for votes, DAG vertices and transactions are already defined but unused by the node. No block sync, peer scoring, per-peer limits, or tx gossip. |
+| Consensus | Node owns a linear `n - f` quorum driver restored at the ledger tip. Observers verify without voting. No timeout, view change, leader rotation or durable unfinished votes yet. |
+| Networking | libp2p relays proposals, verified votes and QC-certified next blocks; demo block gossip remains. No historical block sync, peer scoring, per-peer limits, or tx gossip. |
 | Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
 | RPC | 11 methods. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. RPC counters in the metrics registry are still never incremented. |
@@ -33,7 +33,7 @@ fixed or written down as an explicit, reviewed limitation.
 
 1. **Authenticated block production.** Every block carries a signature that verifies
    against the active validator set; an unregistered producer is rejected.
-2. **Consensus is live.** Blocks commit only after a `2f+1` quorum certificate. No
+2. **Consensus is live.** Blocks commit only after an `n - f` quorum certificate. No
    direct "RPC submit → commit" path remains in a validator deployment.
 3. **One chain under partition.** Fork choice plus block sync means two producers
    converge and an offline node catches up.
@@ -120,21 +120,21 @@ agent always sees the real state.
 
 ## 4. Stage index
 
-| Stage | Goal | Track | Depends on | Size |
-| --- | --- | --- | --- | --- |
-| S0 | Prepare `rpc` for parallel work | A | — | S |
-| S1 | Signed blocks and validator identity | A | S0 | M |
-| S2 | Wire the consensus driver into the node | A | S1 | L |
-| S3 | Fork choice, reorg, and block sync | A | S2 | L |
-| S4 | Segmented storage, snapshots, migration | B | — | L |
-| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M |
-| S6 | Durable mempool and fee market | B | S0 | M |
-| S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M |
-| S8 | Observability, health, runbooks | B | S0 | M |
-| S9 | Release engineering | B | S5 | M |
-| S10 | Execution layer (EVM or WASM) | C | S3 | XL |
-| S11 | IBC production light client + relayer | C | — | L |
-| S12 | External audit and public testnet soak | all | S1–S9 | XL |
+| Stage | Goal | Track | Depends on | Size | Status |
+| --- | --- | --- | --- | --- | --- |
+| S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
+| S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
+| S2 | Wire the consensus driver into the node | A | S1 | L | Partial: S2.1–S2.2 and QC API; timeout/CLI pending |
+| S3 | Fork choice, reorg, and block sync | A | S2 | L | Planned |
+| S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
+| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a merged |
+| S6 | Durable mempool and fee market | B | S0 | M | Planned |
+| S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
+| S8 | Observability, health, runbooks | B | S0 | M | Planned |
+| S9 | Release engineering | B | S5 | M | Planned |
+| S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
+| S11 | IBC production light client + relayer | C | — | L | Planned |
+| S12 | External audit and public testnet soak | all | S1–S9 | XL | Planned |
 
 Size is relative effort, not calendar time. S10 alone is larger than S0–S9 combined.
 
@@ -210,6 +210,13 @@ cannot load quietly.
 rejected by every other node; the ledger still replays.
 
 ### S2 — Wire the consensus driver into the node (Track A)
+
+**Status:** S2.1–S2.2 and the S2.3 QC commit API implemented on
+`s2/consensus-driver-ownership`. The stage remains incomplete: S2.4 timeout/view
+change, durable unfinished vote recovery, the explicit S2.3 `--single-writer` CLI
+policy, and the S2.5 timeout assertions are deferred. QCs remain in memory and are
+not authenticated on ledger replay until S3.4 supplies the persisted format.
+Concurrent proposals can stall. See `docs/consensus.md`; this is not production BFT.
 
 **S2.1 Driver ownership** (`subhost-node/src/lib.rs`)
 - `Node` holds a `ConsensusDriver` built from the genesis set and its identity.

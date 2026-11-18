@@ -45,11 +45,13 @@ because the peer address is not exposed to the middleware.
 using a password taken from the request body. The explorer refuses to bind to a
 non-loopback address for that reason. Do not expose it.
 
-**No consensus in the node.** Block production still comes from whichever node
-receives the transaction, even though `subhost-consensus` contains a tested
-in-process `2f + 1` driver. There is no fork choice, no reorg handling, no block
-sync, and no leader rotation. A produced block is signed by the configured producer
-and is only accepted by a node that has the same genesis validator set.
+**Validator consensus is a prototype linear quorum driver.** With a genesis
+validator set, RPC submissions remain pending and only a verified `n - f` QC can
+commit a block. There is no timeout, view change, leader rotation, historical sync
+or reorg. Unfinished votes are not durable across restarts, and historical QCs are
+not stored/authenticated by ledger replay. Concurrent proposals can stall. This
+slice must not be treated as production BFT or a finality guarantee. Demo chains
+without validators still seal synchronously. See `docs/consensus.md`.
 
 **The producer key is an unencrypted file.** `<data_dir>/producer.key` holds one
 hex-encoded 32-byte BLS scalar with mode `0600`, and the node refuses to load it if
@@ -58,11 +60,11 @@ so anyone who copies the file can produce blocks as that validator. That is
 acceptable for a testnet and not for production; `ROADMAP.md` S9.6 replaces it with
 an encrypted keystore. Back the file up as carefully as the identity it represents.
 
-**Block gossip is best-effort and unauthenticated beyond libp2p.** With
-`--p2p-listen`, a node publishes blocks it sealed and applies peer blocks that
-extend its tip. There is no peer scoring, no rate limiting per peer, and no way to
-request a missed block: a node that was offline cannot catch up. Two producers at
-the same height fork permanently.
+**Gossip has no historical catch-up or peer scoring.** Validator nodes exchange
+producer-authenticated proposals, verified votes and QC-certified next blocks.
+Demo chains without validators accept unsigned blocks. There is no per-peer rate
+limit or request for a missed range, so an offline node cannot catch up across a
+history gap. Gossip retransmission is best effort.
 
 **BLS hash-to-curve is non-standard.** `subhost-crypto` uses a domain-separated,
 length-prefixed hash-and-multiply onto the prime-order G2 subgroup, not an RFC 9380
@@ -134,7 +136,7 @@ A regression in any of these is a genuine vulnerability and worth reporting.
 - Quorum certificates are accepted only when the required number of distinct,
   registered validators each contribute a signature that verifies over a payload
   binding both the view and the block hash.
-- The consensus driver commits only on a `2f + 1` quorum for one proposal, counts
+- The consensus driver commits only on an `n - f` quorum for one proposal, counts
   each validator once per view, and refuses a proposal that does not extend the
   committed tip by exactly one height.
 - Merkle leaves, internal nodes, and padding use separate domain tags, so a leaf
