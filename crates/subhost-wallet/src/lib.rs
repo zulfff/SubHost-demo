@@ -246,7 +246,10 @@ fn encrypt_private_key(
     key.zeroize();
 
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce_bytes), secret.as_slice())
+        .encrypt(
+            &Nonce::try_from(&nonce_bytes[..]).map_err(|_| WalletError::EncryptionFailed)?,
+            secret.as_slice(),
+        )
         .map_err(|_| WalletError::EncryptionFailed)?;
 
     Ok(EncryptedKey { ciphertext, salt: salt.to_vec(), nonce: nonce_bytes.to_vec(), kdf })
@@ -266,7 +269,11 @@ fn decrypt_private_key(
     key.zeroize();
 
     let mut plaintext = cipher
-        .decrypt(Nonce::from_slice(&encrypted.nonce), encrypted.ciphertext.as_slice())
+        .decrypt(
+            &Nonce::try_from(encrypted.nonce.as_slice())
+                .map_err(|_| WalletError::DecryptionFailed)?,
+            encrypted.ciphertext.as_slice(),
+        )
         .map_err(|_| WalletError::DecryptionFailed)?;
 
     let secret: Result<[u8; SECRET_KEY_BYTES], _> = plaintext.as_slice().try_into();
