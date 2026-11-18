@@ -102,7 +102,7 @@ impl Wallet {
     /// Create a wallet around a freshly generated key.
     pub fn new(password: &str) -> Result<Self, WalletError> {
         let mut secret = [0u8; SECRET_KEY_BYTES];
-        rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut secret);
+        rand::fill(&mut secret);
         let wallet = Self::from_secret(&secret, password);
         secret.zeroize();
         wallet
@@ -235,11 +235,10 @@ fn encrypt_private_key(
     password: &str,
     kdf: KdfParams,
 ) -> Result<EncryptedKey, WalletError> {
-    let mut rng = rand::thread_rng();
     let mut salt = [0u8; SALT_BYTES];
-    rand::RngCore::fill_bytes(&mut rng, &mut salt);
+    rand::fill(&mut salt);
     let mut nonce_bytes = [0u8; NONCE_BYTES];
-    rand::RngCore::fill_bytes(&mut rng, &mut nonce_bytes);
+    rand::fill(&mut nonce_bytes);
 
     let mut key = derive_encryption_key(password, &salt, kdf)?;
     let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| WalletError::EncryptionFailed)?;
