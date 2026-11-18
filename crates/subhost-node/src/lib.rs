@@ -63,6 +63,10 @@ pub struct NodeConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Whether this node intends to validate, which requires a validator set.
     pub validator: bool,
+    /// Explicit unsigned single-writer demo mode; incompatible with validators.
+    pub single_writer: bool,
+    /// Base consensus view timeout in milliseconds; must be nonzero.
+    pub view_timeout_ms: u64,
     /// Producer key file to sign blocks with. `None` means
     /// `<data_dir>/producer.key` when `validator` is set, and no signing
     /// identity otherwise.
@@ -83,6 +87,8 @@ impl NodeConfig {
             rpc_security: RpcSecurityConfig::default(),
             metrics_addr: None,
             validator: false,
+            single_writer: false,
+            view_timeout_ms: 2_000,
             producer_key_file: None,
             fallback_chain_id: 1,
             network: None,
