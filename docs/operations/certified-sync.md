@@ -5,6 +5,15 @@ and replays the authenticated history over the existing P2P transport. A fresh
 node with the same genesis can receive old blocks without a manual snapshot.
 Each block goes through normal QC, producer, execution and node-journal checks.
 
+This deployment requires the corrected RFC 9380 BLS suite. The old scalar-hash
+construction permitted signatures to be forged from public genesis possession
+proofs. Upgrade to a freshly generated validator genesis and preserve old data
+separately; legacy proofs and signatures are refused without a fallback.
+Archive records bind to the exact new genesis. This stable prototype uses the
+linear QC contract where certificate view equals block height. Phased
+final-commit certificates and independent timeout views require a coordinated
+future node/relay upgrade; they are not enabled by this relay.
+
 Build the compatible node and relay together:
 
 ```sh
@@ -69,3 +78,6 @@ and production finality remain separate protocol work.
 Verification covers invalid/insufficient QCs, tampered execution, corruption,
 wrong genesis, exclusive-writer locking, capacity failure, out-of-order blocks,
 archive restart and a real P2P observer backfilling 100 certified blocks.
+The corrected suite must also pass official RFC vectors and the consumer's
+public-possession-proof forgery regression. Cancelling a relay aborts its owned
+network task and releases its listener.

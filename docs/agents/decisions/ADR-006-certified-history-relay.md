@@ -40,6 +40,13 @@ timeout/view change and leader rotation remain Track A protocol work. Voting
 journals still may not be rolled back to bypass newer signing obligations.
 The relay does not establish production finality or a multi-host testnet soak.
 
+The public prototype consumes isolated corrected crypto commit `c7b8aa9`:
+RFC 9380 BLS with official vectors and public-PoP forgery rejection. Fresh
+genesis possession proofs change the archive binding; old proofs/signatures
+are refused without a compatibility verifier. The stable linear QC contract
+still requires view equal to height. The agreed phased-QC/context consumer is
+prepared separately and requires its own tested Protocol revision and rollout.
+
 ## Evidence
 
 - https://github.com/cometbft/cometbft/blob/main/blocksync/reactor.go — verifies

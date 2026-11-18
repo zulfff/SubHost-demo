@@ -201,6 +201,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Corrected BLS authentication for the testnet.** RFC 9380 G2 hashing replaces
+  the scalar-hash construction that allowed arbitrary signatures to be rescaled
+  from public possession proofs. Official curve vectors and direct forgery
+  regressions cover the suite; the relay also rejects manufactured historical
+  quorum evidence. Upgrade with fresh genesis proofs, preserve legacy data and
+  do not enable a legacy verifier. Phased timeout/leader consensus remains
+  separate from this corrected stable-API prototype.
+
 - **Automatic certified-history replay.** The optional `sync-relay` Platform
   example records genesis-bound, checksummed block/QC pairs after quorum and
   full execution validation, then replays them over existing P2P for fresh or

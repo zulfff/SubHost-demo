@@ -218,6 +218,47 @@ fn out_of_order_certificates_wait_for_a_verified_parent() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aborting_the_relay_releases_its_network_listener() {
+    let fixture = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let archive = History::open(dir.path(), &fixture.genesis, 1_000_000).unwrap();
+    let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let task = tokio::spawn(relay(
+        archive,
+        NetworkConfig {
+            listen_addr: format!("/ip4/127.0.0.1/tcp/{}", address.port()),
+            bootstrap_peers: Vec::new(),
+            enable_mdns: false,
+            ..Default::default()
+        },
+        Duration::from_millis(50),
+        std::future::pending(),
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while tokio::net::TcpStream::connect(address).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let listener = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(listener) = TcpListener::bind(address) {
+                break listener;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborting a relay must not detach its networking task");
+    drop(listener);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_node_automatically_backfills_one_hundred_certified_blocks_over_p2p() {
     let fixture = Fixture::new();
     let archive_dir = tempfile::tempdir().unwrap();

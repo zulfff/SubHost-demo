@@ -27,6 +27,14 @@ struct Options {
     max_history_bytes: u64,
 }
 
+struct AbortNetworkOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortNetworkOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn relay(
     mut history: History,
     config: NetworkConfig,
@@ -35,6 +43,7 @@ async fn relay(
 ) -> Result<()> {
     let (manager, mut handle) = NetworkManager::new(config)?;
     let mut network = tokio::spawn(manager.run());
+    let _network_cleanup = AbortNetworkOnDrop(network.abort_handle());
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cursor = 0;

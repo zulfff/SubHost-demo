@@ -211,16 +211,21 @@ impl RpcState {
         self
     }
 
-    pub fn consensus_context(&self) -> Hash { self.consensus_context }
+    pub fn consensus_context(&self) -> Hash {
+        self.consensus_context
+    }
 
     /// Latest verified final-QC view. None means restored certificate evidence
     /// is still missing; block height is never treated as a verified view.
     pub fn committed_view(&self) -> Option<u64> {
-        self.verified_view.load(Ordering::SeqCst)
+        self.verified_view
+            .load(Ordering::SeqCst)
             .then(|| self.committed_view.load(Ordering::SeqCst))
     }
 
-    pub fn proposal_bytes_limit(&self) -> Option<usize> { self.proposal_bytes_limit }
+    pub fn proposal_bytes_limit(&self) -> Option<usize> {
+        self.proposal_bytes_limit
+    }
 
     pub fn chain_id(&self) -> ChainId {
         self.chain_id

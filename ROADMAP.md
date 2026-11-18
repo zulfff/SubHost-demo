@@ -273,6 +273,10 @@ blocks. This does not complete native range request/response sync, QC-aware
 ledger pruning, fork choice, reorg, timeout/view change or leader rotation.
 Redundant archives must retain QCs from the first block; reaching the configured
 archive byte cap stops ingestion. See `docs/operations/certified-sync.md`.
+The stable prototype requires corrected RFC 9380 BLS, official-vector and
+public-PoP forgery rejection tests, and fresh genesis proofs; legacy signatures
+are refused. Its linear QC view/height rule is retained until the separately
+tested phased Protocol revision and coordinated archive upgrade are ready.
 
 - `GetBlocks { from, to }` / `Blocks { items }` messages with a hard item cap.
 - On startup and on a height gap, request the missing range; apply in order.
