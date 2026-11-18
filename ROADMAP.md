@@ -211,6 +211,12 @@ rejected by every other node; the ledger still replays.
 
 ### S2 — Wire the consensus driver into the node (Track A)
 
+Track B's CLI construction compatibility change is in review on
+`s2/cli-config-contract`: use `NodeConfig::new` plus explicit supported overrides.
+The `--single-writer` and view-timeout consumers still wait for the landed
+ADR-008 node policy types; configuration compatibility alone does not implement
+those flags or complete S2.3.
+
 **Status:** S2.1–S2.2, the S2.3 QC commit API and S2.4a durable round recovery/
 P2P reconnect are implemented on `s2/consensus-driver-ownership`. The local-testnet
 runner and real four-validator regressions cover late bootstrap, quorum shortfall,
