@@ -14,6 +14,9 @@ A node is one process assembled in `subhost-node`:
 - `RpcServer` serves the JSON-RPC surface over HTTP and WebSocket, optionally
   behind a bearer-token and per-connection rate-limit HTTP middleware. Both are
   off unless the operator configures them.
+- A linear consensus driver for a genesis validator set, verifying `n - f` votes
+  before commit. Observers hold no signing key. A node-local journal preserves
+  the open proposal/votes and latest QC before votes are published.
 - The optional metrics exporter, the optional libp2p gossip task, and a five-second
   observer that copies block height and pending count into metrics.
 - `subhost-cli` parses operator flags, writes genesis files, and calls
@@ -22,7 +25,11 @@ A node is one process assembled in `subhost-node`:
 `Node::bootstrap` loads `genesis.json` when present, opens the ledger, and applies
 genesis allocations only when no ledger exists yet. A restarted node
 restores the ledger and logs the restored height instead of re-applying allocations.
-The mempool is not persisted, so a restart loses pending transactions.
+The mempool is not persisted, so a restart loses pool entries. Transactions in
+a journalled open proposal survive with their voting obligation. Bootstrap
+reconciles certified commit intents with the ledger and refuses missing, corrupt
+or incompatible validator voting state. The journal does not authenticate
+historical QCs in the block ledger.
 
 A node started with `--validator` refuses to start without a genesis file that
 contains at least one initial validator. A node without that flag may run with no
@@ -56,8 +63,10 @@ Submission works on a clone of the mempool. `Mempool::admit` enforces, in order:
   transaction when full and the highest nonce among equal prices, so the remaining
   per-sender sequence stays contiguous from the bottom.
 
-The live pool is replaced only after the block write succeeds, so a rejected or
-failed submission leaves admission, replacement, and eviction undone.
+With validators configured, an executable admission replaces the pool and returns
+its hash before a block or receipt exists. The producer builds a proposal and
+waits for quorum. Without validators, the pool is replaced only after the
+synchronous block write succeeds. The mempool remains volatile in both modes.
 
 ### 2.3 Select
 
@@ -70,7 +79,9 @@ until the commit succeeds.
 
 ### 2.4 Execute and seal
 
-`seal_block` produces at most one block per submission:
+`build_block` builds and signs a proposal without writing the ledger, changing
+balances or removing pool entries. Validator nodes use this path; demo chains
+without validators use `seal_block` synchronously on submission. Both forms use:
 
 - height is the tip height plus one, or 1 when the ledger is empty; there is no
   genesis block;
@@ -99,13 +110,19 @@ and only then swaps the new state, blocks, and receipts into place and stores th
 new height. If persistence fails, none of the swaps happen and no block event is
 emitted.
 
-On success the node removes the mined transactions from the pool, emits
-`BlockEvent::Sealed`, and the network task relays only locally sealed blocks. A block
-received from a peer is never relayed again.
+On success the node removes the mined transactions from the pool. Demo sealing
+emits `BlockEvent::Sealed`; QC commits emit `BlockEvent::Accepted`. The validator
+network loop retries proposals, verified votes and the latest certified block.
+A failed QC write keeps the tally ready for retry while both committed tips stay
+unchanged. See [consensus wiring](consensus.md).
 
 ### 2.6 Accept a peer block
 
-`RpcState::accept_block` re-validates a block end to end before touching anything:
+`RpcState::commit_qc` requires a certificate binding the block hash and linear
+view (equal to height), from `n - f` distinct registered validators. Each BLS
+signature verifies over the QC domain. `accept_block` refuses validator blocks
+without a certificate and remains available for demo chains. Both commit paths
+re-validate end to end before touching anything:
 
 1. it must extend the local tip exactly: height `tip + 1`, parent equal to the tip
    hash, configured chain ID, the fixed block gas limit, and at least one
@@ -123,7 +140,7 @@ Any failure rejects the whole block and leaves the ledger unchanged.
 
 ### 2.7 Ordering buffer
 
-Peer blocks that arrive before their parent are buffered by height. A block at or
+On demo chains, peer blocks that arrive before their parent are buffered by height. A block at or
 below the next expected height is discarded as stale, and anything more than 64
 blocks ahead of the local tip is refused so a peer cannot force unbounded buffering.
 The first block seen for a height wins; a duplicate cannot replace it. Whenever the
@@ -136,7 +153,7 @@ cannot succeed.
 Today: JSON-RPC is unauthenticated by default, so any client that can reach the
 port can submit a transaction; with the optional bearer-token policy enabled, only
 clients with the token can. Any node whose genesis carries a validator set rejects
-blocks that do not come from one of those validators. On a genesis with no validators,
+blocks that do not come from one of those validators or lack a valid quorum certificate. On a genesis with no validators,
 the single-node path is unchanged and unsigned blocks are accepted.
 
 - Bootstrap builds a `ValidatorRegistry` from `genesis.initial_validators` on every
@@ -153,7 +170,7 @@ the single-node path is unchanged and unsigned blocks are accepted.
 - A node with a `BlockAuthority` sets `header.validator` to the resolved address and
   attaches exactly one BLS signature over `Block::signing_payload()`. Construction
   also checks that the secret belongs to the registered public key.
-- `accept_block` on a node with a registry requires `header.validator` to be
+- Proposal validation and `commit_qc` on a node with a registry require `header.validator` to be
   registered and exactly one signature from that validator over the payload, checked
   before the state transition. A missing, extra, foreign, malformed, or stale
   signature is rejected with `RpcError::UnauthorizedProducer`.
@@ -276,8 +293,8 @@ What the ledger does not guarantee:
 | `subhost-mempool` | Admission policy, per-sender ordering, replacement, eviction | Execution, persistence |
 | `subhost-storage` | On-disk format, atomic write, load validation, receipt and block commitments | Deciding which block to write |
 | `subhost-rpc` | Block selection, sealing, acceptance, the JSON-RPC surface, submission signature check | Consensus, peer identity, genesis policy |
-| `subhost-consensus` | Validator registry, votes, quorum certificates, DAG, slashing | Nothing in the node path yet; it is not wired into `subhost-node` |
-| `subhost-node` | Node assembly, genesis loading, gossip relay, ordering buffer, shutdown | Ledger rules, block validity |
+| `subhost-consensus` | Validator registry, linear quorum driver, votes, certificates, DAG, slashing | Ledger writes, execution, transport |
+| `subhost-node` | Node assembly, genesis loading, consensus/transport orchestration, demo ordering buffer, shutdown | Ledger format, block validity |
 | `subhost-network` | libp2p transport, framing, message size limits | Message meaning |
 | `subhost-cli` | Operator flags, genesis file authoring, wallet and transaction commands | Ledger logic |
 | `subhost-metrics`, `subhost-telemetry` | Counters and gauges; one structured logging setup | State transitions, tracing spans |

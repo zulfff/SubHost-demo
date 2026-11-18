@@ -4,12 +4,13 @@
 //! Scope: these are the verifiable pieces of the protocol — vertex admission,
 //! quorum support, QC signature validation, and stake accounting. The
 //! [`driver`] module turns them into an in-process agreement loop: one view at a
-//! time, a `2f + 1` BLS quorum commits a block, and every proposal must extend
+//! time, a `n - f` BLS quorum commits a block, and every proposal must extend
 //! the committed tip. The driver has no networking, timeouts, view changes, or
 //! leader rotation yet, so it is a tested state machine rather than a
 //! decentralized testnet.
 
 use ark_serialize::CanonicalDeserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use subhost_core::{encode_canonical, Address, Block, Hash, ValidatorInfo};
 use subhost_crypto::{BLSScheme, PublicKey, Signature};
@@ -27,7 +28,7 @@ pub const BLS_PUBLIC_KEY_BYTES: usize = 48;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsensusConfig {
     pub validator_count: usize,
-    /// Signatures required to form a quorum certificate: `2f + 1`.
+    /// Signatures required to form a quorum certificate: `n - f`.
     pub quorum_threshold: usize,
     /// Tolerated byzantine validators: `f = (n - 1) / 3`.
     pub max_faulty: usize,
@@ -47,7 +48,7 @@ impl ConsensusConfig {
         let max_faulty = (validator_count - 1) / 3;
         Ok(Self {
             validator_count,
-            quorum_threshold: 2 * max_faulty + 1,
+            quorum_threshold: validator_count - max_faulty,
             max_faulty,
             block_time_ms: subhost_core::DEFAULT_BLOCK_TIME_MS,
             dag_round_timeout_ms: 500,
@@ -333,7 +334,7 @@ impl DAG {
 }
 
 /// A quorum certificate over one block at one view.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumCertificate {
     pub view: u64,
     pub block_hash: Hash,
@@ -711,8 +712,16 @@ mod tests {
 
     #[test]
     fn quorum_sizing_follows_the_bft_bound() {
-        for (validators, faulty, quorum) in [(1, 0, 1), (3, 0, 1), (4, 1, 3), (7, 2, 5), (10, 3, 7)]
-        {
+        for (validators, faulty, quorum) in [
+            (1, 0, 1),
+            (2, 0, 2),
+            (3, 0, 3),
+            (4, 1, 3),
+            (5, 1, 4),
+            (6, 1, 5),
+            (7, 2, 5),
+            (10, 3, 7),
+        ] {
             let config = ConsensusConfig::new(validators).unwrap();
             assert_eq!(config.max_faulty, faulty, "n={validators}");
             assert_eq!(config.quorum_threshold, quorum, "n={validators}");

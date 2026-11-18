@@ -3,7 +3,7 @@
 use crate::state::{lock, read, write, BlockEvent, RpcError, RpcState};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use subhost_consensus::ValidatorRegistry;
+use subhost_consensus::{ConsensusConfig, HotStuff, QuorumCertificate, ValidatorRegistry};
 use subhost_core::{
     tx_root_of, Address, Block, BlockHeader, Gas, Hash, Receipt, ReceiptStatus, Transaction,
     ValidatorSignature, BLOCK_GAS_LIMIT,
@@ -52,12 +52,19 @@ impl BlockAuthority {
     }
 }
 
+/// A block built against a candidate state, before any commit.
+struct BuiltCandidate {
+    block: Block,
+    /// State after the block's transactions were applied.
+    state: State,
+}
+
 impl RpcState {
-    /// Submit a transaction: admit it to a copy of the pool, then seal the next
-    /// block with every pending transaction that is currently executable.
+    /// Admit an executable transaction to a copy of the pool.
     ///
-    /// The live pool is only replaced after the ledger write succeeds, so a
-    /// failed commit leaves admission, replacement, and eviction entirely undone.
+    /// With validators, admission leaves the transaction pending for a certified
+    /// block and returns its hash before a receipt exists. Demo chains seal
+    /// synchronously and replace the live pool only after persistence succeeds.
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
         let requested_hash = tx.hash();
@@ -74,6 +81,23 @@ impl RpcState {
         }
         debug_assert_eq!(admission.hash, requested_hash);
 
+        // With a validator set configured, this node does not commit on the RPC
+        // thread: the producer proposes the block and it commits only after a
+        // quorum. Dry-run the build so an unexecutable transaction is still
+        // rejected here, then leave it for the producer.
+        if self.validators.is_some() {
+            let executable = self.build_candidate(&candidate_pool)?.is_some_and(|candidate| {
+                candidate.block.transactions.iter().any(|tx| tx.hash() == requested_hash)
+            });
+            if !executable {
+                return Err(RpcError::TransactionRejected(
+                    "transaction is not executable against the current state".into(),
+                ));
+            }
+            *write(&self.mempool) = candidate_pool;
+            return Ok(requested_hash);
+        }
+
         let receipts = self.seal_block(&mut candidate_pool)?;
         if !receipts.contains_key(&requested_hash) {
             return Err(RpcError::TransactionRejected(
@@ -89,6 +113,11 @@ impl RpcState {
     /// block's executable transactions.
     pub fn include_transaction(&self, tx_hash: &Hash) -> Result<Receipt, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
+        if self.validators.is_some() {
+            return Err(RpcError::TransactionRejected(
+                "direct inclusion is disabled while a validator set is configured; the producer will include the transaction".into(),
+            ));
+        }
         let mut candidate_pool = read(&self.mempool).clone();
         if !candidate_pool.contains(tx_hash) {
             return Err(RpcError::InvalidTxHash);
@@ -129,16 +158,30 @@ impl RpcState {
         selected
     }
 
-    /// Seal every executable pending transaction into one block.
+    /// The next block this producer would seal, without committing it.
     ///
-    /// On success the pool has the mined transactions removed and every other
-    /// in-memory view has been swapped; on error nothing is published. The caller
-    /// installs the mutated pool only after this returns `Ok`.
-    fn seal_block(&self, pool: &mut Mempool) -> Result<HashMap<Hash, Receipt>, RpcError> {
+    /// The block is built and signed against a snapshot of the current state,
+    /// but nothing is persisted, the mempool is untouched, and no event is
+    /// emitted. A consensus producer hands this block to the driver and commits
+    /// it through [`RpcState::commit_qc`] only after a quorum certifies it.
+    ///
+    /// Returns `None` when no pending transaction is executable.
+    pub fn build_block(&self) -> Result<Option<Block>, RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        let pool = read(&self.mempool).clone();
+        Ok(self.build_candidate(&pool)?.map(|candidate| candidate.block))
+    }
+
+    /// Build the next block from `pool` and the state it would produce.
+    ///
+    /// The caller must hold the commit lock. `seal_block` uses the returned
+    /// state to persist the commit; `build_block` throws it away because a
+    /// proposal is not a commit.
+    fn build_candidate(&self, pool: &Mempool) -> Result<Option<BuiltCandidate>, RpcError> {
         let mut candidate_state = read(&self.state).clone();
         let transactions = self.select_transactions(pool, &mut candidate_state);
         if transactions.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(None);
         }
 
         let previous_block = read(&self.blocks).last().cloned();
@@ -197,7 +240,22 @@ impl RpcState {
             block
         };
 
+        Ok(Some(BuiltCandidate { block, state: candidate_state }))
+    }
+
+    /// Seal every executable pending transaction into one block.
+    ///
+    /// On success the pool has the mined transactions removed and every other
+    /// in-memory view has been swapped; on error nothing is published. The caller
+    /// installs the mutated pool only after this returns `Ok`.
+    fn seal_block(&self, pool: &mut Mempool) -> Result<HashMap<Hash, Receipt>, RpcError> {
+        let Some(BuiltCandidate { block, state: candidate_state }) = self.build_candidate(pool)?
+        else {
+            return Ok(HashMap::new());
+        };
+
         let block_hash = block.hash();
+        let height = block.header.height;
         let mut receipts = HashMap::with_capacity(block.transactions.len());
         let mut cumulative_gas_used: Gas = 0;
         for (index, tx) in block.transactions.iter().enumerate() {
@@ -277,6 +335,47 @@ impl RpcState {
     /// Receipts are derived locally and never taken from the wire.
     pub fn accept_block(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
+        self.verify_block_authority(&block)?;
+        if self.validators.is_some() {
+            return Err(RpcError::BlockRejected(
+                "validator blocks require a quorum certificate".into(),
+            ));
+        }
+        self.accept_validated(block)
+    }
+
+    /// Validate a proposal against the current tip without writing any state.
+    pub fn validate_proposal(&self, block: &Block) -> Result<(), RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        self.validate_candidate(block).map(|_| ())
+    }
+
+    /// Persist a block only after its quorum certificate and state transition verify.
+    pub fn commit_qc(
+        &self,
+        block: Block,
+        qc: &QuorumCertificate,
+    ) -> Result<Vec<Receipt>, RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        let validators = self.validators.as_ref().ok_or_else(|| {
+            RpcError::BlockRejected("a quorum commit requires a validator registry".into())
+        })?;
+        // With no view changes yet, the linear driver's view equals block height.
+        if qc.block_hash != block.hash() || qc.view != block.header.height {
+            return Err(RpcError::BlockRejected(
+                "certificate does not match the block and view".into(),
+            ));
+        }
+        let config = ConsensusConfig::new(validators.len())
+            .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
+        HotStuff::new(config, (**validators).clone())
+            .validate_qc(qc)
+            .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
+        self.accept_validated(block)
+    }
+
+    /// Validate before persistence; caller holds the commit lock.
+    fn validate_candidate(&self, block: &Block) -> Result<State, RpcError> {
         let previous = read(&self.blocks).last().cloned();
         let expected_height = match previous.as_ref() {
             Some(previous) => previous.header.height.checked_add(1).ok_or(RpcError::Internal)?,
@@ -297,7 +396,7 @@ impl RpcState {
 
         // Identity before execution: an unauthorized block must not reach the
         // state transition at all.
-        self.verify_block_authority(&block)?;
+        self.verify_block_authority(block)?;
 
         let mut candidate_state = read(&self.state).clone();
         let mut seen = HashSet::with_capacity(block.transactions.len());
@@ -343,6 +442,12 @@ impl RpcState {
             )));
         }
 
+        Ok(candidate_state)
+    }
+
+    /// Apply a validated block under the caller's commit lock.
+    fn accept_validated(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
+        let candidate_state = self.validate_candidate(&block)?;
         let block_hash = block.hash();
         let mut receipts = Vec::with_capacity(block.transactions.len());
         let mut cumulative_gas_used: Gas = 0;
@@ -437,6 +542,22 @@ mod tests {
         registry
     }
 
+    fn certificate(block: &Block, signers: &[(Address, &PrivateKey)]) -> QuorumCertificate {
+        let view = block.header.height;
+        let block_hash = block.hash();
+        let payload = QuorumCertificate::payload_for(view, &block_hash);
+        QuorumCertificate {
+            view,
+            block_hash,
+            signatures: signers
+                .iter()
+                .map(|(address, secret)| {
+                    (*address, BLSScheme::encode_signature(&BLSScheme::sign(secret, &payload)))
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn authority_signs_the_block_it_produces() {
         let tx_key = signing_key(7);
@@ -445,8 +566,7 @@ mod tests {
         let state = funded_state(&tx_key, 1_000_000).with_authority(authority);
 
         state.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
-
-        let block = state.block_at_height(1).unwrap();
+        let block = state.build_block().unwrap().unwrap();
         assert_eq!(block.header.validator, producer);
         assert_eq!(block.signatures.len(), 1);
         let signature = &block.signatures[0];
@@ -499,7 +619,7 @@ mod tests {
     }
 
     /// A producer and a follower that both know the two-validator registry.
-    fn signed_block_and_follower() -> (Block, RpcState) {
+    fn signed_block_and_follower() -> (Block, QuorumCertificate, RpcState) {
         let tx_key = signing_key(7);
         let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
         let (alice_secret, _) = BLSScheme::keygen();
@@ -508,22 +628,68 @@ mod tests {
         let bob = Address::new([10; 20]);
         let registry = registry(&[(alice, &alice_secret), (bob, &bob_secret)]);
 
-        let producer = funded_state(&tx_key, 1_000_000)
-            .with_authority(BlockAuthority::new(registry.clone(), alice, alice_secret).unwrap());
+        let producer = funded_state(&tx_key, 1_000_000).with_authority(
+            BlockAuthority::new(registry.clone(), alice, alice_secret.clone()).unwrap(),
+        );
         producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
-        let block = producer.block_at_height(1).unwrap();
+        let block = producer.build_block().unwrap().unwrap();
+        let qc = certificate(&block, &[(alice, &alice_secret), (bob, &bob_secret)]);
 
         let follower = RpcState::in_memory(1)
             .unwrap()
             .with_authority(BlockAuthority::new(registry, bob, bob_secret).unwrap());
         follower.seed_accounts([(sender, 1_000_000)]).unwrap();
-        (block, follower)
+        (block, qc, follower)
+    }
+
+    #[test]
+    fn admission_and_proposal_do_not_publish_state_or_bypass_quorum() {
+        let tx_key = signing_key(7);
+        let (secret, _) = BLSScheme::keygen();
+        let (authority, _) = authority(&secret);
+        let state = funded_state(&tx_key, 1_000_000).with_authority(authority);
+        let root = state.state_root();
+        let mut events = state.subscribe_blocks();
+        let hash = state.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+        let block = state.build_block().unwrap().unwrap();
+        assert_eq!(state.block_height(), 0);
+        assert_eq!(state.state_root(), root);
+        assert!(state.receipt(&hash).is_none());
+        assert_eq!(state.pending_count(), 1);
+        assert!(events.try_recv().is_err());
+        assert!(state.include_transaction(&hash).is_err());
+        assert!(state.accept_block(block).is_err());
+        assert_eq!(state.block_height(), 0);
+    }
+
+    #[test]
+    fn invalid_certificates_leave_balances_receipts_and_height_unchanged() {
+        let (block, qc, follower) = signed_block_and_follower();
+        let mut insufficient = qc.clone();
+        insufficient.signatures.pop();
+        let mut duplicate = qc.clone();
+        duplicate.signatures[1] = duplicate.signatures[0].clone();
+        let mut wrong_hash = qc.clone();
+        wrong_hash.block_hash = Hash::ZERO;
+        let mut wrong_view = qc.clone();
+        wrong_view.view += 1;
+        let mut malformed = qc.clone();
+        malformed.signatures[0].1 = vec![0xff; 96];
+        let root = follower.state_root();
+        for bad in [insufficient, duplicate, wrong_hash, wrong_view, malformed] {
+            assert!(follower.commit_qc(block.clone(), &bad).is_err());
+            assert_eq!(follower.block_height(), 0);
+            assert_eq!(follower.state_root(), root);
+            assert!(follower.receipt(&block.transactions[0].hash()).is_none());
+        }
+        follower.commit_qc(block, &qc).unwrap();
+        assert_eq!(follower.block_height(), 1);
     }
 
     #[test]
     fn a_block_with_a_valid_producer_signature_is_accepted() {
-        let (block, follower) = signed_block_and_follower();
-        follower.accept_block(block).unwrap();
+        let (block, qc, follower) = signed_block_and_follower();
+        follower.commit_qc(block, &qc).unwrap();
         assert_eq!(follower.block_height(), 1);
         assert_eq!(follower.block_count(), 1);
     }
@@ -536,14 +702,16 @@ mod tests {
         let alice = Address::new([9; 20]);
         let registry = registry(&[(alice, &alice_secret)]);
 
-        let producer = funded_state(&tx_key, 1_000_000)
-            .with_authority(BlockAuthority::new(registry.clone(), alice, alice_secret).unwrap());
+        let producer = funded_state(&tx_key, 1_000_000).with_authority(
+            BlockAuthority::new(registry.clone(), alice, alice_secret.clone()).unwrap(),
+        );
         producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
-        let block = producer.block_at_height(1).unwrap();
+        let block = producer.build_block().unwrap().unwrap();
+        let qc = certificate(&block, &[(alice, &alice_secret)]);
 
         let follower = RpcState::in_memory(1).unwrap().with_validators(registry.clone());
         follower.seed_accounts([(sender, 1_000_000)]).unwrap();
-        follower.accept_block(block.clone()).unwrap();
+        follower.commit_qc(block.clone(), &qc).unwrap();
         assert_eq!(follower.block_height(), 1);
         assert_eq!(follower.balance(&Address::new([2; 20])), 10);
 
@@ -557,7 +725,7 @@ mod tests {
 
     #[test]
     fn a_block_without_a_valid_producer_signature_is_rejected() {
-        let (block, follower) = signed_block_and_follower();
+        let (block, _, follower) = signed_block_and_follower();
 
         let mut missing = block.clone();
         missing.signatures.clear();

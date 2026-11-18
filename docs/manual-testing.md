@@ -4,9 +4,9 @@ This walkthrough runs a chain end to end: wallet creation, ed25519 signing,
 balances, nonces, fees, block production, account proofs, restart persistence, and
 two-node block gossip.
 
-It is not a multi-node testnet. `--p2p-listen` relays blocks between nodes, but the
-node has no consensus, no fork choice, and no block sync, so only one node may
-produce.
+This walkthrough uses the single-writer demo chain without genesis validators.
+For quorum commits over P2P, use the [four-validator local testnet](local-testnet.md).
+Historical sync, fork choice and leader rotation remain pending.
 
 ## 1. Build
 
@@ -423,3 +423,23 @@ That only removes the `/tmp` directories created above.
 - `cannot reach the node at …`: the node is not running on that port.
 - `a validator network requires at least one initial validator`: `node
   --validator` needs `init --validator`.
+
+## Validator quorum checks (S2)
+
+On a genesis containing validators, a successful submission returns a hash before
+its receipt exists. Poll `eth_getTransactionReceipt` until a QC commits the block;
+`eth_blockNumber` and balances stay unchanged while quorum is absent. Submit to a
+node with its producer key: transaction gossip is not implemented.
+
+For a four-validator set, three distinct valid votes commit; two votes leave the
+ledger unchanged. Two- and three-validator sets require all their validators,
+rather than a single signer. Run the node's loopback regression to exercise real
+proposal → vote → commit delivery:
+
+```sh
+cargo test -p subhost-node two_validators_commit_over_real_loopback_gossip
+```
+
+See [consensus wiring and limitations](consensus.md) before running a devnet.
+Timeout/view change remains pending; open-round vote recovery is journalled. This
+slice does not establish production finality or long-offline catch-up.

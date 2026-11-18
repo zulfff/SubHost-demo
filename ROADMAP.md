@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `0c81993` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5 and S5.1a merged · S5.3a in review · `Q-001`–`Q-010` agreed
+Status: 2026-11-18 · baseline `main` = `1043268` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5, S5.1a and S5.3a merged · S2.1–S2.2, S2.3 QC API, S2.4a recovery/P2P and S5.3b implemented on the S2 branch · `Q-001`–`Q-011` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -11,13 +11,13 @@ editing the same files.
 
 | Area | Reality |
 | --- | --- |
-| Chain | Single-writer node. One submission seals one block with every executable pending transaction. |
+| Chain | Validator deployments admit to the pool and commit with a QC. Demo chains without validators seal synchronously on submission. |
 | Block auth | A node with a configured authority signs each produced block with the validator's BLS key and verifies that signature on accept; a node without one still produces and accepts unsigned blocks. |
-| Consensus | `subhost-consensus` has a tested in-process `2f+1` driver (`propose`, `receive_proposal`, `receive_vote`, commit). **No crate depends on it**; the node never calls it. |
-| Networking | libp2p gossip publishes only locally sealed blocks. Messages for votes, DAG vertices and transactions are already defined but unused by the node. No block sync, peer scoring, per-peer limits, or tx gossip. |
+| Consensus | Node owns a linear `n - f` quorum driver restored at the ledger tip. Observers verify without voting. Durable open rounds/latest QC; no timeout, view change or leader rotation yet. |
+| Networking | libp2p relays proposals, verified votes and QC-certified next blocks; demo block gossip remains. Bootstrap retries; no historical block sync, peer scoring, per-peer limits or tx gossip. |
 | Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
-| RPC | 11 methods. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. RPC counters in the metrics registry are still never incremented. |
+| RPC | 11 methods. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. Completed decoded RPC calls and returned errors now reach the node metrics registry. |
 | Mempool | In memory only; fixed gas price 1. |
 | IBC | State machine + single-key ed25519 light client. No validator-set rotation, no multisig QC, no non-membership proof. |
 | Release | `0.1.0`, no tag, no release workflow, no signed binaries or SBOM. |
@@ -33,7 +33,7 @@ fixed or written down as an explicit, reviewed limitation.
 
 1. **Authenticated block production.** Every block carries a signature that verifies
    against the active validator set; an unregistered producer is rejected.
-2. **Consensus is live.** Blocks commit only after a `2f+1` quorum certificate. No
+2. **Consensus is live.** Blocks commit only after an `n - f` quorum certificate. No
    direct "RPC submit → commit" path remains in a validator deployment.
 3. **One chain under partition.** Fork choice plus block sync means two producers
    converge and an offline node catches up.
@@ -120,21 +120,21 @@ agent always sees the real state.
 
 ## 4. Stage index
 
-| Stage | Goal | Track | Depends on | Size |
-| --- | --- | --- | --- | --- |
-| S0 | Prepare `rpc` for parallel work | A | — | S |
-| S1 | Signed blocks and validator identity | A | S0 | M |
-| S2 | Wire the consensus driver into the node | A | S1 | L |
-| S3 | Fork choice, reorg, and block sync | A | S2 | L |
-| S4 | Segmented storage, snapshots, migration | B | — | L |
-| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M |
-| S6 | Durable mempool and fee market | B | S0 | M |
-| S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M |
-| S8 | Observability, health, runbooks | B | S0 | M |
-| S9 | Release engineering | B | S5 | M |
-| S10 | Execution layer (EVM or WASM) | C | S3 | XL |
-| S11 | IBC production light client + relayer | C | — | L |
-| S12 | External audit and public testnet soak | all | S1–S9 | XL |
+| Stage | Goal | Track | Depends on | Size | Status |
+| --- | --- | --- | --- | --- | --- |
+| S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
+| S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
+| S2 | Wire the consensus driver into the node | A | S1 | L | Partial: QC API, durable rounds, local testnet/P2P; timeout/CLI pending |
+| S3 | Fork choice, reorg, and block sync | A | S2 | L | Planned |
+| S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
+| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented |
+| S6 | Durable mempool and fee market | B | S0 | M | Planned |
+| S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
+| S8 | Observability, health, runbooks | B | S0 | M | Planned |
+| S9 | Release engineering | B | S5 | M | Planned |
+| S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
+| S11 | IBC production light client + relayer | C | — | L | Planned |
+| S12 | External audit and public testnet soak | all | S1–S9 | XL | Planned |
 
 Size is relative effort, not calendar time. S10 alone is larger than S0–S9 combined.
 
@@ -210,6 +210,17 @@ cannot load quietly.
 rejected by every other node; the ledger still replays.
 
 ### S2 — Wire the consensus driver into the node (Track A)
+
+**Status:** S2.1–S2.2, the S2.3 QC commit API and S2.4a durable round recovery/
+P2P reconnect are implemented on `s2/consensus-driver-ownership`. The local-testnet
+runner and real four-validator regressions cover late bootstrap, quorum shortfall,
+late next-block delivery and hub restart. The stage remains incomplete: S2.4b
+timeout/view change, the explicit S2.3 `--single-writer` CLI policy and S2.5 timeout
+assertions are pending. The node journal retains open votes and the latest QC,
+but historical QCs are not authenticated on ledger replay until S3.4 supplies that
+format. Concurrent proposals and oversized gossip blocks can stall. Preserve the
+latest voting state when restoring backups. See `docs/consensus.md` and
+`docs/local-testnet.md`; this is not production BFT.
 
 **S2.1 Driver ownership** (`subhost-node/src/lib.rs`)
 - `Node` holds a `ConsensusDriver` built from the genesis set and its identity.
@@ -334,8 +345,8 @@ start-up time remains proportional to retained history even after pruning (S4.3)
 | --- | --- |
 | S5.1a | Merged |
 | S5.2 | In progress on the separate `s5/rpc-methods` branch |
-| S5.3a | Server middleware and registry API contract in review on `s5/rpc-metrics` |
-| S5.3b | Node registry wiring pending the S5.3a contract landing (Track A) |
+| S5.3a | Merged server middleware and registry API contract (ADR-004) |
+| S5.3b | Node registry wiring and exported success/error regression implemented on the S2 branch (Track A) |
 
 **S5.1 Auth and transport** *(S5.1a shipped; S5.1b TLS posture is a documented
 reverse-proxy mode)*
@@ -365,9 +376,10 @@ reverse-proxy mode)*
   batch entries, errors and execution duration. Existing metric names gain a
   `method` label; known names come from the module registry and arbitrary names
   share `unknown`. Legacy recorder APIs use `unattributed`.
-- S5.3b must pass the node's existing metrics handle into the server after the
-  contract lands. Until then the bundled node's RPC counters still remain zero;
-  this stage is not complete. No node/state/block source is changed by S5.3a.
+- S5.3b passes the node's existing metrics handle into the server under ADR-004.
+  Completed decoded calls and RPC errors reach `/metrics`; an HTTP/exporter test
+  verifies success, error and latency samples. No node/state/block source was
+  changed by S5.3a; the node glue lands with Track A's S2 continuation.
 - Notifications, malformed requests, guard/limit rejections and cancelled calls
   bypass completion metrics; transport-level instrumentation remains S8 work.
 - Relevant doc: `docs/operations/rpc-metrics.md`.

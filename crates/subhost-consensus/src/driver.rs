@@ -1,7 +1,7 @@
 //! A minimal linear consensus driver over the quorum primitives.
 //!
 //! Scope: one in-process state machine that advances a single view at a time,
-//! collects BLS votes for one proposal, and commits the block once `2f + 1`
+//! collects BLS votes for one proposal, and commits the block once `n - f`
 //! distinct validators sign the same `(view, block hash)`. Every proposal must
 //! extend the committed tip by exactly one height, and a validator votes at most
 //! once per view, so two conflicting blocks cannot both collect a quorum.
@@ -16,25 +16,36 @@ use crate::{
     ConsensusConfig, ConsensusError, HotStuff, QuorumCertificate, ValidatorRegistry,
     BLS_SIGNATURE_BYTES,
 };
-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_serialize::CanonicalSerialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use subhost_core::{Address, Block, Hash};
-use subhost_crypto::{BLSScheme, PrivateKey, Signature};
+use subhost_crypto::{BLSScheme, PrivateKey};
 
 /// A block put forward for one view.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockProposal {
     pub view: u64,
     pub block: Block,
 }
 
 /// One validator's signature over [`QuorumCertificate::payload_for`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vote {
     pub view: u64,
     pub block_hash: Hash,
     pub validator: Address,
     pub signature: Vec<u8>,
+}
+
+/// Key-free recovery state. The node must durably save it before relaying votes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverCheckpoint {
+    pub height: u64,
+    pub tip: Hash,
+    pub high_qc: Option<QuorumCertificate>,
+    pub proposal: Option<BlockProposal>,
+    pub votes: Vec<Vote>,
 }
 
 /// What happened to a vote.
@@ -70,6 +81,56 @@ pub struct ConsensusDriver {
 }
 
 impl ConsensusDriver {
+    /// Capture the current voting obligation without serializing the identity key.
+    pub fn checkpoint(&self) -> DriverCheckpoint {
+        DriverCheckpoint {
+            height: self.height,
+            tip: self.tip,
+            high_qc: self.hotstuff.high_qc().cloned(),
+            proposal: self.proposal.clone(),
+            votes: self.votes.values().cloned().collect(),
+        }
+    }
+
+    /// Restore a checkpoint, independently validating every saved vote and QC.
+    /// A validator's open proposal must retain its own previously released vote.
+    pub fn from_checkpoint(
+        config: ConsensusConfig,
+        registry: ValidatorRegistry,
+        identity: Option<(Address, PrivateKey)>,
+        checkpoint: DriverCheckpoint,
+    ) -> Result<Self, ConsensusError> {
+        let mut driver =
+            Self::with_tip(config, registry, identity, checkpoint.height, checkpoint.tip)?;
+        if let Some(qc) = checkpoint.high_qc {
+            if qc.view != driver.height || qc.block_hash != driver.tip || driver.height == 0 {
+                return Err(ConsensusError::InvalidProposal(
+                    "saved QC does not match the tip".into(),
+                ));
+            }
+            driver.hotstuff.update_high_qc(qc)?;
+        }
+        if let Some(proposal) = checkpoint.proposal {
+            driver.observe_proposal(proposal)?;
+            // Verify saved signatures even for our own address, rather than
+            // treating a corrupted own vote as an already-tallied duplicate.
+            driver.votes.clear();
+            for vote in checkpoint.votes {
+                if !driver.record_vote(vote)? {
+                    return Err(ConsensusError::InvalidProposal("duplicate saved vote".into()));
+                }
+            }
+            if driver.is_validator() && driver.own_vote().is_none() {
+                return Err(ConsensusError::InvalidProposal(
+                    "saved round is missing our vote".into(),
+                ));
+            }
+        } else if !checkpoint.votes.is_empty() {
+            return Err(ConsensusError::InvalidProposal("saved votes have no proposal".into()));
+        }
+        Ok(driver)
+    }
+
     /// Build a driver for a full validator set.
     ///
     /// `identity` must be a registered validator when present; `None` makes the
@@ -79,6 +140,27 @@ impl ConsensusDriver {
         registry: ValidatorRegistry,
         identity: Option<(Address, PrivateKey)>,
     ) -> Result<Self, ConsensusError> {
+        Self::with_tip(config, registry, identity, 0, Hash::ZERO)
+    }
+
+    /// Build a driver that resumes from a ledger restored at `height`.
+    ///
+    /// A fresh driver starts at height zero with the zero hash as its tip. A node
+    /// that reopened an existing ledger must pass the restored height and declared
+    /// tip instead, otherwise the next proposal is rejected for not extending
+    /// height zero.
+    ///
+    /// In this linear driver each committed height consumes exactly one view,
+    /// so the restored height also restores the committed view. Use
+    /// [`Self::from_checkpoint`] for unfinished rounds; the node persists the
+    /// checkpoint before publishing votes.
+    pub fn with_tip(
+        config: ConsensusConfig,
+        registry: ValidatorRegistry,
+        identity: Option<(Address, PrivateKey)>,
+        height: u64,
+        tip: Hash,
+    ) -> Result<Self, ConsensusError> {
         if registry.len() != config.validator_count {
             return Err(ConsensusError::InvalidConfig(format!(
                 "registry holds {} validators but the config expects {}",
@@ -86,19 +168,42 @@ impl ConsensusDriver {
                 config.validator_count
             )));
         }
-        if let Some((address, _)) = &identity {
-            if !registry.contains(address) {
-                return Err(ConsensusError::UnknownValidator(*address));
+        if let Some((address, secret)) = &identity {
+            let public_key =
+                registry.public_key(address).ok_or(ConsensusError::UnknownValidator(*address))?;
+            if *public_key != BLSScheme::public_key(secret) {
+                return Err(ConsensusError::InvalidConfig(
+                    "validator identity key mismatch".into(),
+                ));
             }
         }
+        let expected = ConsensusConfig::new(config.validator_count)?;
+        if config.quorum_threshold != expected.quorum_threshold
+            || config.max_faulty != expected.max_faulty
+        {
+            return Err(ConsensusError::InvalidConfig("invalid quorum parameters".into()));
+        }
+        if height == 0 && tip != Hash::ZERO {
+            return Err(ConsensusError::InvalidConfig(
+                "height zero must pair with the zero tip hash".into(),
+            ));
+        }
+        if height > 0 && tip == Hash::ZERO {
+            return Err(ConsensusError::InvalidConfig(
+                "a non-zero height needs the committed tip hash".into(),
+            ));
+        }
+        let mut hotstuff = HotStuff::new(config, registry);
+        hotstuff.view = height;
+        hotstuff.locked_view = height;
         Ok(Self {
-            hotstuff: HotStuff::new(config, registry),
+            hotstuff,
             identity,
-            height: 0,
-            tip: Hash::ZERO,
+            height,
+            tip,
             proposal: None,
             votes: BTreeMap::new(),
-            last_committed_view: 0,
+            last_committed_view: height,
             committed: Vec::new(),
         })
     }
@@ -126,6 +231,11 @@ impl ConsensusDriver {
     /// Leader path: open the next view with `block` and return the leader's own
     /// vote along with the proposal to broadcast.
     pub fn propose(&mut self, block: Block) -> Result<(BlockProposal, Vote), ConsensusError> {
+        if self.proposal.is_some() {
+            return Err(ConsensusError::InvalidProposal(
+                "a proposal is already awaiting quorum".into(),
+            ));
+        }
         self.ensure_extends_tip(&block)?;
         let view = self
             .hotstuff
@@ -143,28 +253,107 @@ impl ConsensusDriver {
         Ok((proposal, vote))
     }
 
-    /// Follower path: validate the leader's proposal and return this replica's
-    /// vote. Only the next view is accepted, so a leader cannot skip views or
-    /// replay an old proposal.
+    /// Follower path: accept the next proposal and return this validator's vote.
     pub fn receive_proposal(&mut self, proposal: BlockProposal) -> Result<Vote, ConsensusError> {
+        if self.identity.is_none() {
+            return Err(ConsensusError::NotAValidator);
+        }
+        // Keep the strict public API: repeated proposals do not open another view.
+        if proposal.view != self.view().saturating_add(1) {
+            return Err(ConsensusError::InvalidView {
+                proposed: proposal.view,
+                current: self.view(),
+            });
+        }
+        self.observe_proposal(proposal)?.ok_or(ConsensusError::NotAValidator)
+    }
+
+    /// Accept a proposal without requiring an observer to hold a signing key.
+    ///
+    /// An exact retransmission returns the already signed vote. A conflicting
+    /// proposal cannot replace a round awaiting quorum, even in a later view.
+    pub fn observe_proposal(
+        &mut self,
+        proposal: BlockProposal,
+    ) -> Result<Option<Vote>, ConsensusError> {
+        if let Some(open) = &self.proposal {
+            if *open == proposal {
+                return Ok(self.own_vote().cloned());
+            }
+            return Err(ConsensusError::InvalidProposal(
+                "a conflicting proposal is already open".into(),
+            ));
+        }
         self.ensure_extends_tip(&proposal.block)?;
-        let current = self.hotstuff.view();
+        let current = self.view();
         if proposal.view != current.saturating_add(1) {
             return Err(ConsensusError::InvalidView { proposed: proposal.view, current });
         }
         if !self.hotstuff.is_safe_proposal(proposal.view) {
-            return Err(ConsensusError::InvalidProposal(format!(
-                "view {} is below the locked view {}",
-                proposal.view,
-                self.hotstuff.locked_view()
-            )));
+            return Err(ConsensusError::InvalidProposal(
+                "proposal is below the locked view".into(),
+            ));
         }
-        let vote = self.sign_vote(&proposal)?;
+        let vote = if self.identity.is_some() { Some(self.sign_vote(&proposal)?) } else { None };
         self.hotstuff.enter_next_view()?;
-        self.proposal = Some(proposal.clone());
+        self.proposal = Some(proposal);
         self.votes.clear();
-        self.votes.insert(vote.validator, vote.clone());
+        if let Some(vote) = &vote {
+            self.votes.insert(vote.validator, vote.clone());
+        }
         Ok(vote)
+    }
+
+    /// Latest certificate held in memory (ledger QC persistence is S3.4).
+    pub fn committed_qc(&self) -> Option<&QuorumCertificate> {
+        self.hotstuff.high_qc()
+    }
+
+    /// Adopt a peer's certified next block, after checking the certificate.
+    pub fn receive_commit(
+        &mut self,
+        block: Block,
+        qc: QuorumCertificate,
+    ) -> Result<(), ConsensusError> {
+        self.ensure_extends_tip(&block)?;
+        if qc.block_hash != block.hash() || qc.view != block.header.height {
+            return Err(ConsensusError::InvalidProposal(
+                "certificate does not match the block".into(),
+            ));
+        }
+        self.hotstuff.update_high_qc(qc.clone())?;
+        self.height = block.header.height;
+        self.tip = block.hash();
+        self.last_committed_view = qc.view;
+        self.committed.push(block);
+        self.proposal = None;
+        self.votes.clear();
+        Ok(())
+    }
+
+    pub fn is_validator(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    pub fn own_vote(&self) -> Option<&Vote> {
+        self.identity.as_ref().and_then(|(address, _)| self.votes.get(address))
+    }
+
+    /// Verified certificate ready to persist, without advancing the tip.
+    pub fn pending_qc(&self) -> Option<QuorumCertificate> {
+        let proposal = self.proposal.as_ref()?;
+        if self.votes.len() < self.hotstuff.config().quorum_threshold {
+            return None;
+        }
+        Some(QuorumCertificate {
+            view: proposal.view,
+            block_hash: proposal.block.hash(),
+            signatures: self
+                .votes
+                .values()
+                .map(|vote| (vote.validator, vote.signature.clone()))
+                .collect(),
+        })
     }
 
     /// Validate and tally a vote.
@@ -173,9 +362,25 @@ impl ConsensusDriver {
     /// validator, once per signer, with a valid BLS signature over the exact
     /// `(view, block hash)` pair. A quorum commits the proposal immediately.
     pub fn receive_vote(&mut self, vote: Vote) -> Result<VoteOutcome, ConsensusError> {
-        let Some(proposal) = self.proposal.clone() else {
+        let fresh = self.record_vote(vote)?;
+        if self.pending_qc().is_some() {
+            return self.commit_open_proposal();
+        }
+        if !fresh {
+            return Ok(VoteOutcome::Ignored);
+        }
+        Ok(VoteOutcome::Pending {
+            votes: self.votes.len(),
+            needed: self.hotstuff.config().quorum_threshold,
+        })
+    }
+
+    /// Validate and retain a vote without committing, for persist-before-visibility.
+    /// Returns false for duplicates and already committed views.
+    pub fn record_vote(&mut self, vote: Vote) -> Result<bool, ConsensusError> {
+        let Some(proposal) = &self.proposal else {
             if vote.view <= self.last_committed_view {
-                return Ok(VoteOutcome::Ignored);
+                return Ok(false);
             }
             return Err(ConsensusError::NoProposal);
         };
@@ -185,26 +390,32 @@ impl ConsensusDriver {
             ));
         }
         if self.votes.contains_key(&vote.validator) {
-            return Ok(VoteOutcome::Ignored);
+            return Ok(false);
         }
-
         let public_key = self
             .hotstuff
             .registry()
             .public_key(&vote.validator)
             .ok_or(ConsensusError::UnknownValidator(vote.validator))?;
-        if vote.signature.len() != BLS_SIGNATURE_BYTES {
-            return Err(ConsensusError::MalformedSignature(vote.validator));
-        }
-        let signature = Signature::deserialize_compressed(vote.signature.as_slice())
-            .map_err(|_| ConsensusError::MalformedSignature(vote.validator))?;
+        let signature = BLSScheme::decode_signature(&vote.signature)
+            .ok_or(ConsensusError::MalformedSignature(vote.validator))?;
         let payload = QuorumCertificate::payload_for(vote.view, &vote.block_hash);
         if !BLSScheme::verify(public_key, &payload, &signature) {
             return Err(ConsensusError::InvalidSignature(vote.validator));
         }
-
         self.votes.insert(vote.validator, vote);
+        Ok(true)
+    }
 
+    /// Commit the open proposal when its tally has reached the quorum.
+    ///
+    /// The caller has already checked that every signature is valid and that
+    /// the signers are distinct, registered validators. `update_high_qc`
+    /// re-verifies the assembled certificate before the lock moves.
+    pub fn commit_open_proposal(&mut self) -> Result<VoteOutcome, ConsensusError> {
+        let Some(proposal) = self.proposal.clone() else {
+            return Ok(VoteOutcome::Ignored);
+        };
         let needed = self.hotstuff.config().quorum_threshold;
         if self.votes.len() < needed {
             return Ok(VoteOutcome::Pending { votes: self.votes.len(), needed });
@@ -219,7 +430,6 @@ impl ConsensusDriver {
                 .map(|vote| (vote.validator, vote.signature.clone()))
                 .collect(),
         };
-        // `update_high_qc` re-verifies the quorum and advances the lock.
         self.hotstuff.update_high_qc(quorum)?;
 
         let block = proposal.block;
@@ -270,6 +480,7 @@ mod tests {
     use super::*;
     use ark_serialize::CanonicalSerialize;
     use subhost_core::{BlockHeader, BLOCK_GAS_LIMIT};
+    use subhost_crypto::Signature;
 
     fn address(n: u8) -> Address {
         Address::new([n; 20])
@@ -501,6 +712,138 @@ mod tests {
         ));
         assert_eq!(proposal.view, 1);
         assert_eq!(leader.view(), 1);
+    }
+
+    #[test]
+    fn an_open_round_cannot_be_abandoned_for_a_conflicting_later_view() {
+        let (registry, keys) = registry(4);
+        let mut leader = driver(&registry, &keys, 0);
+        let (proposal, _) = leader.propose(block(1, Hash::ZERO, 1)).unwrap();
+        assert!(leader.propose(block(1, Hash::ZERO, 2)).is_err());
+        assert!(leader
+            .observe_proposal(BlockProposal { view: 2, block: block(1, Hash::ZERO, 2) })
+            .is_err());
+        assert_eq!(leader.open_proposal(), Some(&proposal));
+        assert_eq!(leader.view(), 1);
+    }
+
+    #[test]
+    fn unsafe_quorum_configuration_and_mismatched_identity_are_rejected() {
+        let (registry, keys) = registry(4);
+        let mut config = ConsensusConfig::new(4).unwrap();
+        config.quorum_threshold = 1;
+        assert!(ConsensusDriver::new(config, registry.clone(), Some(keys[0].clone())).is_err());
+        assert!(ConsensusDriver::new(
+            ConsensusConfig::new(4).unwrap(),
+            registry,
+            Some((keys[0].0, keys[1].1.clone()))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn checkpoints_reverify_votes_and_never_fabricate_a_missing_own_vote() {
+        let (registry, keys) = registry(4);
+        let config = ConsensusConfig::new(4).unwrap();
+        let identity = Some(keys[0].clone());
+        let mut driver =
+            ConsensusDriver::new(config.clone(), registry.clone(), identity.clone()).unwrap();
+        driver.propose(block(1, Hash::ZERO, 1)).unwrap();
+        let checkpoint = driver.checkpoint();
+        let restored = ConsensusDriver::from_checkpoint(
+            config.clone(),
+            registry.clone(),
+            identity.clone(),
+            checkpoint.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored.checkpoint(), checkpoint);
+        let mut missing = checkpoint.clone();
+        missing.votes.clear();
+        let mut forged = checkpoint.clone();
+        forged.votes[0].signature = vec![0xff; 96];
+        let mut duplicate = checkpoint.clone();
+        duplicate.votes.push(duplicate.votes[0].clone());
+        let mut detached = checkpoint;
+        detached.proposal = None;
+        for bad in [missing, forged, duplicate, detached] {
+            assert!(ConsensusDriver::from_checkpoint(
+                config.clone(),
+                registry.clone(),
+                identity.clone(),
+                bad
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn a_single_validator_commits_its_own_proposal() {
+        let (registry, keys) = registry(1);
+        let mut driver =
+            ConsensusDriver::new(ConsensusConfig::new(1).unwrap(), registry, Some(keys[0].clone()))
+                .unwrap();
+
+        let (proposal, vote) = driver.propose(block(1, Hash::ZERO, 1)).unwrap();
+        assert_eq!(
+            driver.receive_vote(vote).unwrap(),
+            VoteOutcome::Committed { view: proposal.view, block_hash: proposal.block.hash() }
+        );
+        assert_eq!(driver.height(), 1);
+        assert_eq!(driver.tip(), proposal.block.hash());
+        assert!(driver.open_proposal().is_none());
+    }
+
+    #[test]
+    fn a_restored_driver_extends_the_restored_tip() {
+        let (registry, keys) = registry(4);
+        let restored_tip = Hash::from_data(b"restored tip");
+        let mut driver = ConsensusDriver::with_tip(
+            ConsensusConfig::new(4).unwrap(),
+            registry,
+            Some(keys[0].clone()),
+            7,
+            restored_tip,
+        )
+        .unwrap();
+
+        assert_eq!(driver.height(), 7);
+        assert_eq!(driver.tip(), restored_tip);
+
+        // A block that ignores the restored tip is refused.
+        assert!(matches!(
+            driver.propose(block(1, Hash::ZERO, 1)),
+            Err(ConsensusError::InvalidProposal(_))
+        ));
+
+        let (proposal, _) = driver.propose(block(8, restored_tip, 2)).unwrap();
+        assert_eq!(proposal.view, 8);
+        assert_eq!(driver.height(), 7);
+    }
+
+    #[test]
+    fn a_restored_driver_needs_a_consistent_height_and_tip() {
+        let (registry, _) = registry(4);
+        assert!(matches!(
+            ConsensusDriver::with_tip(
+                ConsensusConfig::new(4).unwrap(),
+                registry.clone(),
+                None,
+                9,
+                Hash::ZERO,
+            ),
+            Err(ConsensusError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            ConsensusDriver::with_tip(
+                ConsensusConfig::new(4).unwrap(),
+                registry,
+                None,
+                0,
+                Hash::from_data(b"not the genesis tip"),
+            ),
+            Err(ConsensusError::InvalidConfig(_))
+        ));
     }
 
     #[test]

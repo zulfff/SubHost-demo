@@ -15,11 +15,14 @@ use libp2p::{
     identity::Keypair,
     kad::{self, store::MemoryStore},
     mdns, noise, ping,
-    swarm::{behaviour::toggle::Toggle, NetworkBehaviour, SwarmEvent},
+    swarm::{
+        behaviour::toggle::Toggle, dial_opts::DialOpts, ConnectionId, NetworkBehaviour, SwarmEvent,
+    },
     tcp, yamux, Multiaddr, PeerId, Swarm, SwarmBuilder,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -29,6 +32,33 @@ pub const TOPIC: &str = "subhost-txs";
 pub const MAX_TRANSMIT_BYTES: usize = 256 * 1024;
 /// Capacity of the inbound and outbound channels.
 const CHANNEL_CAPACITY: usize = 1_000;
+
+/// One configured endpoint, including the attempt ID used to match dial errors.
+struct BootstrapRetry {
+    address: Multiaddr,
+    attempt: Option<ConnectionId>,
+    connected: Option<PeerId>,
+    next_attempt: Instant,
+    delay: Duration,
+}
+
+impl BootstrapRetry {
+    fn new(address: Multiaddr) -> Self {
+        Self {
+            address,
+            attempt: None,
+            connected: None,
+            next_attempt: Instant::now(),
+            delay: Duration::from_secs(1),
+        }
+    }
+
+    fn failed(&mut self, now: Instant) {
+        self.attempt = None;
+        self.next_attempt = now + self.delay;
+        self.delay = (self.delay * 2).min(Duration::from_secs(30));
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
@@ -93,10 +123,19 @@ pub enum NetworkMessage {
     TransactionFluff { tx_hash: [u8; 32], data: Vec<u8> },
     /// A serialized DAG vertex.
     DagVertex { data: Vec<u8> },
-    /// A serialized block proposal.
-    BlockProposal { data: Vec<u8> },
-    /// A vote for a block hash.
-    Vote { block_hash: [u8; 32], signature: Vec<u8> },
+    /// A block proposal for one consensus view.
+    ///
+    /// `data` is the canonical block encoding; `view` lets a driver reject a
+    /// proposal that is not the next view before it spends time decoding.
+    BlockProposal { view: u64, data: Vec<u8> },
+    /// One validator's vote for a block in a view.
+    ///
+    /// `validator` is the 20-byte address the signature belongs to. Without it a
+    /// receiver cannot tell which registered key to verify against, and `view`
+    /// binds the vote to one proposal.
+    Vote { view: u64, validator: [u8; 20], block_hash: [u8; 32], signature: Vec<u8> },
+    /// A committed block and its independently verifiable quorum certificate.
+    BlockCommit { view: u64, data: Vec<u8>, signatures: Vec<([u8; 20], Vec<u8>)> },
 }
 
 impl NetworkMessage {
@@ -110,7 +149,22 @@ impl NetworkMessage {
                 data.len()
             }
             Self::TransactionFluff { data, .. } => data.len(),
-            Self::DagVertex { data } | Self::BlockProposal { data } => data.len(),
+            Self::DagVertex { data } | Self::BlockProposal { data, .. } => data.len(),
+            Self::BlockCommit { data, signatures, .. } => {
+                if data.is_empty() || signatures.is_empty() {
+                    return Err(NetworkError::InvalidMessage("empty block or certificate".into()));
+                }
+                signatures.iter().try_fold(data.len(), |size, (_, signature)| {
+                    if signature.len() != 96 {
+                        return Err(NetworkError::InvalidMessage(
+                            "malformed certificate signature".into(),
+                        ));
+                    }
+                    size.checked_add(20 + signature.len()).ok_or_else(|| {
+                        NetworkError::InvalidMessage("certificate size overflow".into())
+                    })
+                })?
+            }
             Self::Vote { signature, .. } => signature.len(),
         };
         if payload_len == 0 {
@@ -143,13 +197,20 @@ pub struct NetworkManager {
     outbound_rx: mpsc::Receiver<NetworkMessage>,
     inbound_tx: mpsc::Sender<NetworkMessage>,
     local_peer_id: PeerId,
+    bootstrap: Vec<BootstrapRetry>,
 }
 
 impl NetworkManager {
     /// Build the swarm and return it alongside the application's channels.
     pub fn new(config: NetworkConfig) -> Result<(Self, NetworkHandle), NetworkError> {
         // Validate configuration before allocating anything.
-        config.parsed_addresses()?;
+        let (_, bootstrap) = config.parsed_addresses()?;
+        let mut seen = HashSet::new();
+        let bootstrap = bootstrap
+            .into_iter()
+            .filter(|address| seen.insert(address.clone()))
+            .map(BootstrapRetry::new)
+            .collect();
 
         let id_keys = Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(id_keys.public());
@@ -202,7 +263,7 @@ impl NetworkManager {
             .with_behaviour(|_| Ok(behavior))
             .map_err(|error| NetworkError::Libp2p(error.to_string()))?
             .with_swarm_config(|config: libp2p::swarm::Config| {
-                config.with_idle_connection_timeout(std::time::Duration::from_secs(60))
+                config.with_idle_connection_timeout(Duration::from_secs(60))
             })
             .build();
 
@@ -218,6 +279,7 @@ impl NetworkManager {
                 outbound_rx,
                 inbound_tx,
                 local_peer_id,
+                bootstrap,
             },
             NetworkHandle { outbound: outbound_tx, inbound: inbound_rx, local_peer_id },
         ))
@@ -234,23 +296,20 @@ impl NetworkManager {
     /// Listen, dial the bootstrap set, then pump events until the outbound
     /// channel closes.
     pub async fn run(mut self) -> Result<(), NetworkError> {
-        let (listen_addr, bootstrap) = self.config.parsed_addresses()?;
+        let (listen_addr, _) = self.config.parsed_addresses()?;
         self.swarm
             .listen_on(listen_addr)
             .map_err(|error| NetworkError::Libp2p(error.to_string()))?;
 
-        for peer in bootstrap {
-            match self.swarm.dial(peer.clone()) {
-                Ok(()) => debug!(%peer, "dialling bootstrap peer"),
-                // One unreachable bootstrap peer must not stop the node.
-                Err(error) => warn!(%peer, %error, "cannot dial bootstrap peer"),
-            }
-        }
+        self.retry_bootstrap();
         info!("network started");
+        let mut retry_tick = tokio::time::interval(Duration::from_millis(250));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 event = self.swarm.select_next_some() => self.handle_event(event),
+                _ = retry_tick.tick() => self.retry_bootstrap(),
                 message = self.outbound_rx.recv() => match message {
                     Some(message) => self.publish(message),
                     // The application dropped its handle: shut down cleanly.
@@ -259,6 +318,42 @@ impl NetworkManager {
             }
         }
         Ok(())
+    }
+
+    fn retry_bootstrap(&mut self) {
+        let now = Instant::now();
+        for peer in &mut self.bootstrap {
+            if peer.attempt.is_some() || peer.connected.is_some() || now < peer.next_attempt {
+                continue;
+            }
+            let options = DialOpts::from(peer.address.clone());
+            let connection = options.connection_id();
+            match self.swarm.dial(options) {
+                Ok(()) => {
+                    peer.attempt = Some(connection);
+                    debug!(address = %peer.address, "dialling bootstrap endpoint");
+                }
+                Err(error) => {
+                    debug!(address = %peer.address, %error, "bootstrap dial deferred");
+                    peer.failed(now);
+                }
+            }
+        }
+    }
+
+    fn note_connection_closed(&mut self, peer_id: PeerId, remaining: u32) {
+        if remaining != 0 {
+            return;
+        }
+        self.connected_peers.remove(&peer_id);
+        for peer in &mut self.bootstrap {
+            if peer.connected == Some(peer_id) {
+                peer.connected = None;
+                peer.attempt = None;
+                peer.delay = Duration::from_secs(1);
+                peer.next_attempt = Instant::now() + peer.delay;
+            }
+        }
     }
 
     /// Publish one application message to the gossip topic.
@@ -286,13 +381,28 @@ impl NetworkManager {
             SwarmEvent::NewListenAddr { address, .. } => {
                 info!(%address, "listening");
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
                 self.connected_peers.insert(peer_id);
+                for peer in &mut self.bootstrap {
+                    if peer.attempt == Some(connection_id) {
+                        peer.attempt = None;
+                        peer.connected = Some(peer_id);
+                        peer.delay = Duration::from_secs(1);
+                    }
+                }
                 debug!(%peer_id, peers = self.connected_peers.len(), "peer connected");
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                self.connected_peers.remove(&peer_id);
+            SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                self.note_connection_closed(peer_id, num_established);
                 debug!(%peer_id, peers = self.connected_peers.len(), "peer disconnected");
+            }
+            SwarmEvent::OutgoingConnectionError { connection_id, error, .. } => {
+                for peer in &mut self.bootstrap {
+                    if peer.attempt == Some(connection_id) {
+                        debug!(address = %peer.address, %error, "bootstrap dial failed; will retry");
+                        peer.failed(Instant::now());
+                    }
+                }
             }
             SwarmEvent::Behaviour(SubhostBehaviorEvent::Gossipsub(gossipsub::Event::Message {
                 message,
@@ -366,6 +476,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retry_backoff_is_capped_and_final_disconnect_resets_it() {
+        let address = "/ip4/127.0.0.1/tcp/30333".parse().unwrap();
+        let mut retry = BootstrapRetry::new(address);
+        let now = Instant::now();
+        retry.failed(now);
+        assert_eq!(retry.next_attempt, now + Duration::from_secs(1));
+        for _ in 0..10 {
+            retry.failed(now);
+        }
+        assert_eq!(retry.delay, Duration::from_secs(30));
+        let peer_id = PeerId::random();
+        retry.connected = Some(peer_id);
+        let (mut manager, _) =
+            NetworkManager::new(NetworkConfig { enable_mdns: false, ..Default::default() })
+                .unwrap();
+        manager.bootstrap = vec![retry];
+        manager.connected_peers.insert(peer_id);
+        manager.note_connection_closed(peer_id, 1);
+        assert_eq!(manager.connected_peer_count(), 1);
+        assert_eq!(manager.bootstrap[0].connected, Some(peer_id));
+        manager.note_connection_closed(peer_id, 0);
+        assert_eq!(manager.connected_peer_count(), 0);
+        assert!(manager.bootstrap[0].connected.is_none());
+        assert_eq!(manager.bootstrap[0].delay, Duration::from_secs(1));
+    }
+
+    #[test]
     fn default_config_parses() {
         let (listen, bootstrap) = NetworkConfig::default().parsed_addresses().unwrap();
         assert_eq!(listen.to_string(), "/ip4/0.0.0.0/tcp/0");
@@ -408,10 +545,22 @@ mod tests {
     }
 
     #[test]
+    fn certificate_messages_require_a_bounded_nonempty_signature_list() {
+        for (data, signatures) in [
+            (Vec::new(), vec![([1; 20], vec![2; 96])]),
+            (vec![1], Vec::new()),
+            (vec![1], vec![([1; 20], vec![2; 95])]),
+            (vec![1; MAX_TRANSMIT_BYTES], vec![([1; 20], vec![2; 96])]),
+        ] {
+            assert!(NetworkMessage::BlockCommit { view: 1, data, signatures }.validate().is_err());
+        }
+    }
+
+    #[test]
     fn message_validation_rejects_empty_oversized_and_exhausted_payloads() {
         assert!(NetworkMessage::DagVertex { data: vec![1] }.validate().is_ok());
         assert!(NetworkMessage::DagVertex { data: Vec::new() }.validate().is_err());
-        assert!(NetworkMessage::BlockProposal { data: vec![0; MAX_TRANSMIT_BYTES + 1] }
+        assert!(NetworkMessage::BlockProposal { view: 1, data: vec![0; MAX_TRANSMIT_BYTES + 1] }
             .validate()
             .is_err());
 
@@ -424,9 +573,14 @@ mod tests {
         assert!(NetworkMessage::TransactionFluff { tx_hash: [0; 32], data: vec![1] }
             .validate()
             .is_ok());
-        assert!(NetworkMessage::Vote { block_hash: [0; 32], signature: Vec::new() }
-            .validate()
-            .is_err());
+        assert!(NetworkMessage::Vote {
+            view: 1,
+            validator: [2; 20],
+            block_hash: [0; 32],
+            signature: Vec::new()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
@@ -435,8 +589,18 @@ mod tests {
             NetworkMessage::TransactionStem { data: vec![1, 2], ttl: 4 },
             NetworkMessage::TransactionFluff { tx_hash: [7; 32], data: vec![3] },
             NetworkMessage::DagVertex { data: vec![4] },
-            NetworkMessage::BlockProposal { data: vec![5] },
-            NetworkMessage::Vote { block_hash: [9; 32], signature: vec![6] },
+            NetworkMessage::BlockCommit {
+                view: 4,
+                data: vec![5],
+                signatures: vec![([8; 20], vec![6; 96])],
+            },
+            NetworkMessage::BlockProposal { view: 4, data: vec![5] },
+            NetworkMessage::Vote {
+                view: 4,
+                validator: [8; 20],
+                block_hash: [9; 32],
+                signature: vec![6],
+            },
         ];
         for message in messages {
             let encoded = serde_json::to_vec(&message).unwrap();
@@ -482,7 +646,7 @@ mod tests {
             NetworkManager::new(NetworkConfig { enable_mdns: false, ..Default::default() })
                 .unwrap();
 
-        let message = NetworkMessage::BlockProposal { data: vec![1, 2, 3] };
+        let message = NetworkMessage::BlockProposal { view: 1, data: vec![1, 2, 3] };
         manager.handle_gossip(&serde_json::to_vec(&message).unwrap());
         assert_eq!(handle.inbound.recv().await, Some(message));
 

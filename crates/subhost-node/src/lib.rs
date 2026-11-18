@@ -4,19 +4,28 @@
 //! This is the single place that decides how a running node is assembled, so the
 //! CLI, tests, and container entrypoint cannot drift apart.
 //!
-//! Scope of the networking: a node publishes every block its own producer
-//! seals, and applies blocks received from peers through
-//! [`RpcState::accept_block`], which re-validates the whole block. Blocks that
-//! arrive before their parent are buffered briefly and applied in height order.
-//! There is no peer scoring, fork choice, or block request/response protocol.
+//! With a genesis validator set, the node exchanges proposals, verified votes
+//! and certified commits, and writes blocks through [`RpcState::commit_qc`].
+//! Demo chains without validators use [`RpcState::accept_block`] and buffer
+//! blocks that arrive before their parent. There are no consensus timeouts,
+//! view changes, peer scoring, fork choice, or historical block sync yet.
+
+mod consensus_journal;
+#[cfg(test)]
+mod testnet_tests;
 
 use bincode::Options;
+use consensus_journal::ConsensusJournal;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use subhost_consensus::ValidatorRegistry;
-use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, GenesisConfig};
+use std::sync::{Arc, Mutex};
+use subhost_consensus::{
+    driver::{BlockProposal as DriverProposal, ConsensusDriver, Vote, VoteOutcome},
+    ConsensusConfig, QuorumCertificate, ValidatorRegistry,
+};
+use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, GenesisConfig, Hash};
 use subhost_crypto::{BLSScheme, PrivateKey};
 use subhost_metrics::{Metrics, MetricsConfig};
 use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessage};
@@ -99,6 +108,9 @@ pub struct Node {
     metrics: Metrics,
     config: NodeConfig,
     genesis: Option<GenesisConfig>,
+    /// A driver for every node with a validator set. Observers verify without voting.
+    consensus: Option<Arc<Mutex<ConsensusDriver>>>,
+    consensus_journal: Option<Arc<ConsensusJournal>>,
 }
 
 impl Node {
@@ -135,15 +147,18 @@ impl Node {
             _ => None,
         };
 
+        let mut producer_identity = None;
         let authority = match (config.producer_key_path(), validators.as_ref()) {
             (None, _) => None,
             (Some(path), Some(validators)) => {
                 let (producer, secret) = load_producer(&path, genesis.as_ref())?;
                 info!(path = %path.display(), %producer, "loaded the producer key");
+                producer_identity = Some((producer, secret.clone()));
                 Some(BlockAuthority::new(validators.clone(), producer, secret)?)
             }
             (Some(path), None) => return Err(NodeError::NoValidatorSetForProducer(path)),
         };
+        let driver_registry = validators.clone();
 
         let store = LedgerStore::open(chain_id, &config.data_dir)?;
         let fresh = !store.exists();
@@ -154,6 +169,24 @@ impl Node {
         if let Some(authority) = authority {
             state = state.with_authority(authority);
         }
+
+        let (consensus, consensus_journal) = match (driver_registry, producer_identity) {
+            (Some(registry), identity) => {
+                let binding =
+                    consensus_genesis_hash(genesis.as_ref().expect("registry requires genesis"));
+                let (journal, driver) = ConsensusJournal::open(
+                    &config.data_dir,
+                    &state,
+                    binding,
+                    ConsensusConfig::new(registry.len())?,
+                    registry,
+                    identity,
+                    fresh,
+                )?;
+                (Some(Arc::new(Mutex::new(driver))), Some(Arc::new(journal)))
+            }
+            _ => (None, None),
+        };
 
         if fresh {
             if let Some(genesis) = &genesis {
@@ -180,7 +213,7 @@ impl Node {
         metrics.set_block_height(state.block_height());
         metrics.set_pending_transactions(state.pending_count());
 
-        Ok(Self { state, metrics, config, genesis })
+        Ok(Self { state, metrics, config, genesis, consensus, consensus_journal })
     }
 
     pub fn state(&self) -> &RpcState {
@@ -197,6 +230,11 @@ impl Node {
 
     pub fn genesis(&self) -> Option<&GenesisConfig> {
         self.genesis.as_ref()
+    }
+
+    /// The consensus driver, when genesis declares a validator set.
+    pub fn consensus(&self) -> Option<&Arc<Mutex<ConsensusDriver>>> {
+        self.consensus.as_ref()
     }
 
     pub fn chain_id(&self) -> ChainId {
@@ -238,16 +276,37 @@ impl Node {
             })
         };
 
-        let network_task = self.config.network.clone().map(|config| {
-            let state = self.state.clone();
-            tokio::spawn(async move {
-                if let Err(error) = run_network(state, config).await {
-                    warn!(%error, "peer gossip stopped");
-                }
-            })
-        });
+        let network_task = match (self.config.network.clone(), self.consensus.clone()) {
+            (Some(config), Some(driver)) => {
+                let state = self.state.clone();
+                let journal = self.consensus_journal.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(error) =
+                        run_network_with_journal(state, config, driver, journal).await
+                    {
+                        warn!(%error, "peer gossip stopped");
+                    }
+                }))
+            }
+            (Some(config), None) => {
+                let state = self.state.clone();
+                Some(tokio::spawn(async move {
+                    if let Err(error) = run_network(state, config).await {
+                        warn!(%error, "peer gossip stopped");
+                    }
+                }))
+            }
+            // A validator without peers still has to produce, so the driver runs
+            // even when gossip is disabled.
+            (None, Some(driver)) => {
+                let state = self.state.clone();
+                let journal = self.consensus_journal.clone();
+                Some(tokio::spawn(produce_blocks(state, Some(driver), None, journal)))
+            }
+            (None, None) => None,
+        };
 
-        let rpc = RpcServer::new(self.state.clone());
+        let rpc = RpcServer::new(self.state.clone()).with_metrics(self.metrics.clone());
         let result = tokio::select! {
             result = rpc.run(rpc_config) => result.map_err(NodeError::from),
             result = shutdown_signal() => result,
@@ -266,6 +325,22 @@ impl Node {
 
 /// How far ahead of the local tip a peer block may be buffered.
 const MAX_BLOCKS_AHEAD: BlockHeight = 64;
+
+fn consensus_genesis_hash(genesis: &GenesisConfig) -> Hash {
+    // HashMap iteration order changes across processes; account allocations
+    // must be ordered before binding a recovery file to its genesis.
+    let mut allocations: Vec<_> =
+        genesis.allocations.iter().map(|(address, balance)| (*address, *balance)).collect();
+    allocations.sort_unstable();
+    Hash::from_data(&encode_canonical(&(
+        genesis.chain_id,
+        &genesis.initial_validators,
+        allocations,
+        genesis.block_time_ms,
+        genesis.gas_limit,
+        genesis.genesis_time,
+    )))
+}
 
 /// Holds peer blocks that arrived before their parent.
 ///
@@ -293,6 +368,7 @@ impl BlockBuffer {
         self.pending.remove(&next_height)
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.pending.len()
     }
@@ -341,6 +417,34 @@ fn decode_block(data: &[u8]) -> Result<Block, bincode::Error> {
 /// The swarm and the application loop live in one task, so aborting the task
 /// stops both. Nothing is spawned here that could outlive the node.
 async fn run_network(state: RpcState, config: NetworkConfig) -> Result<(), NodeError> {
+    run_network_inner(state, config, None, None).await
+}
+
+/// Gossip plus block production for a node that holds a consensus driver.
+#[cfg(test)]
+async fn run_network_with_driver(
+    state: RpcState,
+    config: NetworkConfig,
+    driver: Arc<Mutex<ConsensusDriver>>,
+) -> Result<(), NodeError> {
+    run_network_inner(state, config, Some(driver), None).await
+}
+
+async fn run_network_with_journal(
+    state: RpcState,
+    config: NetworkConfig,
+    driver: Arc<Mutex<ConsensusDriver>>,
+    journal: Option<Arc<ConsensusJournal>>,
+) -> Result<(), NodeError> {
+    run_network_inner(state, config, Some(driver), journal).await
+}
+
+async fn run_network_inner(
+    state: RpcState,
+    config: NetworkConfig,
+    driver: Option<Arc<Mutex<ConsensusDriver>>>,
+    journal: Option<Arc<ConsensusJournal>>,
+) -> Result<(), NodeError> {
     let (manager, handle) = NetworkManager::new(config)?;
     let local_peer_id = handle.local_peer_id;
     let NetworkHandle { outbound, mut inbound, .. } = handle;
@@ -356,8 +460,234 @@ async fn run_network(state: RpcState, config: NetworkConfig) -> Result<(), NodeE
             }
             Ok(())
         }
-        () = pump_gossip(&state, &outbound, &mut inbound, &mut block_events, &mut buffer) => {
+        () = pump_gossip(&state, &outbound, &mut inbound, &mut block_events, &mut buffer, driver.as_ref(), journal.as_deref()) => {
             Ok(())
+        }
+        () = produce_blocks(state.clone(), driver.clone(), Some(outbound.clone()), journal.clone()) => {
+            Ok(())
+        }
+    }
+}
+
+/// One proposal ready to broadcast, possibly from an observer.
+struct ProducedRound {
+    proposal: DriverProposal,
+    vote: Option<Vote>,
+}
+
+/// Commit a certified candidate before advancing the live consensus driver.
+/// Valid votes stay in the live tally on I/O failure, so the ticker can retry.
+fn commit_ready(
+    state: &RpcState,
+    driver: &mut ConsensusDriver,
+    journal: Option<&ConsensusJournal>,
+) -> Result<(), NodeError> {
+    let Some(qc) = driver.pending_qc() else { return Ok(()) };
+    let block = driver.open_proposal().expect("pending QC requires a proposal").block.clone();
+    let mut candidate = driver.clone();
+    if !matches!(candidate.commit_open_proposal()?, VoteOutcome::Committed { .. }) {
+        return Ok(());
+    }
+    if let Some(journal) = journal {
+        journal.prepare_commit(driver, block.clone(), qc.clone())?;
+    }
+    state.commit_qc(block, &qc)?;
+    *driver = candidate;
+    if let Some(journal) = journal {
+        journal.save(driver)?;
+    }
+    Ok(())
+}
+
+/// Build a proposal or retry a pending certificate without committing alone.
+fn produce_once_inner(
+    state: &RpcState,
+    driver: &mut ConsensusDriver,
+    journal: Option<&ConsensusJournal>,
+) -> Result<Option<ProducedRound>, NodeError> {
+    if driver.open_proposal().is_none() && driver.is_validator() {
+        if let Some(block) = state.build_block()? {
+            let mut candidate = driver.clone();
+            candidate.propose(block)?;
+            adopt_pending(driver, candidate, journal)?;
+        }
+    }
+    let round = driver
+        .open_proposal()
+        .cloned()
+        .map(|proposal| ProducedRound { proposal, vote: driver.own_vote().cloned() });
+    commit_ready(state, driver, journal)?;
+    Ok(round)
+}
+
+#[cfg(test)]
+fn produce_once(
+    state: &RpcState,
+    driver: &mut ConsensusDriver,
+) -> Result<Option<ProducedRound>, NodeError> {
+    produce_once_inner(state, driver, None)
+}
+
+fn adopt_pending(
+    driver: &mut ConsensusDriver,
+    candidate: ConsensusDriver,
+    journal: Option<&ConsensusJournal>,
+) -> Result<(), NodeError> {
+    if let Some(journal) = journal {
+        if candidate.checkpoint() != driver.checkpoint() {
+            journal.save(&candidate)?;
+        }
+    }
+    *driver = candidate;
+    Ok(())
+}
+
+fn vote_message(vote: &Vote) -> NetworkMessage {
+    NetworkMessage::Vote {
+        view: vote.view,
+        validator: *vote.validator.as_bytes(),
+        block_hash: *vote.block_hash.as_bytes(),
+        signature: vote.signature.clone(),
+    }
+}
+
+fn relay(outbound: &tokio::sync::mpsc::Sender<NetworkMessage>, message: NetworkMessage) {
+    if outbound.try_send(message).is_err() {
+        debug!("outbound gossip queue is full; consensus message was not relayed");
+    }
+}
+
+/// Validate inbound consensus traffic before voting or publishing it.
+fn handle_consensus_message_inner(
+    state: &RpcState,
+    driver: &mut ConsensusDriver,
+    message: NetworkMessage,
+    journal: Option<&ConsensusJournal>,
+) -> Result<Option<Vote>, NodeError> {
+    match message {
+        NetworkMessage::BlockProposal { view, data } => {
+            let block = decode_block(&data)
+                .map_err(|error| subhost_rpc::RpcError::BlockRejected(error.to_string()))?;
+            if block.header.height <= driver.height() {
+                return Ok(None);
+            }
+            state.validate_proposal(&block)?;
+            let mut candidate = driver.clone();
+            let vote = candidate.observe_proposal(DriverProposal { view, block })?;
+            adopt_pending(driver, candidate, journal)?;
+            commit_ready(state, driver, journal)?;
+            Ok(vote)
+        }
+        NetworkMessage::Vote { view, validator, block_hash, signature } => {
+            let vote = Vote {
+                view,
+                validator: Address::new(validator),
+                block_hash: Hash::new(block_hash),
+                signature,
+            };
+            let mut candidate = driver.clone();
+            let fresh = candidate.record_vote(vote.clone())?;
+            adopt_pending(driver, candidate, journal)?;
+            commit_ready(state, driver, journal)?;
+            Ok(fresh.then_some(vote))
+        }
+        NetworkMessage::BlockCommit { view, data, signatures } => {
+            let block = decode_block(&data)
+                .map_err(|error| subhost_rpc::RpcError::BlockRejected(error.to_string()))?;
+            if block.header.height <= driver.height() {
+                return Ok(None);
+            }
+            let qc = QuorumCertificate {
+                view,
+                block_hash: block.hash(),
+                signatures: signatures
+                    .into_iter()
+                    .map(|(address, signature)| (Address::new(address), signature))
+                    .collect(),
+            };
+            let mut candidate = driver.clone();
+            candidate.receive_commit(block.clone(), qc.clone())?;
+            if let Some(journal) = journal {
+                journal.prepare_commit(driver, block.clone(), qc.clone())?;
+            }
+            state.commit_qc(block, &qc)?;
+            *driver = candidate;
+            if let Some(journal) = journal {
+                journal.save(driver)?;
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+fn handle_consensus_message(
+    state: &RpcState,
+    driver: &mut ConsensusDriver,
+    message: NetworkMessage,
+) -> Result<Option<Vote>, NodeError> {
+    handle_consensus_message_inner(state, driver, message, None)
+}
+
+/// Retry proposal/vote/commit dissemination as peers join the mesh.
+async fn produce_blocks(
+    state: RpcState,
+    driver: Option<Arc<Mutex<ConsensusDriver>>>,
+    outbound: Option<tokio::sync::mpsc::Sender<NetworkMessage>>,
+    journal: Option<Arc<ConsensusJournal>>,
+) {
+    let Some(driver) = driver else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let block_time = std::time::Duration::from_millis(subhost_core::DEFAULT_BLOCK_TIME_MS.max(100));
+    let mut ticker = tokio::time::interval(block_time);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let result = {
+            let Ok(mut driver) = driver.lock() else {
+                warn!("consensus lock poisoned; stopping producer");
+                return;
+            };
+            produce_once_inner(&state, &mut driver, journal.as_deref()).map(|round| {
+                (round, driver.committed_qc().cloned().zip(state.block_at_height(driver.height())))
+            })
+        };
+        let (round, committed) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                warn!(%error, "consensus round failed");
+                continue;
+            }
+        };
+        let Some(outbound) = &outbound else { continue };
+        if let Some(round) = round {
+            relay(
+                outbound,
+                NetworkMessage::BlockProposal {
+                    view: round.proposal.view,
+                    data: encode_block(&round.proposal.block),
+                },
+            );
+            if let Some(vote) = round.vote {
+                relay(outbound, vote_message(&vote));
+            }
+        }
+        if let Some((qc, block)) = committed {
+            relay(
+                outbound,
+                NetworkMessage::BlockCommit {
+                    view: qc.view,
+                    data: encode_block(&block),
+                    signatures: qc
+                        .signatures
+                        .into_iter()
+                        .map(|(address, signature)| (*address.as_bytes(), signature))
+                        .collect(),
+                },
+            );
         }
     }
 }
@@ -369,18 +699,33 @@ async fn pump_gossip(
     inbound: &mut tokio::sync::mpsc::Receiver<NetworkMessage>,
     block_events: &mut tokio::sync::broadcast::Receiver<BlockEvent>,
     buffer: &mut BlockBuffer,
+    driver: Option<&Arc<Mutex<ConsensusDriver>>>,
+    journal: Option<&ConsensusJournal>,
 ) {
     loop {
         tokio::select! {
             message = inbound.recv() => match message {
-                Some(NetworkMessage::BlockProposal { data }) => match decode_block(&data) {
-                    Ok(block) => {
-                        buffer.offer(block, state.block_height().saturating_add(1));
-                        debug!(buffered = buffer.len(), "evaluating a peer block");
-                        apply_buffered(state, buffer);
+                Some(message) if driver.is_some() => {
+                    let Some(driver) = driver else { continue };
+                    let result = match driver.lock() {
+                        Ok(mut driver) => handle_consensus_message_inner(state, &mut driver, message, journal),
+                        Err(_) => { warn!("consensus lock poisoned; stopping gossip application"); return; }
+                    };
+                    match result {
+                        Ok(Some(vote)) => relay(outbound, vote_message(&vote)),
+                        Ok(None) => {},
+                        Err(error) => debug!(%error, "discarding invalid consensus traffic"),
                     }
-                    Err(error) => debug!(%error, "discarding an undecodable peer block"),
-                },
+                }
+                Some(NetworkMessage::BlockProposal { view: 0, data }) if !state.has_validator_set() => {
+                    match decode_block(&data) {
+                        Ok(block) => {
+                            buffer.offer(block, state.block_height().saturating_add(1));
+                            apply_buffered(state, buffer);
+                        }
+                        Err(error) => debug!(%error, "discarding an undecodable peer block"),
+                    }
+                }
                 // Other flows exist on the wire but are not driven here.
                 Some(_) => {}
                 None => break,
@@ -389,7 +734,10 @@ async fn pump_gossip(
                 // Only relay blocks this node produced; a received block already
                 // reached every peer through gossip.
                 Ok(BlockEvent::Sealed(block)) => {
-                    let message = NetworkMessage::BlockProposal { data: encode_block(&block) };
+                    // Legacy single-writer blocks have no consensus view; the
+                    // receiver only decodes the block payload.
+                    let message =
+                        NetworkMessage::BlockProposal { view: 0, data: encode_block(&block) };
                     if outbound.try_send(message).is_err() {
                         debug!("outbound gossip queue is full; a block was not relayed");
                     }
@@ -539,6 +887,9 @@ async fn shutdown_signal() -> Result<(), NodeError> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum NodeError {
+    #[error("consensus journal {path}: {detail}")]
+    ConsensusJournal { path: PathBuf, detail: String },
+
     #[error("cannot create data directory {path}: {source}")]
     DataDir {
         path: PathBuf,
@@ -716,6 +1067,16 @@ mod tests {
         let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
         node.state().seed_accounts([(sender, 1_000_000)]).unwrap();
         node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+        assert_eq!(
+            node.state().block_height(),
+            0,
+            "under consensus the RPC submission only admits; the producer commits"
+        );
+
+        let driver = node.consensus().expect("a validator node must own a driver");
+        let mut driver = driver.lock().unwrap();
+        assert!(produce_once(node.state(), &mut driver).unwrap().is_some());
+        drop(driver);
 
         let block = node.state().block_at_height(1).unwrap();
         assert_eq!(
@@ -723,6 +1084,282 @@ mod tests {
             "blocks must be signed as the genesis validator"
         );
         assert_eq!(block.signatures.len(), 1);
+    }
+
+    pub(super) fn validator_nodes(count: u8) -> (Vec<tempfile::TempDir>, Vec<Node>) {
+        let tx_key = signing_key(7);
+        let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+        let keys: Vec<_> = (0..count).map(|_| BLSScheme::keygen().0).collect();
+        let mut genesis = genesis_with(1, Some((sender, 1_000_000)));
+        genesis.initial_validators = keys
+            .iter()
+            .enumerate()
+            .map(|(index, secret)| ValidatorInfo {
+                address: Address::new([index as u8 + 1; 20]),
+                public_key: BLSScheme::encode_public_key(&BLSScheme::public_key(secret)),
+                power: 100,
+                proof_of_possession: BLSScheme::encode_signature(&BLSScheme::proof_of_possession(
+                    secret,
+                )),
+            })
+            .collect();
+        let dirs: Vec<_> = keys
+            .iter()
+            .map(|secret| {
+                let dir = tempfile::tempdir().unwrap();
+                genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+                write_test_producer_key(dir.path(), secret);
+                dir
+            })
+            .collect();
+        let nodes = dirs
+            .iter()
+            .map(|dir| {
+                Node::bootstrap(NodeConfig { validator: true, ..NodeConfig::new(dir.path()) })
+                    .unwrap()
+            })
+            .collect();
+        (dirs, nodes)
+    }
+
+    #[test]
+    fn four_validator_nodes_require_three_votes_before_a_ledger_write() {
+        for voting_nodes in [4, 3, 2] {
+            let (dirs, nodes) = validator_nodes(4);
+            let manifests: Vec<_> = dirs
+                .iter()
+                .map(|dir| {
+                    std::fs::read(
+                        dir.path()
+                            .join(subhost_storage::LEDGER_DIR_NAME)
+                            .join(subhost_storage::MANIFEST_FILE_NAME),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let tx = signed_transfer(&signing_key(7), 0, 10);
+            let hash = nodes[0].state().submit_transaction(tx).unwrap();
+            let round =
+                produce_once(nodes[0].state(), &mut nodes[0].consensus().unwrap().lock().unwrap())
+                    .unwrap()
+                    .unwrap();
+            let mut votes = vec![round.vote.unwrap()];
+            for node in &nodes[1..voting_nodes] {
+                let vote = handle_consensus_message(
+                    node.state(),
+                    &mut node.consensus().unwrap().lock().unwrap(),
+                    NetworkMessage::BlockProposal {
+                        view: round.proposal.view,
+                        data: encode_block(&round.proposal.block),
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                votes.push(vote);
+            }
+            for (index, node) in nodes[..voting_nodes].iter().enumerate() {
+                for vote in &votes {
+                    handle_consensus_message(
+                        node.state(),
+                        &mut node.consensus().unwrap().lock().unwrap(),
+                        vote_message(vote),
+                    )
+                    .unwrap();
+                }
+                let driver = node.consensus().unwrap().lock().unwrap();
+                if voting_nodes >= 3 {
+                    assert_eq!(node.state().block_height(), 1);
+                    assert_eq!(driver.height(), 1);
+                    assert_eq!(driver.tip(), round.proposal.block.hash());
+                    assert!(node.state().receipt(&hash).is_some());
+                    assert_eq!(node.state().balance(&Address::new([2; 20])), 10);
+                } else {
+                    assert_eq!(node.state().block_height(), 0);
+                    assert_eq!(driver.height(), 0);
+                    assert!(node.state().receipt(&hash).is_none());
+                    assert_eq!(node.state().balance(&Address::new([2; 20])), 0);
+                    assert_eq!(
+                        std::fs::read(
+                            dirs[index]
+                                .path()
+                                .join(subhost_storage::LEDGER_DIR_NAME)
+                                .join(subhost_storage::MANIFEST_FILE_NAME)
+                        )
+                        .unwrap(),
+                        manifests[index]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_observer_can_commit_a_certified_block_without_a_signing_key() {
+        let (dirs, nodes) = validator_nodes(1);
+        let observer_dir = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            dirs[0].path().join(GENESIS_FILE_NAME),
+            observer_dir.path().join(GENESIS_FILE_NAME),
+        )
+        .unwrap();
+        let observer = Node::bootstrap(NodeConfig::new(observer_dir.path())).unwrap();
+        assert!(!observer.consensus().unwrap().lock().unwrap().is_validator());
+        nodes[0].state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+        produce_once(nodes[0].state(), &mut nodes[0].consensus().unwrap().lock().unwrap()).unwrap();
+        let qc = nodes[0].consensus().unwrap().lock().unwrap().committed_qc().unwrap().clone();
+        let block = nodes[0].state().block_at_height(1).unwrap();
+        let mut driver = observer.consensus().unwrap().lock().unwrap();
+        let vote = handle_consensus_message(
+            observer.state(),
+            &mut driver,
+            NetworkMessage::BlockProposal { view: 1, data: encode_block(&block) },
+        )
+        .unwrap();
+        assert!(vote.is_none());
+        assert_eq!(observer.state().block_height(), 0);
+        let message = NetworkMessage::BlockCommit {
+            view: qc.view,
+            data: encode_block(&block),
+            signatures: qc
+                .signatures
+                .into_iter()
+                .map(|(address, signature)| (*address.as_bytes(), signature))
+                .collect(),
+        };
+        assert!(handle_consensus_message(observer.state(), &mut driver, message.clone())
+            .unwrap()
+            .is_none());
+        assert_eq!(observer.state().block_height(), 1);
+        assert_eq!(observer.state().tip_hash(), block.hash());
+        handle_consensus_message(observer.state(), &mut driver, message).unwrap();
+        assert_eq!(observer.state().balance(&Address::new([2; 20])), 10);
+    }
+
+    #[test]
+    fn a_failed_quorum_write_keeps_the_tip_and_retries_the_certificate() {
+        let (dirs, nodes) = validator_nodes(1);
+        let node = &nodes[0];
+        let tx = signed_transfer(&signing_key(7), 0, 10);
+        let hash = node.state().submit_transaction(tx).unwrap();
+        let ledger = dirs[0].path().join(subhost_storage::LEDGER_DIR_NAME);
+        let saved = dirs[0].path().join("saved-ledger");
+        std::fs::rename(&ledger, &saved).unwrap();
+        std::fs::write(&ledger, b"block ledger directory creation").unwrap();
+        let mut driver = node.consensus().unwrap().lock().unwrap();
+        assert!(produce_once(node.state(), &mut driver).is_err());
+        assert_eq!(driver.height(), 0);
+        assert_eq!(node.state().block_height(), 0);
+        assert!(driver.pending_qc().is_some());
+        assert!(node.state().receipt(&hash).is_none());
+        assert_eq!(node.state().pending_count(), 1);
+        let block_hash = driver.open_proposal().unwrap().block.hash();
+        std::fs::remove_file(&ledger).unwrap();
+        std::fs::rename(&saved, &ledger).unwrap();
+        produce_once(node.state(), &mut driver).unwrap();
+        assert_eq!(driver.tip(), block_hash);
+        assert_eq!(node.state().tip_hash(), block_hash);
+        assert_eq!(node.state().pending_count(), 0);
+        assert!(node.state().receipt(&hash).is_some());
+    }
+
+    #[test]
+    fn restarting_a_validator_restores_the_committed_height_and_view() {
+        let (_dirs, nodes) = validator_nodes(1);
+        let node = &nodes[0];
+        node.state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+        produce_once(node.state(), &mut node.consensus().unwrap().lock().unwrap()).unwrap();
+        let first_hash = node.state().tip_hash();
+        let config = node.config().clone();
+        drop(nodes);
+        let restarted = Node::bootstrap(config).unwrap();
+        assert_eq!(restarted.consensus().unwrap().lock().unwrap().view(), 1);
+        restarted.state().submit_transaction(signed_transfer(&signing_key(7), 1, 20)).unwrap();
+        produce_once(restarted.state(), &mut restarted.consensus().unwrap().lock().unwrap())
+            .unwrap();
+        assert_eq!(restarted.state().block_height(), 2);
+        assert_eq!(restarted.state().block_at_height(2).unwrap().header.parent_hash, first_hash);
+    }
+
+    #[test]
+    fn invalid_or_unseen_consensus_traffic_cannot_trigger_a_vote() {
+        let (_dirs, nodes) = validator_nodes(2);
+        nodes[0].state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+        let round =
+            produce_once(nodes[0].state(), &mut nodes[0].consensus().unwrap().lock().unwrap())
+                .unwrap()
+                .unwrap();
+        let follower = &nodes[1];
+        let mut driver = follower.consensus().unwrap().lock().unwrap();
+        assert!(handle_consensus_message(
+            follower.state(),
+            &mut driver,
+            vote_message(round.vote.as_ref().unwrap())
+        )
+        .is_err());
+        let mut tampered = round.proposal.block.clone();
+        tampered.transactions[0].value += 1;
+        assert!(handle_consensus_message(
+            follower.state(),
+            &mut driver,
+            NetworkMessage::BlockProposal { view: 1, data: encode_block(&tampered) }
+        )
+        .is_err());
+        assert_eq!(driver.view(), 0);
+        assert!(driver.open_proposal().is_none());
+        let mut malformed = round.vote.unwrap();
+        malformed.signature = vec![0xff; 96];
+        handle_consensus_message(
+            follower.state(),
+            &mut driver,
+            NetworkMessage::BlockProposal { view: 1, data: encode_block(&round.proposal.block) },
+        )
+        .unwrap();
+        assert!(handle_consensus_message(follower.state(), &mut driver, vote_message(&malformed))
+            .is_err());
+        assert_eq!(follower.state().block_height(), 0);
+        assert!(driver.pending_qc().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_validators_commit_over_real_loopback_gossip() {
+        let (_dirs, nodes) = validator_nodes(2);
+        let (first_port, second_port) = two_free_loopback_ports();
+        let first_task = tokio::spawn(run_network_with_driver(
+            nodes[0].state().clone(),
+            NetworkConfig {
+                listen_addr: format!("/ip4/127.0.0.1/tcp/{first_port}"),
+                enable_mdns: false,
+                ..Default::default()
+            },
+            nodes[0].consensus().unwrap().clone(),
+        ));
+        wait_until_listening(first_port).await;
+        let second_task = tokio::spawn(run_network_with_driver(
+            nodes[1].state().clone(),
+            NetworkConfig {
+                listen_addr: format!("/ip4/127.0.0.1/tcp/{second_port}"),
+                enable_mdns: false,
+                bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/{first_port}")],
+                ..Default::default()
+            },
+            nodes[1].consensus().unwrap().clone(),
+        ));
+        let hash =
+            nodes[0].state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while nodes.iter().any(|node| node.state().block_height() != 1) {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        first_task.abort();
+        second_task.abort();
+        assert!(result.is_ok(), "both validators must commit after gossip quorum");
+        assert_eq!(nodes[0].state().tip_hash(), nodes[1].state().tip_hash());
+        assert_eq!(nodes[0].state().state_root(), nodes[1].state().state_root());
+        for node in &nodes {
+            assert!(node.state().receipt(&hash).is_some());
+        }
     }
 
     #[test]
@@ -818,15 +1455,15 @@ mod tests {
         let address = genesis.initial_validators[0].address;
         let producer = RpcState::in_memory(1)
             .unwrap()
-            .with_authority(BlockAuthority::new(registry, address, secret).unwrap());
+            .with_authority(BlockAuthority::new(registry, address, secret.clone()).unwrap());
 
         let tx_key = signing_key(7);
         let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
         producer.seed_accounts([(sender, 1_000_000)]).unwrap();
         producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+        let block = producer.build_block().unwrap().unwrap();
         node.state().seed_accounts([(sender, 1_000_000)]).unwrap();
 
-        let block = producer.block_at_height(1).unwrap();
         let mut unsigned = block.clone();
         unsigned.signatures.clear();
         assert!(matches!(
@@ -835,7 +1472,18 @@ mod tests {
         ));
         assert_eq!(node.state().block_height(), 0);
 
-        node.state().accept_block(block).unwrap();
+        let qc = QuorumCertificate {
+            view: 1,
+            block_hash: block.hash(),
+            signatures: vec![(
+                address,
+                BLSScheme::encode_signature(&BLSScheme::sign(
+                    &secret,
+                    &QuorumCertificate::payload_for(1, &block.hash()),
+                )),
+            )],
+        };
+        node.state().commit_qc(block, &qc).unwrap();
         assert_eq!(node.state().block_height(), 1);
         assert_eq!(node.state().balance(&Address::new([2; 20])), 10);
     }
@@ -882,11 +1530,11 @@ mod tests {
         assert!(!config.validator);
     }
 
-    fn signing_key(seed: u8) -> SigningKey {
+    pub(super) fn signing_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
     }
 
-    fn signed_transfer(key: &SigningKey, nonce: u64, value: u128) -> Transaction {
+    pub(super) fn signed_transfer(key: &SigningKey, nonce: u64, value: u128) -> Transaction {
         let public_key = key.verifying_key().to_bytes();
         let mut tx = Transaction {
             tx_type: TransactionType::Transfer,
@@ -1027,7 +1675,7 @@ mod tests {
     /// that dial can happen before the producer has bound its listener, and because
     /// there is no redial the mesh never forms. Waiting for the port first removes
     /// that ordering dependency.
-    async fn wait_until_listening(port: u16) {
+    pub(super) async fn wait_until_listening(port: u16) {
         for _ in 0..250 {
             if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
                 return;
@@ -1077,7 +1725,7 @@ mod tests {
             // Newest first: the follower must buffer height 2 until height 1
             // arrives, then apply both.
             for block in [&second, &first] {
-                let message = NetworkMessage::BlockProposal { data: encode_block(block) };
+                let message = NetworkMessage::BlockProposal { view: 0, data: encode_block(block) };
                 if handle.outbound.send(message).await.is_err() {
                     break;
                 }

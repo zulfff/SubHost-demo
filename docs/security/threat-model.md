@@ -16,12 +16,14 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
 > subset that requires a valid signature bound to the sender; Merkle state and
 > receipt commitments with per-account inclusion proofs; multi-transaction block
 > production and full re-validation of peer blocks; BLS-verified quorum
-> certificates with an in-process `2f + 1` driver; stake-deducting slashing; a
+> certificates with an `n - f` linear driver wired into validator nodes;
+> stake-deducting slashing; a
 > libp2p gossip transport that the node uses for live block propagation; and an IBC
 > light client that verifies a single ed25519 signer's headers and Merkle
 > commitment proofs.
 >
-> **Not implemented:** consensus inside the node, fork choice, reorg handling,
+> **Not implemented:** authenticated historical QC replay, timeout/view change, leader
+> rotation, fork choice, reorg handling,
 > block sync/backfill, peer scoring, an encrypted mempool, Dandelion++ routing,
 > threshold encryption, on-chain governance, EVM or WASM execution, zk proofs, a
 > Merkle Patricia Trie, non-membership proofs, validator-set rotation or multisig
