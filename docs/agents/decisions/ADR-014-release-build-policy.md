@@ -1,6 +1,6 @@
 # ADR-014: Bound release identity and retain test safety checks
 
-Date: 2026-11-19. Track B; review thread Q-023.
+Date: 2026-11-19. Tracks A and B agreed through Q-023.
 
 ## Decision
 
@@ -8,6 +8,9 @@ Release tags must match the workspace package version and a reviewed main-ancest
 source commit. The workspace remains 0.1.0; v0 and alpha/beta/rc artifacts are
 prereleases. Stable v1 requires the real S12 review and protected release approval.
 No tag/live release is created by this implementation.
+A separate coordinated version contract may advance the workspace and internal
+requirements/lockfile to 1.0.0-rc.1 after the current API and infrastructure are
+ready. The RC label remains a prerelease and creates no migration guarantee.
 
 Run the seven reusable CI checks before packaging. Pin the compiler to1.93.0,
 build/link in the immutable Rust image and use --locked. Publish source/lock/tool
