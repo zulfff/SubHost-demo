@@ -22,7 +22,6 @@ use ark_ff::{Field, PrimeField, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rand::RngCore;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Domain separation tag for protocol BLS signatures.
@@ -57,15 +56,14 @@ pub struct BLSScheme;
 impl BLSScheme {
     /// Generate a keypair with a non-zero secret scalar.
     pub fn keygen() -> (PrivateKey, PublicKey) {
-        let mut rng = rand::thread_rng();
         let mut bytes = [0u8; 32];
-        rng.fill_bytes(&mut bytes);
+        rand::fill(&mut bytes);
 
         // A zero scalar would produce the identity public key, which verifies
         // against anything; resample until it is non-zero.
         let mut scalar = Scalar::from_le_bytes_mod_order(&bytes);
         while scalar.is_zero() {
-            rng.fill_bytes(&mut bytes);
+            rand::fill(&mut bytes);
             scalar = Scalar::from_le_bytes_mod_order(&bytes);
         }
         bytes.zeroize();
@@ -252,17 +250,22 @@ pub struct SymmetricEncryption;
 impl SymmetricEncryption {
     pub fn generate_key() -> [u8; 32] {
         let mut key = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::fill(&mut key);
         key
     }
 
     pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+        let cipher = ChaCha20Poly1305::new(
+            &Key::try_from(&key[..]).map_err(|_| CryptoError::EncryptionFailed)?,
+        );
         let mut nonce_bytes = [0u8; AEAD_NONCE_BYTES];
-        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        rand::fill(&mut nonce_bytes);
 
         let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
+            .encrypt(
+                &Nonce::try_from(&nonce_bytes[..]).map_err(|_| CryptoError::EncryptionFailed)?,
+                plaintext,
+            )
             .map_err(|_| CryptoError::EncryptionFailed)?;
 
         let mut output = Vec::with_capacity(AEAD_NONCE_BYTES + ciphertext.len());
@@ -277,22 +280,21 @@ impl SymmetricEncryption {
             return Err(CryptoError::InvalidCiphertext);
         }
         let (nonce, body) = ciphertext.split_at(AEAD_NONCE_BYTES);
-        ChaCha20Poly1305::new(Key::from_slice(key))
-            .decrypt(Nonce::from_slice(nonce), body)
+        ChaCha20Poly1305::new(&Key::try_from(&key[..]).map_err(|_| CryptoError::DecryptionFailed)?)
+            .decrypt(&Nonce::try_from(nonce).map_err(|_| CryptoError::DecryptionFailed)?, body)
             .map_err(|_| CryptoError::DecryptionFailed)
     }
 }
 
 /// X25519 elliptic-curve Diffie-Hellman.
 pub mod key_exchange {
-    use rand::RngCore;
     use x25519_dalek::{PublicKey as XPublicKey, StaticSecret};
     use zeroize::Zeroize;
 
     /// Generate a raw 32-byte secret and its public key.
     pub fn generate_keypair() -> ([u8; 32], [u8; 32]) {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::fill(&mut bytes);
         let secret = StaticSecret::from(bytes);
         let public = XPublicKey::from(&secret);
         bytes.zeroize();
@@ -328,12 +330,11 @@ pub mod key_exchange {
 /// ed25519 signatures, used for transaction authentication.
 pub mod ed25519 {
     use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-    use rand::RngCore;
     use zeroize::Zeroize;
 
     pub fn generate_keypair() -> (SigningKey, VerifyingKey) {
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::fill(&mut bytes);
         let signing_key = SigningKey::from_bytes(&bytes);
         bytes.zeroize();
         let verifying_key = signing_key.verifying_key();

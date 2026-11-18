@@ -188,16 +188,23 @@ Durability and integrity:
   are never read and are truncated before the next append;
 - a segment rolls to a new file at 64 MiB instead of refusing history, and one record
   is capped at 16 MiB;
+- `ledger/manifest.json` also records `base_height`, the number of blocks pruning
+  removed. `subhost db prune --keep-segments N` drops the oldest segment files, keeps
+  the newest snapshot as the replay anchor, and refuses (without writing) when the
+  retained history would no longer contain the block at the snapshot's own height;
 - every read is validated before it is trusted: size bounds, magic, versions,
-  checksums, manifest consistency (expected file names, record counts, snapshot name
+  checksums, manifest consistency (segment file names, record counts, snapshot name
   and height), and chain binding;
 - the snapshot's state root must equal the `state_root` of the block at the
   snapshot's own height, so a snapshot cannot be replayed onto a different history;
 - blocks after the snapshot are executed again with `State::apply_transaction`, then
-  a full replay checks contiguous heights from 1, parent links, chain ID, gas totals,
-  unique blocks and transactions, every transaction signature, both commitments per
-  block, exactly one `Success` receipt per transaction, and that the restored state
-  root equals the newest block's `state_root`;
+  a replay checks contiguous heights over the retained history (from
+  `base_height + 1`), parent links, chain ID, gas totals, unique blocks and
+  transactions, every transaction signature, both commitments per block, exactly one
+  `Success` receipt per transaction, and that the restored state root equals the
+  newest block's `state_root`. The first retained block's parent link cannot be
+  checked after a prune; the snapshot's root anchor is what ties the suffix to the
+  removed prefix;
 - a tampered, truncated, or half-written ledger is rejected, not silently loaded. A
   version 2 `node-state.bin` is still read; the first persist migrates it to segments
   and keeps it as `node-state.bin.v2-backup`.
@@ -235,6 +242,12 @@ What the ledger does not guarantee:
   blocks and start-up executes at most that many blocks on top of it, but every
   segment is still read and scanned, and old segments are never dropped, so
   start-up I/O and disk use still grow with history until S4.3–S4.4;
+- pruning is offline only: `subhost db prune` runs with the node stopped, keeps the
+  newest N segments, and needs the snapshot to stay inside the retained history. A
+  pruned node is not an archive node: `eth_getBlockByNumber` returns `null` below its
+  base height, `eth_getTransactionByHash` and `eth_getTransactionReceipt` return
+  `null` for a pruned transaction, `earliest` is the oldest retained block, and there
+  is no backfill (that returns with block sync in S3/S7);
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
 - no authentication for JSON-RPC or metrics clients. Producer authorization on

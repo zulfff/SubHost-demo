@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `a210f29` · S0.1–S0.3, S1.1–S1.3 and S4.1 merged · S1.4 and S4.2 in review · `Q-001`, `Q-002` agreed
+Status: 2026-11-18 · baseline `main` = `13fb843` · S0.1–S0.3, S1.1–S1.3 and S4.1–S4.4 merged · S1.4 in review · `Q-001`–`Q-006` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -12,10 +12,10 @@ editing the same files.
 | Area | Reality |
 | --- | --- |
 | Chain | Single-writer node. One submission seals one block with every executable pending transaction. |
-| Block auth | `BlockHeader.validator` is `Address::ZERO` and `Block.signatures` is empty on produced blocks. `accept_block` does not check who produced a block. |
+| Block auth | A node with a configured authority signs each produced block with the validator's BLS key and verifies that signature on accept; a node without one still produces and accepts unsigned blocks. |
 | Consensus | `subhost-consensus` has a tested in-process `2f+1` driver (`propose`, `receive_proposal`, `receive_vote`, commit). **No crate depends on it**; the node never calls it. |
 | Networking | libp2p gossip publishes only locally sealed blocks. Messages for votes, DAG vertices and transactions are already defined but unused by the node. No block sync, peer scoring, per-peer limits, or tx gossip. |
-| Storage | `ledger/manifest.json` + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks); v2 `node-state.bin` still read and migrated on first write. No pruning, no CLI migration tool, and loading still reads every segment byte. |
+| Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
 | RPC | 11 methods, no auth, no TLS, no rate limit. RPC counters in the metrics registry are never incremented. |
 | Mempool | In memory only; fixed gas price 1. |
@@ -288,9 +288,17 @@ it is no longer true.
   in full on start-up. Both belong with retention in S4.3.
 
 **S4.3 Pruning**
-- Retain the last `N` segments and the newest snapshot; refuse to prune below the
-  finalized height or below a configured retention floor.
-- `subhost db prune --keep-segments N`.
+- `subhost db prune --keep-segments N` drops the oldest segments and records the
+  new `base_height` in the manifest (version 2; version 1 still reads as unpruned).
+- The newest snapshot stays the replay anchor, so a prune that would drop the block
+  at the snapshot's own height is refused before anything is written; files are
+  deleted only after the manifest stops naming them.
+- RPC maps `blocks[n]` to `base_height + n + 1`: a pruned height and a pruned
+  transaction are `null`, `earliest` is the oldest retained block, and
+  `block_count()` still reports the retained count (`head_height()` is the tip).
+- Not done: there is no finality before S3, so the only retention floor is
+  `--keep-segments`; the snapshot itself is never pruned, and start-up still reads
+  every retained segment.
 
 **S4.4 Migration**
 - `subhost db migrate` converts v2 `node-state.bin` to v3; writes a backup, verifies

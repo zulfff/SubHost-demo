@@ -50,7 +50,12 @@ pub(crate) const LEDGER_MAGIC: [u8; 8] = *b"SUBHOST1";
 /// the new commitments, so it is refused rather than silently reinterpreted.
 pub(crate) const LEDGER_FORMAT_VERSION: u32 = 2;
 
-/// The full persisted ledger: account state plus the local block history.
+/// The persisted ledger: account state plus the block history it still holds.
+///
+/// `blocks` is the *retained* history. On a node that has never pruned it starts
+/// at height 1; after [`LedgerStore::prune`] it starts at `base_height + 1`, and
+/// [`LedgerStore::persist`] expects that shape rather than a full replay from
+/// genesis.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerSnapshot {
     pub chain_id: ChainId,
@@ -62,6 +67,12 @@ pub struct LedgerSnapshot {
 /// What a node recovered from disk.
 #[derive(Debug)]
 pub struct RestoredLedger {
+    /// Number of blocks that existed before the retained history started.
+    ///
+    /// `0` for a ledger that still holds every block. `blocks[0]`, when present,
+    /// is at height `base_height + 1`, and the newest block is at
+    /// `base_height + blocks.len()`.
+    pub base_height: u64,
     pub state: State,
     pub blocks: Vec<Block>,
     pub receipts: Vec<Receipt>,
@@ -72,6 +83,32 @@ impl RestoredLedger {
     pub fn height(&self) -> u64 {
         self.blocks.last().map_or(0, |block| block.header.height)
     }
+
+    /// Number of retained blocks.
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+}
+
+/// Result of [`LedgerStore::prune`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneOutcome {
+    /// Oldest segments were dropped and the manifest now starts at `base_height`.
+    Pruned { dropped_segments: usize, retained_segments: usize, base_height: u64 },
+    /// The ledger already keeps at most the requested number of segments.
+    NothingToPrune { segments: usize },
+}
+
+/// Result of [`LedgerStore::migrate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// The ledger is already segmented; nothing was written. Migration is
+    /// idempotent, so a second run is not an error.
+    AlreadySegmented,
+    /// There is no version 2 `node-state.bin` to migrate.
+    NothingToMigrate,
+    /// The legacy file was migrated and verified by a full replay.
+    Migrated { height: u64 },
 }
 
 /// A ledger store bound to one chain ID and one data directory.
@@ -149,7 +186,12 @@ impl LedgerStore {
             receipts = snapshot.receipts.len(),
             "restored ledger"
         );
-        Ok(RestoredLedger { state, blocks: snapshot.blocks, receipts: snapshot.receipts })
+        Ok(RestoredLedger {
+            base_height: 0,
+            state,
+            blocks: snapshot.blocks,
+            receipts: snapshot.receipts,
+        })
     }
 
     /// Persist a snapshot, validating it first so a rejected ledger can never be
@@ -158,20 +200,28 @@ impl LedgerStore {
     /// A snapshot that does not extend the committed history is refused until
     /// fork choice lands (S3): writing it would silently rewrite the chain.
     pub fn persist(&self, snapshot: &LedgerSnapshot) -> Result<(), StorageError> {
-        validate_snapshot(snapshot, self.chain_id)?;
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
-        fs::create_dir_all(data_dir)
-            .map_err(|source| StorageError::Io { path: data_dir.to_path_buf(), source })?;
-        segmented::persist(
-            self.chain_id,
-            data_dir,
+        self.persist_snapshot(
             snapshot,
             segmented::SEGMENT_MAX_BYTES,
             segmented::SNAPSHOT_INTERVAL_BLOCKS,
         )
+    }
+
+    fn persist_snapshot(
+        &self,
+        snapshot: &LedgerSnapshot,
+        segment_max_bytes: u64,
+        snapshot_interval: u64,
+    ) -> Result<(), StorageError> {
+        let Some(path) = &self.path else {
+            return validate_snapshot(snapshot, self.chain_id).map(|_| ());
+        };
+        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
+        fs::create_dir_all(data_dir)
+            .map_err(|source| StorageError::Io { path: data_dir.to_path_buf(), source })?;
+        // `segmented::persist` reads the committed base from the manifest and
+        // validates the retained suffix against it before writing anything.
+        segmented::persist(self.chain_id, data_dir, snapshot, segment_max_bytes, snapshot_interval)
     }
 
     /// Test-only entry point that shrinks the segment roll-over threshold and the
@@ -183,12 +233,7 @@ impl LedgerStore {
         segment_max_bytes: u64,
         snapshot_interval: u64,
     ) -> Result<(), StorageError> {
-        validate_snapshot(snapshot, self.chain_id)?;
-        let Some(path) = &self.path else {
-            return Ok(());
-        };
-        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
-        segmented::persist(self.chain_id, data_dir, snapshot, segment_max_bytes, snapshot_interval)
+        self.persist_snapshot(snapshot, segment_max_bytes, snapshot_interval)
     }
 
     /// Test-only: keep the default interval but shrink only the segment target.
@@ -201,8 +246,76 @@ impl LedgerStore {
         self.persist_with_limits(snapshot, segment_max_bytes, segmented::SNAPSHOT_INTERVAL_BLOCKS)
     }
 
+    /// Migrate a version 2 `node-state.bin` to the segmented format.
+    ///
+    /// The legacy file is fully validated before anything is written, the
+    /// migrated ledger is loaded back and compared with the legacy head, and the
+    /// original file is kept as `node-state.bin.v2-backup`. A second call is a
+    /// no-op once the manifest exists, so an interrupted run can simply be
+    /// repeated.
+    pub fn migrate(&self) -> Result<MigrationOutcome, StorageError> {
+        let Some(path) = &self.path else {
+            return Err(StorageError::Invalid(
+                "an ephemeral store has no ledger to migrate".into(),
+            ));
+        };
+        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
+        if segmented::manifest_path(data_dir).is_file() {
+            return Ok(MigrationOutcome::AlreadySegmented);
+        }
+        if !path.is_file() {
+            return Ok(MigrationOutcome::NothingToMigrate);
+        }
+
+        let legacy = self.restore(legacy::read(path)?)?;
+        let height = legacy.height();
+        let state_root = legacy.state.root();
+        let snapshot = LedgerSnapshot {
+            chain_id: self.chain_id,
+            state: legacy.state.snapshot(),
+            blocks: legacy.blocks,
+            receipts: legacy.receipts,
+        };
+
+        self.persist(&snapshot)?;
+
+        // Re-read through the normal loader: the migration only counts if the
+        // segmented history replays to the same head.
+        let migrated = self.load()?;
+        if migrated.height() != height || migrated.state.root() != state_root {
+            return Err(StorageError::Invalid(
+                "migrated ledger does not replay to the same head".into(),
+            ));
+        }
+        debug!(height, "migrated the legacy ledger to segments");
+        Ok(MigrationOutcome::Migrated { height })
+    }
+
+    /// Drop the oldest segments, keeping only the newest `keep_segments` files.
+    ///
+    /// The committed snapshot stays the replay anchor, so pruning is refused when
+    /// the retained history would no longer contain the block at the snapshot's
+    /// own height. On refusal nothing on disk changes. Blocks and receipts that
+    /// are pruned are gone: this node stops answering for those heights.
+    pub fn prune(&self, keep_segments: usize) -> Result<PruneOutcome, StorageError> {
+        if keep_segments == 0 {
+            return Err(StorageError::Invalid(
+                "keep_segments must be at least 1, else the ledger has no history".into(),
+            ));
+        }
+        let Some(path) = &self.path else {
+            return Err(StorageError::Invalid("an ephemeral store has no ledger to prune".into()));
+        };
+        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
+        if !segmented::manifest_path(data_dir).is_file() {
+            return Err(StorageError::Invalid("there is no segmented ledger to prune".into()));
+        }
+        segmented::prune(self.chain_id, data_dir, keep_segments)
+    }
+
     fn empty(&self) -> RestoredLedger {
         RestoredLedger {
+            base_height: 0,
             state: State::with_chain_id(self.chain_id),
             blocks: Vec::new(),
             receipts: Vec::new(),
@@ -215,12 +328,21 @@ pub(crate) fn validate_snapshot(
     snapshot: &LedgerSnapshot,
     chain_id: ChainId,
 ) -> Result<State, StorageError> {
+    validate_snapshot_from(snapshot, chain_id, 0)
+}
+
+/// Validate a snapshot whose history starts after `base_height`.
+fn validate_snapshot_from(
+    snapshot: &LedgerSnapshot,
+    chain_id: ChainId,
+    base_height: u64,
+) -> Result<State, StorageError> {
     if snapshot.chain_id != chain_id || snapshot.state.chain_id != chain_id {
         return Err(StorageError::ChainMismatch { expected: chain_id, got: snapshot.chain_id });
     }
     let state = State::from_snapshot(snapshot.state.clone())
         .map_err(|error| StorageError::Invalid(error.to_string()))?;
-    validate_chain(&snapshot.blocks, &snapshot.receipts, chain_id, &state)?;
+    validate_chain_from(base_height, &snapshot.blocks, &snapshot.receipts, chain_id, &state)?;
     Ok(state)
 }
 
@@ -263,6 +385,22 @@ pub fn validate_chain(
     chain_id: ChainId,
     state: &State,
 ) -> Result<(), StorageError> {
+    validate_chain_from(0, blocks, receipts, chain_id, state)
+}
+
+/// [`validate_chain`] for a history whose first retained block is
+/// `base_height + 1`.
+///
+/// The parent link of that first block cannot be checked, because the block it
+/// points at has been pruned; every later parent link is still verified. The
+/// retained state snapshot is what anchors the suffix to the pruned prefix.
+fn validate_chain_from(
+    base_height: u64,
+    blocks: &[Block],
+    receipts: &[Receipt],
+    chain_id: ChainId,
+    state: &State,
+) -> Result<(), StorageError> {
     let mut parent = Hash::ZERO;
     let mut seen_blocks = HashSet::with_capacity(blocks.len());
     let mut seen_transactions = HashSet::new();
@@ -271,10 +409,12 @@ pub fn validate_chain(
     for (index, block) in blocks.iter().enumerate() {
         let expected_height = u64::try_from(index)
             .ok()
+            .and_then(|value| value.checked_add(base_height))
             .and_then(|value| value.checked_add(1))
             .ok_or_else(|| StorageError::Invalid("block height overflow".into()))?;
+        let parent_checked = index > 0 || base_height == 0;
         if block.header.height != expected_height
-            || block.header.parent_hash != parent
+            || (parent_checked && block.header.parent_hash != parent)
             || block.header.chain_id != chain_id
             || block.header.gas_used > block.header.gas_limit
             || !seen_blocks.insert(block.hash())
@@ -412,6 +552,11 @@ pub enum StorageError {
 
     #[error("refusing to persist a history that does not extend the committed chain")]
     NonAppendPersist,
+
+    #[error(
+        "refusing to prune: the retained history would start at height {first_retained_height}, after the snapshot at height {snapshot_height} that anchors replay"
+    )]
+    PruneWouldDropSnapshot { first_retained_height: u64, snapshot_height: u64 },
 
     #[error("ledger is invalid: {0}")]
     Invalid(String),

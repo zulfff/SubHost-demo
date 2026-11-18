@@ -58,7 +58,7 @@ serde_json = "1.0"
 bincode = "1.3"
 
 # Errors and diagnostics
-thiserror = "1.0"
+thiserror = "2.0"
 anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
@@ -68,15 +68,15 @@ ark-bls12-381 = "0.6"
 ark-ec = "0.6"
 ark-ff = "0.6"
 ark-serialize = "0.6"
-sha3 = "0.10"
+sha3 = "0.12"
 blake3 = "1.5"
-rand = "0.8"
-chacha20poly1305 = "0.10"
+rand = "0.10"
+chacha20poly1305 = "0.11"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 ed25519-dalek = "3.0"
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
 scrypt = "0.11"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 # Networking / services
 # tokio transport, not async-std: the whole application is tokio-based, and
@@ -84,13 +84,13 @@ aes-gcm = "0.10"
 libp2p = { version = "0.57", features = ["tcp", "dns", "tokio", "noise", "yamux", "ping", "kad", "gossipsub", "mdns", "macros"] }
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors", "limit"] }
+tower-http = { version = "0.7", features = ["cors", "limit"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-prometheus = { version = "0.13", default-features = false }
+prometheus = { version = "0.14", default-features = false }
 
 # Utilities
 clap = { version = "4.4", features = ["derive"] }
-dashmap = "5.5"
+dashmap = "6.2"
 hex = "0.4"
 time = { version = "0.3", features = ["formatting"] }
 hdrhistogram = "7.5"

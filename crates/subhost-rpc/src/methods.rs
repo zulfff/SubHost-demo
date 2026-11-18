@@ -96,19 +96,24 @@ fn hex_data(value: Option<&serde_json::Value>) -> Result<Vec<u8>, RpcError> {
 
 /// Resolve a block tag (`latest`, `earliest`, `pending`, or a hex height) to a
 /// concrete height. `Ok(None)` means "no such block", which maps to JSON `null`.
-fn resolve_block_height(tag: &str, block_count: usize) -> Result<Option<u64>, RpcError> {
-    if block_count == 0 {
+///
+/// `base` is the last pruned height and `head` is the newest height. On a pruned
+/// node `earliest` is the oldest block it can actually serve, not height 1.
+fn resolve_block_height(tag: &str, base: u64, head: u64) -> Result<Option<u64>, RpcError> {
+    let Some(earliest) = base.checked_add(1) else {
+        return Ok(None);
+    };
+    if head < earliest {
         return Ok(None);
     }
-    let newest = block_count as u64;
     match tag {
-        "latest" | "pending" | "safe" | "finalized" => Ok(Some(newest)),
-        "earliest" => Ok(Some(1)),
+        "latest" | "pending" | "safe" | "finalized" => Ok(Some(head)),
+        "earliest" => Ok(Some(earliest)),
         value => {
             let height =
                 u64::from_str_radix(value.strip_prefix("0x").ok_or(RpcError::InvalidParams)?, 16)
                     .map_err(|_| RpcError::InvalidParams)?;
-            Ok((height >= 1 && height <= newest).then_some(height))
+            Ok((height >= earliest && height <= head).then_some(height))
         }
     }
 }
@@ -380,7 +385,9 @@ impl RpcServer {
             let tag: String = sequence.next().map_err(|_| RpcError::InvalidParams)?;
             let full_transactions: bool =
                 sequence.optional_next().unwrap_or(Some(false)).unwrap_or(false);
-            let Some(height) = resolve_block_height(&tag, state.block_count())? else {
+            let Some(height) =
+                resolve_block_height(&tag, state.base_height(), state.head_height())?
+            else {
                 return Ok::<_, RpcError>(serde_json::Value::Null);
             };
             Ok::<_, RpcError>(
@@ -496,15 +503,48 @@ mod tests {
 
     #[test]
     fn block_tag_resolution_covers_tags_heights_and_gaps() {
-        assert_eq!(resolve_block_height("latest", 0).unwrap(), None);
-        assert_eq!(resolve_block_height("latest", 3).unwrap(), Some(3));
-        assert_eq!(resolve_block_height("pending", 3).unwrap(), Some(3));
-        assert_eq!(resolve_block_height("finalized", 3).unwrap(), Some(3));
-        assert_eq!(resolve_block_height("earliest", 3).unwrap(), Some(1));
-        assert_eq!(resolve_block_height("0x2", 3).unwrap(), Some(2));
-        assert_eq!(resolve_block_height("0x0", 3).unwrap(), None, "genesis has no block");
-        assert_eq!(resolve_block_height("0x9", 3).unwrap(), None, "beyond the tip");
-        assert!(resolve_block_height("2", 3).is_err());
+        assert_eq!(resolve_block_height("latest", 0, 0).unwrap(), None);
+        assert_eq!(resolve_block_height("latest", 0, 3).unwrap(), Some(3));
+        assert_eq!(resolve_block_height("pending", 0, 3).unwrap(), Some(3));
+        assert_eq!(resolve_block_height("finalized", 0, 3).unwrap(), Some(3));
+        assert_eq!(resolve_block_height("earliest", 0, 3).unwrap(), Some(1));
+        assert_eq!(resolve_block_height("0x2", 0, 3).unwrap(), Some(2));
+        assert_eq!(resolve_block_height("0x0", 0, 3).unwrap(), None, "genesis has no block");
+        assert_eq!(resolve_block_height("0x9", 0, 3).unwrap(), None, "beyond the tip");
+        assert_eq!(resolve_block_height("0x0", 4, 9).unwrap(), None, "below the pruned base");
+        assert_eq!(resolve_block_height("0x4", 4, 9).unwrap(), None, "the base itself is pruned");
+        assert_eq!(resolve_block_height("earliest", 4, 9).unwrap(), Some(5));
+        assert!(resolve_block_height("2", 0, 3).is_err());
+    }
+
+    #[test]
+    fn a_pruned_state_maps_heights_onto_the_retained_suffix() {
+        let key = signing_key(7);
+        let mut state = funded_state(&key, 1_000_000);
+        for nonce in 0..3 {
+            state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+        }
+        assert_eq!(state.head_height(), 3);
+        assert_eq!(state.head_height(), state.block_height());
+        assert_eq!(state.block_at_height(1).unwrap().header.height, 1);
+
+        // Simulate a load from a ledger whose first two blocks were pruned: the
+        // blocks and the receipts of those heights are gone, the base is not.
+        {
+            let mut blocks = state.blocks.write().unwrap();
+            blocks.remove(0);
+            blocks.remove(0);
+        }
+        state.base_height = 2;
+
+        assert_eq!(state.base_height(), 2);
+        assert_eq!(state.block_count(), 1);
+        assert_eq!(state.head_height(), 3);
+        assert_eq!(state.head_height(), state.block_height());
+        assert_eq!(state.block_at_height(1), None, "pruned");
+        assert_eq!(state.block_at_height(2), None, "the base itself is pruned");
+        assert_eq!(state.block_at_height(3).unwrap().header.height, 3);
+        assert_eq!(state.block_at_height(4), None, "beyond the head");
     }
 
     #[test]

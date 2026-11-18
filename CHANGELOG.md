@@ -205,6 +205,19 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `<data_dir>/producer.key` (or `--producer-key-file`) with mode `0600` and is never
   overwritten; a mismatched key, an invalid proof, and a zero-power validator all
   fail before the genesis file is written.
+- **Segment pruning and height mapping.** `subhost db prune --keep-segments N`
+  drops the oldest `ledger/segments/NNNNNN.log` files and records the new
+  `base_height` in `ledger/manifest.json` (manifest version 2; version 1 is still
+  read as an unpruned ledger). The newest snapshot stays the replay anchor, so a
+  prune that would drop the block at the snapshot's own height is refused before
+  anything is written, and segment files are deleted only after the manifest no
+  longer names them. `RestoredLedger` now reports `base_height`, load validates
+  and replays the retained suffix instead of assuming heights start at 1, and the
+  RPC layer maps `blocks[n]` to `base_height + n + 1`: a pruned height is JSON
+  `null`, `earliest` is the oldest retained block, and `block_count()` still means
+  the retained count while `head_height()` is the tip. Covered by 12 new storage
+  tests and 2 RPC tests (prune, refusal, no-op, restart, persistence after prune,
+  v1 manifests, out-of-order segments, corruption after prune).
 - **Producer verification on accept.** With a configured authority,
   `accept_block` requires `header.validator` to be a registered validator and
   exactly one BLS signature from that validator over `Block::signing_payload()`,
@@ -220,7 +233,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   only the blocks after it with `State::apply_transaction`, so start-up executes
   at most one interval of transactions. Still outstanding and recorded in
   `ROADMAP.md`: segments are still read in full on start-up, the snapshot holds no
-  receipt index, and history is not pruned.
+  receipt index, and history is not pruned yet (`subhost db prune` lands in S4.3).
 - **Block signing on produce.** `RpcState::with_authority` attaches a
   `BlockAuthority`: the validator registry, the producer address, and its BLS
   secret. When one is configured, `seal_block` sets `header.validator` and attaches
@@ -228,6 +241,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   single-node form stays `Address::ZERO` with an empty signature list.
   `BlockAuthority::new` refuses an unregistered producer, or a secret whose public
   key is not the registered one, with `RpcError::UnauthorizedProducer`.
+- **`subhost db migrate`.** A version 2 `node-state.bin` can now be converted
+  without starting a node. The command validates the whole legacy file, writes the
+  segmented ledger, re-reads it and compares the head with the legacy head, keeps the
+  original as `node-state.bin.v2-backup`, and is a no-op on an already-segmented
+  ledger. Corrupt or unknown-version files fail without writing anything, so an
+  interrupted run can simply be repeated.
 - **Segmented ledger store.** `subhost-storage` keeps history in
   `ledger/manifest.json` plus append-only `ledger/segments/NNNNNN.log` (framed
   records, BLAKE3 per record) and account state in

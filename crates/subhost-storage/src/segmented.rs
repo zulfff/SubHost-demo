@@ -25,8 +25,8 @@ use subhost_state::{State, StateSnapshot};
 use tracing::debug;
 
 use crate::{
-    LedgerSnapshot, RestoredLedger, StorageError, LEDGER_BACKUP_FILE_NAME, LEDGER_DIR_NAME,
-    LEDGER_FILE_NAME, MANIFEST_FILE_NAME,
+    LedgerSnapshot, PruneOutcome, RestoredLedger, StorageError, LEDGER_BACKUP_FILE_NAME,
+    LEDGER_DIR_NAME, LEDGER_FILE_NAME, MANIFEST_FILE_NAME,
 };
 
 /// Target size for one segment file. A record is never split, so a segment may
@@ -46,7 +46,10 @@ const RECORD_HEADER_LEN: u64 = 44;
 const MAX_RECORD_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
+/// Version 1 manifests predate pruning: they always start at height 1 and carry
+/// no `base_height`.
+const MANIFEST_VERSION_LEGACY: u32 = 1;
 const SNAPSHOT_MAGIC: [u8; 8] = *b"SUBHSST1";
 const SNAPSHOT_VERSION: u32 = 1;
 
@@ -81,6 +84,10 @@ struct ManifestFile {
     chain_id: ChainId,
     head_height: u64,
     head_hash: String,
+    /// Number of blocks that were pruned before the retained segments. Absent in
+    /// version 1, where it is always zero.
+    #[serde(default)]
+    base_height: u64,
     snapshot: SnapshotFile,
     segments: Vec<SegmentFile>,
 }
@@ -124,6 +131,8 @@ pub(crate) struct SegmentRef {
 pub(crate) struct CommittedLedger {
     pub head_height: u64,
     pub head_hash: Hash,
+    /// Height of the last pruned block; the retained segments start after it.
+    pub base_height: u64,
     pub snapshot: Option<SnapshotRef>,
     pub segments: Vec<SegmentRef>,
 }
@@ -135,6 +144,13 @@ impl CommittedLedger {
                 .checked_add(segment.records)
                 .ok_or_else(|| StorageError::Manifest("segment record count overflow".into()))
         })
+    }
+
+    /// Height of the oldest retained block.
+    fn first_retained_height(&self) -> Result<u64, StorageError> {
+        self.base_height
+            .checked_add(1)
+            .ok_or_else(|| StorageError::Manifest("base height overflow".into()))
     }
 }
 
@@ -161,8 +177,13 @@ pub(crate) fn read_manifest(
     let manifest: ManifestFile = serde_json::from_slice(&bytes)
         .map_err(|error| StorageError::Manifest(error.to_string()))?;
 
-    if manifest.version != MANIFEST_VERSION {
+    if manifest.version != MANIFEST_VERSION && manifest.version != MANIFEST_VERSION_LEGACY {
         return Err(StorageError::UnsupportedManifestVersion(manifest.version));
+    }
+    if manifest.version == MANIFEST_VERSION_LEGACY && manifest.base_height != 0 {
+        return Err(StorageError::Manifest(
+            "a version 1 manifest cannot have pruned history".into(),
+        ));
     }
     if manifest.chain_id != chain_id {
         return Err(StorageError::ChainMismatch { expected: chain_id, got: manifest.chain_id });
@@ -182,15 +203,20 @@ pub(crate) fn read_manifest(
     }
 
     let mut segments = Vec::with_capacity(manifest.segments.len());
-    for (index, entry) in manifest.segments.iter().enumerate() {
-        let index =
-            u64::try_from(index).map_err(|_| StorageError::Manifest("too many segments".into()))?;
-        if entry.file != segment_file_name(index) {
+    let mut previous_index = None;
+    for entry in &manifest.segments {
+        let index = segment_index(&entry.file).ok_or_else(|| {
+            StorageError::Manifest(format!("segment file name {:?} is invalid", entry.file))
+        })?;
+        // Names stay monotonically increasing after pruning, so a gap is fine but
+        // a repeat or a step backwards is not.
+        if previous_index.is_some_and(|previous| index <= previous) {
             return Err(StorageError::Manifest(format!(
-                "segment file name {:?} does not match index {index}",
+                "segment file name {:?} is not ordered after its predecessor",
                 entry.file
             )));
         }
+        previous_index = Some(index);
         if entry.records == 0 {
             return Err(StorageError::Manifest(format!(
                 "segment {} is committed with no records",
@@ -213,22 +239,35 @@ pub(crate) fn read_manifest(
     let committed = CommittedLedger {
         head_height: manifest.head_height,
         head_hash: parse_hash(&manifest.head_hash, "head_hash")?,
+        base_height: manifest.base_height,
         snapshot: Some(snapshot),
         segments,
     };
     let records = committed.records()?;
-    if records != committed.head_height {
+    let covered = committed
+        .base_height
+        .checked_add(records)
+        .ok_or_else(|| StorageError::Manifest("retained height overflow".into()))?;
+    if covered != committed.head_height {
         return Err(StorageError::Manifest(format!(
-            "segments hold {records} records but the head height is {}",
-            committed.head_height
+            "segments hold {records} records after base height {} but the head height is {}",
+            committed.base_height, committed.head_height
         )));
     }
     if committed.head_height == 0
-        && (committed.head_hash != Hash::ZERO || !committed.segments.is_empty())
+        && (committed.head_hash != Hash::ZERO
+            || committed.base_height != 0
+            || !committed.segments.is_empty())
     {
         return Err(StorageError::Manifest(
-            "an empty ledger must have a zero head and no segments".into(),
+            "an empty ledger must have a zero head, no base, and no segments".into(),
         ));
+    }
+    if committed.base_height >= committed.head_height && committed.head_height > 0 {
+        return Err(StorageError::Manifest(format!(
+            "base height {} is not below the head height {}",
+            committed.base_height, committed.head_height
+        )));
     }
     if let Some(snapshot) = &committed.snapshot {
         if snapshot.height > committed.head_height {
@@ -237,8 +276,26 @@ pub(crate) fn read_manifest(
                 snapshot.height, committed.head_height
             )));
         }
+        if snapshot.height < committed.base_height
+            || (snapshot.height == committed.base_height && snapshot.height > 0)
+        {
+            return Err(StorageError::Manifest(format!(
+                "snapshot height {} is not inside the retained history that starts at {}",
+                snapshot.height,
+                committed.base_height + 1
+            )));
+        }
     }
     Ok(committed)
+}
+
+/// Parse the six-digit index out of `NNNNNN.log`.
+fn segment_index(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(".log")?;
+    if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 fn parse_hash(value: &str, field: &str) -> Result<Hash, StorageError> {
@@ -249,6 +306,7 @@ fn parse_hash(value: &str, field: &str) -> Result<Hash, StorageError> {
 /// Load and fully validate the segmented ledger.
 pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger, StorageError> {
     let committed = read_manifest(data_dir, chain_id)?;
+    let base_height = committed.base_height;
     let snapshot = committed
         .snapshot
         .as_ref()
@@ -256,7 +314,10 @@ pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger,
     let mut state = read_snapshot(data_dir, chain_id, snapshot)?;
     let (blocks, receipts) = read_segments(data_dir, chain_id, &committed)?;
 
-    let height = u64::try_from(blocks.len()).ok().filter(|height| *height == committed.head_height);
+    let retained = u64::try_from(blocks.len()).ok();
+    let height = retained
+        .and_then(|retained| base_height.checked_add(retained))
+        .filter(|height| *height == committed.head_height);
     let head_hash = blocks.last().map_or(Hash::ZERO, Block::hash);
     if height.is_none() || head_hash != committed.head_hash {
         return Err(StorageError::Manifest(
@@ -266,9 +327,20 @@ pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger,
 
     // The snapshot must be rooted in the block at its own height, not merely be
     // internally consistent: otherwise a stale or mismatched snapshot could pass
-    // the manifest checksum and still replay onto the wrong history.
+    // the manifest checksum and still replay onto the wrong history. A snapshot
+    // at height 0 is the genesis state and has no block to anchor to.
     if snapshot.height > 0 {
-        let index = usize::try_from(snapshot.height - 1)
+        let index = snapshot
+            .height
+            .checked_sub(base_height)
+            .and_then(|offset| offset.checked_sub(1))
+            .ok_or_else(|| {
+                StorageError::Manifest(format!(
+                    "snapshot height {} is not inside the retained history",
+                    snapshot.height
+                ))
+            })?;
+        let index = usize::try_from(index)
             .map_err(|_| StorageError::Manifest("snapshot height does not fit in memory".into()))?;
         let anchored = blocks.get(index).ok_or_else(|| {
             StorageError::Manifest(format!(
@@ -284,10 +356,14 @@ pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger,
         }
     }
 
-    // Replay only the blocks after the snapshot. `validate_chain` still checks the
-    // full history's commitments, so a truncated prefix cannot hide a rewrite.
-    let replay_from = usize::try_from(snapshot.height)
-        .map_err(|_| StorageError::Manifest("snapshot height does not fit in memory".into()))?;
+    // Replay only the blocks after the snapshot. `validate_chain_from` still
+    // checks every retained commitment, so a truncated suffix cannot hide a
+    // rewrite of the blocks this node still holds.
+    let replay_from = snapshot
+        .height
+        .checked_sub(base_height)
+        .and_then(|offset| usize::try_from(offset).ok())
+        .ok_or_else(|| StorageError::Manifest("snapshot height does not fit in memory".into()))?;
     for block in blocks.iter().skip(replay_from) {
         for transaction in &block.transactions {
             state.apply_transaction(transaction).map_err(|error| {
@@ -299,14 +375,15 @@ pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger,
         }
     }
 
-    crate::validate_chain(&blocks, &receipts, chain_id, &state)?;
+    crate::validate_chain_from(base_height, &blocks, &receipts, chain_id, &state)?;
     debug!(
+        base_height,
         blocks = blocks.len(),
         receipts = receipts.len(),
         replayed = blocks.len().saturating_sub(replay_from),
         "restored segmented ledger"
     );
-    Ok(RestoredLedger { state, blocks, receipts })
+    Ok(RestoredLedger { base_height, state, blocks, receipts })
 }
 
 fn read_snapshot(
@@ -373,7 +450,7 @@ fn read_segments(
     let dir = segments_dir(data_dir);
     let mut blocks = Vec::new();
     let mut receipts = Vec::new();
-    let mut expected_height = 1u64;
+    let mut expected_height = committed.first_retained_height()?;
 
     for entry in &committed.segments {
         let path = dir.join(&entry.file);
@@ -544,7 +621,12 @@ pub(crate) fn persist(
     snapshot_interval: u64,
 ) -> Result<(), StorageError> {
     let previous = read_previous(chain_id, data_dir)?;
+    let base_height = previous.as_ref().map_or(0, |previous| previous.base_height);
     let new_height = snapshot.blocks.last().map_or(0, |block| block.header.height);
+    // Validate before any write, against the base the manifest commits to. A
+    // full history offered to a pruned store is rejected here rather than being
+    // silently re-anchored.
+    crate::validate_snapshot_from(snapshot, chain_id, base_height)?;
     check_append_only(previous.as_ref(), snapshot, new_height)?;
 
     let committed_records = previous.as_ref().map_or(Ok(0), CommittedLedger::records)?;
@@ -552,7 +634,7 @@ pub(crate) fn persist(
     fs::create_dir_all(&dir).map_err(|source| StorageError::Io { path: dir.clone(), source })?;
 
     let mut segments = previous.as_ref().map_or_else(Vec::new, |best| best.segments.clone());
-    if committed_records < new_height {
+    if committed_records < new_height.saturating_sub(base_height) {
         let receipts = group_receipts(snapshot);
         let mut appender = Appender::open(&dir, &mut segments, segment_max_bytes)?;
         let start = usize::try_from(committed_records)
@@ -585,6 +667,7 @@ pub(crate) fn persist(
     let committed = CommittedLedger {
         head_height: new_height,
         head_hash: snapshot.blocks.last().map_or(Hash::ZERO, Block::hash),
+        base_height,
         snapshot: Some(snapshot_ref),
         segments,
     };
@@ -613,6 +696,7 @@ fn read_previous(
     Ok(Some(CommittedLedger {
         head_height: legacy.blocks.last().map_or(0, |block| block.header.height),
         head_hash: legacy.blocks.last().map_or(Hash::ZERO, Block::hash),
+        base_height: 0,
         snapshot: None,
         segments: Vec::new(),
     }))
@@ -633,14 +717,85 @@ fn check_append_only(
         return Err(StorageError::NonAppendPersist);
     }
     if previous.head_height > 0 {
-        let index = usize::try_from(previous.head_height - 1)
+        let index = previous
+            .head_height
+            .checked_sub(previous.base_height)
+            .and_then(|offset| offset.checked_sub(1))
+            .ok_or(StorageError::NonAppendPersist)?;
+        let index = usize::try_from(index)
             .map_err(|_| StorageError::Invalid("block height overflow".into()))?;
         let carried = snapshot.blocks.get(index).ok_or(StorageError::NonAppendPersist)?;
-        if carried.hash() != previous.head_hash {
+        if carried.header.height != previous.head_height || carried.hash() != previous.head_hash {
             return Err(StorageError::NonAppendPersist);
         }
     }
     Ok(())
+}
+
+/// Drop the oldest segments, keeping the newest `keep_segments`.
+///
+/// The snapshot is the replay anchor, so a prune that would drop the block at the
+/// snapshot's own height is refused before anything is written. The manifest is
+/// the commit point: segment files are deleted only after it no longer names
+/// them, so an interrupted prune leaves a loadable ledger.
+pub(crate) fn prune(
+    chain_id: ChainId,
+    data_dir: &Path,
+    keep_segments: usize,
+) -> Result<PruneOutcome, StorageError> {
+    let committed = read_manifest(data_dir, chain_id)?;
+    let snapshot = committed
+        .snapshot
+        .clone()
+        .ok_or_else(|| StorageError::Manifest("manifest has no snapshot".into()))?;
+    if committed.segments.len() <= keep_segments {
+        return Ok(PruneOutcome::NothingToPrune { segments: committed.segments.len() });
+    }
+
+    let dropped_segments = committed.segments.len() - keep_segments;
+    let dropped_records =
+        committed.segments[..dropped_segments].iter().try_fold(0u64, |total, segment| {
+            total
+                .checked_add(segment.records)
+                .ok_or_else(|| StorageError::Manifest("segment record count overflow".into()))
+        })?;
+    let base_height = committed
+        .base_height
+        .checked_add(dropped_records)
+        .ok_or_else(|| StorageError::Manifest("base height overflow".into()))?;
+    let first_retained_height = base_height
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Manifest("base height overflow".into()))?;
+    if first_retained_height > snapshot.height {
+        return Err(StorageError::PruneWouldDropSnapshot {
+            first_retained_height,
+            snapshot_height: snapshot.height,
+        });
+    }
+
+    let pruned = CommittedLedger {
+        head_height: committed.head_height,
+        head_hash: committed.head_hash,
+        base_height,
+        snapshot: Some(snapshot.clone()),
+        segments: committed.segments[dropped_segments..].to_vec(),
+    };
+    let covered = pruned.base_height.checked_add(pruned.records()?);
+    if covered != Some(pruned.head_height) {
+        return Err(StorageError::Manifest(
+            "pruned segments do not cover the committed head".into(),
+        ));
+    }
+
+    write_manifest(data_dir, chain_id, &pruned)?;
+    cleanup(data_dir, &pruned, Some(&snapshot));
+    debug!(
+        base_height,
+        dropped_segments,
+        retained_segments = keep_segments,
+        "pruned ledger segments"
+    );
+    Ok(PruneOutcome::Pruned { dropped_segments, retained_segments: keep_segments, base_height })
 }
 
 fn group_receipts(snapshot: &LedgerSnapshot) -> HashMap<u64, Vec<Receipt>> {
@@ -679,8 +834,9 @@ impl<'a> Appender<'a> {
     ) -> Result<Self, StorageError> {
         let current = match entries.last() {
             Some(last) => {
-                let index = u64::try_from(entries.len() - 1)
-                    .map_err(|_| StorageError::Segment("too many segments".into()))?;
+                let index = segment_index(&last.file).ok_or_else(|| {
+                    StorageError::Segment(format!("segment name {:?} is invalid", last.file))
+                })?;
                 let path = dir.join(&last.file);
                 let mut file = OpenOptions::new()
                     .read(true)
@@ -726,8 +882,14 @@ impl<'a> Appender<'a> {
         };
         if roll {
             self.commit_current()?;
-            let index = u64::try_from(self.entries.len())
-                .map_err(|_| StorageError::Segment("too many segments".into()))?;
+            // Segment names stay monotonically increasing after a prune, so the
+            // new file continues from the last committed one, not from `len()`.
+            let index = match self.entries.last() {
+                Some(last) => segment_index(&last.file)
+                    .and_then(|index| index.checked_add(1))
+                    .ok_or_else(|| StorageError::Segment("segment index overflow".into()))?,
+                None => 0,
+            };
             self.current = Some(create_segment(self.dir, index, chain_id, first_height)?);
         }
 
@@ -780,14 +942,17 @@ impl<'a> Appender<'a> {
             records: current.records,
             bytes: current.bytes,
         };
-        let index = usize::try_from(current.index)
-            .map_err(|_| StorageError::Segment("segment index does not fit in memory".into()))?;
-        if index < self.entries.len() {
-            self.entries[index] = entry;
-        } else if index == self.entries.len() {
-            self.entries.push(entry);
-        } else {
-            return Err(StorageError::Segment("segment index is not contiguous".into()));
+        match self.entries.last_mut() {
+            Some(last) if last.file == entry.file => *last = entry,
+            Some(last) => {
+                let last_index = segment_index(&last.file)
+                    .ok_or_else(|| StorageError::Segment("segment name is invalid".into()))?;
+                if current.index <= last_index {
+                    return Err(StorageError::Segment("segment index is not increasing".into()));
+                }
+                self.entries.push(entry);
+            }
+            None => self.entries.push(entry),
         }
         Ok(())
     }
@@ -883,6 +1048,7 @@ fn write_manifest(
         chain_id,
         head_height: committed.head_height,
         head_hash: committed.head_hash.to_string(),
+        base_height: committed.base_height,
         snapshot: SnapshotFile {
             file: snapshot.file.clone(),
             height: snapshot.height,

@@ -287,7 +287,51 @@ tracks mempool depth. The registry also defines `subhost_rpc_requests_total`,
 `subhost_rpc_errors_total`, and a request-duration histogram, but the node does
 not increment them yet, so they stay at zero.
 
-## 14. Clean up
+## 14. Optional: migrate a version 2 ledger
+
+A node built before S4 stores its history in one `node-state.bin`. Point the
+maintenance command at that data directory while the node is stopped:
+
+```bash
+subhost db migrate --data-dir "$SUBHOST_TEST_DATA" --chain-id 1
+```
+
+It validates the whole version 2 file before writing anything, converts it to
+`ledger/manifest.json` plus `ledger/segments/`, re-reads the result and compares
+the head, and keeps the original as `node-state.bin.v2-backup`. Running it again
+prints `is already segmented; nothing to do`; a fresh directory prints `nothing to
+do` as well. If the legacy file is corrupt or an unknown version, the command
+fails and leaves the directory untouched.
+
+## 15. Optional: prune old segments
+
+Pruning drops the oldest `ledger/segments/` files and is only safe with the node
+stopped. It keeps the newest snapshot as the replay anchor:
+
+```bash
+subhost db prune --data-dir "$SUBHOST_TEST_DATA" --chain-id 1 --keep-segments 1
+```
+
+The command prints the new base height and how many segments it removed. After
+restarting the node:
+
+```bash
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"eth_getBlockByNumber","params":["earliest",false]}'
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["0x1",false]}'
+```
+
+`eth_blockNumber` is unchanged, `earliest` is the oldest retained block, and a
+pruned height answers `null`. A pruned transaction also answers `null`; there is no
+backfill, so do not prune a node you rely on as an archive. `--keep-segments 0` is
+refused, and so is a prune that would drop the block the snapshot anchors
+(`refusing to prune: the retained history would start at height …`); on refusal the
+directory is untouched.
+
+## 16. Clean up
 
 Stop the node with `Ctrl-C` first.
 
