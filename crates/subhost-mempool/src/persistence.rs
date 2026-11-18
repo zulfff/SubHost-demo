@@ -120,17 +120,25 @@ impl MempoolStore {
         // limit would defeat bounded snapshot memory use.
         let mut transactions: Vec<_> = pool.txs.values().collect();
         transactions.sort_by_key(|tx| (tx.from, tx.nonce));
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&self.chain_id.to_le_bytes());
-        payload.extend_from_slice(self.genesis_hash.as_bytes());
-        payload.extend_from_slice(&(transactions.len() as u32).to_le_bytes());
-        for (index, tx) in transactions.into_iter().enumerate() {
+        let mut total = HEADER_BYTES as u64 + 8 + 32 + 4;
+        let mut lengths = Vec::with_capacity(transactions.len());
+        for tx in &transactions {
             check_size(tx.data.len() as u64, MAX_MEMPOOL_TRANSACTION_BYTES)?;
             let length = bincode::serialized_size(tx).map_err(MempoolPersistenceError::Encoding)?;
             check_size(length, MAX_MEMPOOL_TRANSACTION_BYTES)?;
-            check_size(payload.len() as u64 + 4 + length + HEADER_BYTES as u64, MAX_MEMPOOL_BYTES)?;
+            total += 4 + length;
+            check_size(total, MAX_MEMPOOL_BYTES)?;
+            lengths.push(length as u32);
+        }
+        for (index, tx) in transactions.iter().enumerate() {
             validate(tx, self.chain_id, index)?;
-            payload.extend_from_slice(&(length as u32).to_le_bytes());
+        }
+        let mut payload = Vec::with_capacity(total as usize - HEADER_BYTES);
+        payload.extend_from_slice(&self.chain_id.to_le_bytes());
+        payload.extend_from_slice(self.genesis_hash.as_bytes());
+        payload.extend_from_slice(&(transactions.len() as u32).to_le_bytes());
+        for (tx, length) in transactions.into_iter().zip(lengths) {
+            payload.extend_from_slice(&length.to_le_bytes());
             payload.extend_from_slice(
                 &bincode::serialize(tx).map_err(MempoolPersistenceError::Encoding)?,
             );

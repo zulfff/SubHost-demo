@@ -17,7 +17,7 @@ empty list when `mempool.bin` is absent. It never returns a partial pool on erro
 The format is `SUBPOOL1`, version 1, a BLAKE3 payload checksum, chain/genesis
 binding, a count and length-framed bincode transaction records. Hard limits are
 64 MiB for the file, 10,000 entries and 1 MiB per encoded transaction. Writes
-borrow the pool's entries and bound serialized sizes before allocating records;
+borrow the pool's entries and measure the full encoded size before allocating the snapshot;
 they do not clone an arbitrarily large pool just to reject its size.
 
 Every stored transfer is checked for the expected chain, recipient, nonzero gas,
@@ -42,6 +42,8 @@ validate the pending snapshot, drop transactions below each sender's committed
 nonce, and rebuild a candidate under the current pool and proposal-byte policy.
 Only then may that candidate become the live pool. Changed limits/fee policy need
 an explicit re-admission/drop policy, rather than a blind in-memory restore.
+An aggregate runtime byte budget is also S6.1b work, including when persistence
+is disabled; snapshot limits alone do not bound the live pool's bytes.
 
 Admission/replacement/eviction candidates must persist successfully before live
 pool replacement and before returning their transaction hash. Cleanup of mined

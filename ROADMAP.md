@@ -403,6 +403,8 @@ the metrics match a request-count test.
   follow the separate node/state contract. Until then this stage is not complete
   and the bundled node's accepted pool remains volatile.
 - Relevant doc: `docs/operations/mempool-persistence.md`.
+- S6.1b must also cap runtime bytes with persistence on or off; count/sender
+  limits and snapshot caps alone do not supply that memory budget.
 
 **S6.2 Fee market**
 - Replace the fixed gas price with an EIP-1559-style base fee computed from the

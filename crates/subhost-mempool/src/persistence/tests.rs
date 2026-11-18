@@ -216,6 +216,28 @@ fn trailing_and_truncated_records_are_not_loaded_as_a_partial_pool() {
 }
 
 #[test]
+fn oversized_total_snapshot_preserves_the_previous_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    store.persist(&Mempool::default()).unwrap();
+    let previous = fs::read(store.path()).unwrap();
+    let mut large = Mempool::new(MempoolConfig {
+        max_per_sender: 256,
+        max_tx_data_bytes: 512 * 1024,
+        ..Default::default()
+    });
+    for nonce in 0..130 {
+        large.add(tx(1, nonce, 1, vec![0; 512 * 1024])).unwrap();
+    }
+    assert!(matches!(
+        store.persist(&large),
+        Err(MempoolPersistenceError::TooLarge { max: MAX_MEMPOOL_BYTES, .. })
+    ));
+    assert_eq!(fs::read(store.path()).unwrap(), previous);
+    assert!(store.load().unwrap().is_empty());
+}
+
+#[test]
 fn failed_snapshot_rename_preserves_the_target_directory_and_can_be_retried() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
