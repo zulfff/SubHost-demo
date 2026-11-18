@@ -17,7 +17,7 @@
 //! state across process recovery. Timeout-only replicas synchronize using the
 //! f+1-th highest authenticated target and cannot outrun lagging peers alone.
 //! The protocol follows the prepare/commit and view-change structure described
-//! in https://pmg.csail.mit.edu/papers/osdi99.pdf; it is not chained HotStuff.
+//! in <https://pmg.csail.mit.edu/papers/osdi99.pdf>; it is not chained HotStuff.
 
 use crate::{ConsensusConfig, ConsensusError, QuorumCertificate, ValidatorRegistry};
 use serde::{Deserialize, Serialize};
