@@ -678,17 +678,16 @@ async fn run_node(
     };
     rpc_security.validate()?;
 
-    let node = Node::bootstrap(NodeConfig {
-        data_dir,
-        rpc_addr,
-        max_rpc_connections: max_connections,
-        rpc_security,
-        metrics_addr,
-        validator,
-        producer_key_file,
-        fallback_chain_id: 1,
-        network,
-    })?;
+    // The node owns defaults, including any later policy/timeout fields.
+    let mut config = NodeConfig::new(data_dir);
+    config.rpc_addr = rpc_addr;
+    config.max_rpc_connections = max_connections;
+    config.rpc_security = rpc_security;
+    config.metrics_addr = metrics_addr;
+    config.validator = validator;
+    config.producer_key_file = producer_key_file;
+    config.network = network;
+    let node = Node::bootstrap(config)?;
     node.run().await?;
     Ok(())
 }
