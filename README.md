@@ -49,7 +49,7 @@ should be treated as production ready.
 | `subhost-state` | Complete. Balances, nonce ordering, replay rejection, checked arithmetic, Merkle state root bound to the chain ID, per-account inclusion proofs. |
 | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
 | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
-| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, pending admission and QC-gated commit when validators are configured (one block per submission on demo chains), optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit, and opt-in bearer-token authentication, per-connection rate limiting and non-loopback bind policy (no in-process TLS; use a TLS-terminating reverse proxy). |
+| `subhost-rpc` | Working subset. 15 JSON-RPC methods, mandatory signature verification, pending admission and QC-gated commit when validators are configured (one block per submission on demo chains), optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit, and opt-in bearer-token authentication, per-connection rate limiting and non-loopback bind policy (no in-process TLS; use a TLS-terminating reverse proxy). |
 | `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, a genesis-backed consensus driver, durable phase-vote/lock recovery, bounded consensus frames, controlled shutdown/cancellation cleanup, optional gossip for proposals/votes/certified commits, and legacy demo block buffering. |
 | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
 | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
@@ -215,13 +215,21 @@ Served on the address given to `node --listen`.
 | `net_version` | Chain ID as a decimal string. |
 | `eth_blockNumber` | Height of the newest committed block. |
 | `eth_gasPrice` | The mempool's minimum accepted gas price. |
+| `eth_maxPriorityFeePerGas` | Same admission recommendation as `eth_gasPrice` while fees use the legacy model. |
+| `eth_feeHistory` | Up to 1024 retained blocks, zero base fees and optional gas-weighted recorded-price percentiles. |
+| `eth_syncing` | `false` while no block-sync worker exists; this does not certify peer convergence. |
 | `eth_getBalance` | Real account balance. |
 | `eth_getTransactionCount` | Next expected nonce. |
 | `eth_sendTransaction` | Signed transfers only. See below. |
 | `eth_getTransactionReceipt` | Real receipt, or `null`. |
 | `eth_getBlockByNumber` | Accepts `latest`, `earliest`, `pending`, or a hex height. `earliest` is the oldest retained block, and a pruned height is `null`. |
+| `eth_getBlockByHash` | Retained blocks by hash; unknown/pruned hashes are `null`. Optional second boolean requests full transactions. |
 | `eth_getTransactionByHash` | Committed transactions only. |
 | `eth_getProof` | Account inclusion proof against the latest state root. `storageProof` is always empty; absence cannot be proven. |
+| `eth_getLogs`, `eth_subscribe` | Explicit `-32004` unsupported-method errors until contract logs and subscriptions exist. |
+
+See [the RPC reference](docs/rpc.md) for fee-history arguments, pruning behavior,
+strict block-query parameters, error codes and compatibility limits.
 
 `eth_sendTransaction` **deviates from standard Ethereum**. The node never holds a
 user key, so the caller must sign and supply two extra fields:

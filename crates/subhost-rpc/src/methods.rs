@@ -22,6 +22,9 @@ const MAX_REQUEST_BODY_BYTES: u32 = 256 * 1024;
 const MAX_RESPONSE_BODY_BYTES: u32 = 1024 * 1024;
 /// Largest batch accepted, so one request cannot fan out without bound.
 const MAX_BATCH_REQUESTS: u32 = 10;
+/// Bound fee-history response size and the work spent sorting rewards.
+const MAX_FEE_HISTORY_BLOCKS: u64 = 1024;
+const MAX_REWARD_PERCENTILES: usize = 100;
 /// Default gas limit applied when a caller omits one.
 pub(crate) const DEFAULT_TX_GAS_LIMIT: Gas = 21_000;
 
@@ -106,6 +109,12 @@ fn hex_data(value: Option<&serde_json::Value>) -> Result<Vec<u8>, RpcError> {
 /// `base` is the last pruned height and `head` is the newest height. On a pruned
 /// node `earliest` is the oldest block it can actually serve, not height 1.
 fn resolve_block_height(tag: &str, base: u64, head: u64) -> Result<Option<u64>, RpcError> {
+    // Validate even on an empty ledger: malformed quantities are errors, not
+    // missing blocks. Reuse the strict QUANTITY parser used by transactions.
+    let explicit_height = match tag {
+        "latest" | "pending" | "safe" | "finalized" | "earliest" => None,
+        value => Some(hex_quantity(Some(&serde_json::Value::String(value.into())), 0)?),
+    };
     let Some(earliest) = base.checked_add(1) else {
         return Ok(None);
     };
@@ -115,13 +124,125 @@ fn resolve_block_height(tag: &str, base: u64, head: u64) -> Result<Option<u64>, 
     match tag {
         "latest" | "pending" | "safe" | "finalized" => Ok(Some(head)),
         "earliest" => Ok(Some(earliest)),
-        value => {
-            let height =
-                u64::from_str_radix(value.strip_prefix("0x").ok_or(RpcError::InvalidParams)?, 16)
-                    .map_err(|_| RpcError::InvalidParams)?;
+        _ => {
+            let height = explicit_height.ok_or(RpcError::InvalidParams)?;
             Ok((height >= earliest && height <= head).then_some(height))
         }
     }
+}
+
+/// Positional block lookup parameters, with the legacy optional hydration flag.
+fn block_lookup_params(params: jsonrpsee::types::Params<'_>) -> Result<(String, bool), RpcError> {
+    let values: Vec<serde_json::Value> = params.parse().map_err(|_| RpcError::InvalidParams)?;
+    if !(1..=2).contains(&values.len()) {
+        return Err(RpcError::InvalidParams);
+    }
+    let key = values[0].as_str().ok_or(RpcError::InvalidParams)?.to_owned();
+    let full = match values.get(1) {
+        Some(value) => value.as_bool().ok_or(RpcError::InvalidParams)?,
+        None => false,
+    };
+    Ok((key, full))
+}
+
+fn no_params(params: jsonrpsee::types::Params<'_>) -> Result<(), RpcError> {
+    if params.len_bytes() == 0 {
+        return Ok(());
+    }
+    let values: Vec<serde_json::Value> = params.parse().map_err(|_| RpcError::InvalidParams)?;
+    if values.is_empty() {
+        Ok(())
+    } else {
+        Err(RpcError::InvalidParams)
+    }
+}
+
+/// Legacy fees have no base-fee component; effective tips equal gas prices.
+/// Gas consumption currently equals the transaction gas limit (see receipts).
+fn block_rewards(block: &Block, percentiles: &[f64]) -> Vec<String> {
+    let mut transactions = block.transactions.iter().collect::<Vec<_>>();
+    transactions.sort_by_key(|tx| tx.gas_price);
+    let Some(first) = transactions.first() else {
+        return vec!["0x0".into(); percentiles.len()];
+    };
+    let mut index = 0;
+    let mut consumed = first.gas_limit;
+    percentiles
+        .iter()
+        .map(|percentile| {
+            let threshold = (block.header.gas_used as f64 * percentile / 100.0) as Gas;
+            while consumed < threshold && index + 1 < transactions.len() {
+                index += 1;
+                consumed += transactions[index].gas_limit;
+            }
+            format!("0x{:x}", transactions[index].gas_price)
+        })
+        .collect()
+}
+
+fn fee_history(
+    params: jsonrpsee::types::Params<'_>,
+    state: &RpcState,
+) -> Result<serde_json::Value, RpcError> {
+    let values: Vec<serde_json::Value> = params.parse().map_err(|_| RpcError::InvalidParams)?;
+    if !(2..=3).contains(&values.len()) {
+        return Err(RpcError::InvalidParams);
+    }
+    let count = hex_quantity(Some(&values[0]), 0)?;
+    if !(1..=MAX_FEE_HISTORY_BLOCKS).contains(&count) {
+        return Err(RpcError::InvalidParams);
+    }
+    let newest = values[1].as_str().ok_or(RpcError::InvalidParams)?;
+    let percentiles = match values.get(2) {
+        Some(value) => {
+            let array = value.as_array().ok_or(RpcError::InvalidParams)?;
+            if array.len() > MAX_REWARD_PERCENTILES {
+                return Err(RpcError::InvalidParams);
+            }
+            array
+                .iter()
+                .map(|value| value.as_f64().ok_or(RpcError::InvalidParams))
+                .collect::<Result<Vec<_>, _>>()?
+        }
+        None => Vec::new(),
+    };
+    if percentiles.iter().any(|p| !p.is_finite() || !(0.0..=100.0).contains(p))
+        || percentiles.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(RpcError::InvalidParams);
+    }
+
+    // Hold a single block-index read guard so concurrent commits cannot produce
+    // arrays from different tips. Only retained blocks are available after prune.
+    let blocks = crate::state::read(&state.blocks);
+    let head = blocks.last().map_or(state.base_height(), |block| block.header.height);
+    let end = resolve_block_height(newest, state.base_height(), head)?;
+    if blocks.is_empty() && newest.starts_with("0x") && hex_quantity(Some(&values[1]), 0)? != 0 {
+        return Err(RpcError::InvalidParams);
+    }
+    let retained = end.map_or(&[][..], |end| {
+        let start = end.saturating_sub(count - 1).max(state.base_height().saturating_add(1));
+        let first = blocks.partition_point(|block| block.header.height < start);
+        let last = blocks.partition_point(|block| block.header.height <= end);
+        &blocks[first..last]
+    });
+    if end.is_none() && !blocks.is_empty() {
+        return Err(RpcError::InvalidParams);
+    }
+    let mut result = serde_json::json!({
+        "oldestBlock": format!("0x{:x}", retained.first().map_or(0, |b| b.header.height)),
+        "baseFeePerGas": vec!["0x0"; if retained.is_empty() { 0 } else { retained.len() + 1 }],
+        "gasUsedRatio": retained.iter().map(|block| {
+            block.header.gas_used as f64 / block.header.gas_limit as f64
+        }).collect::<Vec<_>>(),
+    });
+    if !percentiles.is_empty() {
+        result["reward"] = serde_json::json!(retained
+            .iter()
+            .map(|block| block_rewards(block, &percentiles))
+            .collect::<Vec<_>>());
+    }
+    Ok(result)
 }
 
 fn receipt_json(receipt: &Receipt) -> serde_json::Value {
@@ -357,6 +478,32 @@ impl RpcServer {
             Ok::<_, RpcError>(format!("0x{:x}", state.min_gas_price()))
         })?;
 
+        module.register_method("eth_maxPriorityFeePerGas", |params, state, _extensions| {
+            no_params(params)?;
+            Ok::<_, RpcError>(format!("0x{:x}", state.min_gas_price()))
+        })?;
+
+        module.register_method("eth_syncing", |params, _state, _extensions| {
+            no_params(params)?;
+            // There is no block-sync worker yet. This says no sync is running;
+            // it does not assert that this node knows the network's latest tip.
+            Ok::<_, RpcError>(false)
+        })?;
+
+        module.register_method("eth_feeHistory", |params, state, _extensions| {
+            fee_history(params, state)
+        })?;
+
+        for method in ["eth_getLogs", "eth_subscribe"] {
+            module.register_method(method, |_params, _state, _extensions| {
+                Err::<serde_json::Value, _>(jsonrpsee::types::ErrorObjectOwned::owned(
+                    -32004,
+                    "method unsupported: contract logs and subscriptions are not available",
+                    None::<()>,
+                ))
+            })?;
+        }
+
         module.register_method("eth_getBalance", |params, state, _extensions| {
             // Accept `[address]` as well as the spec's `[address, block]`.
             let address: String = params.sequence().next().map_err(|_| RpcError::InvalidParams)?;
@@ -423,10 +570,7 @@ impl RpcServer {
         })?;
 
         module.register_method("eth_getBlockByNumber", |params, state, _extensions| {
-            let mut sequence = params.sequence();
-            let tag: String = sequence.next().map_err(|_| RpcError::InvalidParams)?;
-            let full_transactions: bool =
-                sequence.optional_next().unwrap_or(Some(false)).unwrap_or(false);
+            let (tag, full_transactions) = block_lookup_params(params)?;
             let Some(height) =
                 resolve_block_height(&tag, state.base_height(), state.head_height())?
             else {
@@ -436,6 +580,18 @@ impl RpcServer {
                 state
                     .block_at_height(height)
                     .map_or(serde_json::Value::Null, |block| block_json(&block, full_transactions)),
+            )
+        })?;
+
+        module.register_method("eth_getBlockByHash", |params, state, _extensions| {
+            let (hash, full_transactions) = block_lookup_params(params)?;
+            let hash = parse_tx_hash(&hash)?;
+            let blocks = crate::state::read(&state.blocks);
+            Ok::<_, RpcError>(
+                blocks
+                    .iter()
+                    .find(|block| block.hash() == hash)
+                    .map_or(serde_json::Value::Null, |block| block_json(block, full_transactions)),
             )
         })?;
 
@@ -489,6 +645,10 @@ mod tests {
 
     async fn rpc_request(addr: SocketAddr, body: serde_json::Value) -> serde_json::Value {
         let payload = body.to_string();
+        rpc_payload(addr, &payload).await
+    }
+
+    async fn rpc_payload(addr: SocketAddr, payload: &str) -> serde_json::Value {
         let request = format!(
             "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
@@ -512,6 +672,240 @@ mod tests {
             })
             .await
             .unwrap()
+    }
+
+    async fn call_rpc(
+        addr: SocketAddr,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        rpc_request(
+            addr,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+            }),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn hash_lookup_matches_number_lookup_and_pruned_hashes_are_null() {
+        let key = signing_key(11);
+        let mut state = funded_state(&key, 1_000_000);
+        state.submit_transaction(signed_transfer(&key, 0, 1)).unwrap();
+        state.submit_transaction(signed_transfer(&key, 1, 1)).unwrap();
+        let first_hash = state.block_at_height(1).unwrap().hash().to_string();
+        let second_hash = state.block_at_height(2).unwrap().hash().to_string();
+        state.blocks.write().unwrap().remove(0);
+        state.base_height = 1;
+        let (addr, handle) = start_test_server(state).await;
+        for full in [false, true] {
+            let by_number =
+                call_rpc(addr, "eth_getBlockByNumber", serde_json::json!(["latest", full])).await;
+            let by_hash =
+                call_rpc(addr, "eth_getBlockByHash", serde_json::json!([second_hash, full])).await;
+            assert_eq!(by_hash["result"], by_number["result"]);
+            assert_eq!(by_hash["result"]["number"], "0x2");
+        }
+        for hash in [first_hash, Hash::ZERO.to_string()] {
+            let response =
+                call_rpc(addr, "eth_getBlockByHash", serde_json::json!([hash, false])).await;
+            assert!(response.get("result").unwrap().is_null());
+        }
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn fee_history_reports_retained_blocks_and_legacy_fees() {
+        let key = signing_key(12);
+        let mut state = funded_state(&key, 1_000_000);
+        for nonce in 0..3 {
+            state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+        }
+        state.blocks.write().unwrap().remove(0);
+        state.base_height = 1;
+        let (addr, handle) = start_test_server(state).await;
+        let response =
+            call_rpc(addr, "eth_feeHistory", serde_json::json!(["0x400", "latest", [0, 50, 100]]))
+                .await;
+        let result = &response["result"];
+        assert_eq!(result["oldestBlock"], "0x2");
+        assert_eq!(result["baseFeePerGas"], serde_json::json!(["0x0", "0x0", "0x0"]));
+        assert_eq!(
+            result["reward"],
+            serde_json::json!([["0x1", "0x1", "0x1"], ["0x1", "0x1", "0x1"]])
+        );
+        assert_eq!(result["gasUsedRatio"], serde_json::json!([0.0007, 0.0007]));
+        let single = call_rpc(addr, "eth_feeHistory", serde_json::json!(["0x1", "0x2", []])).await;
+        assert_eq!(single["result"]["oldestBlock"], "0x2");
+        assert_eq!(single["result"]["baseFeePerGas"], serde_json::json!(["0x0", "0x0"]));
+        assert!(single["result"].get("reward").is_none());
+        assert_eq!(call_rpc(addr, "eth_syncing", serde_json::json!([])).await["result"], false);
+        let price = call_rpc(addr, "eth_gasPrice", serde_json::json!([])).await;
+        let tip = call_rpc(addr, "eth_maxPriorityFeePerGas", serde_json::json!([])).await;
+        assert_eq!(tip["result"], price["result"]);
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn fee_history_rewards_are_weighted_by_receipt_gas() {
+        let keys = [signing_key(21), signing_key(22), signing_key(23)];
+        let state = RpcState::in_memory(1).unwrap();
+        state
+            .seed_accounts(
+                keys.iter().map(|key| {
+                    (Address::from_public_key(&key.verifying_key().to_bytes()), 10_000_000)
+                }),
+            )
+            .unwrap();
+        for (key, price, gas) in
+            [(&keys[0], 1, 21_000), (&keys[1], 2, 210_000), (&keys[2], 9, 21_000)]
+        {
+            let mut tx = signed_transfer(key, 0, 1);
+            tx.gas_price = price;
+            tx.gas_limit = gas;
+            tx.signature =
+                TransactionSignature::from_ed25519(&key.sign(&tx.signing_payload()).to_bytes());
+            state.mempool.write().unwrap().add(tx).unwrap();
+        }
+        let last_tx = crate::state::read(&state.mempool).pending().last().unwrap().clone();
+        state.include_transaction(&last_tx.hash()).unwrap();
+        let (addr, handle) = start_test_server(state).await;
+        let response = call_rpc(
+            addr,
+            "eth_feeHistory",
+            serde_json::json!(["0x1", "latest", [0, 10, 50, 90, 100]]),
+        )
+        .await;
+        assert_eq!(
+            response["result"]["reward"],
+            serde_json::json!([["0x1", "0x2", "0x2", "0x2", "0x9"]])
+        );
+        assert_eq!(response["result"]["gasUsedRatio"], serde_json::json!([0.0084]));
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn new_rpc_methods_reject_malformed_and_unbounded_parameters() {
+        let state = funded_state(&signing_key(13), 1_000_000);
+        state.submit_transaction(signed_transfer(&signing_key(13), 0, 1)).unwrap();
+        let (addr, handle) = start_test_server(state).await;
+        let hash = Hash::ZERO.to_string();
+        let cases = [
+            ("eth_getBlockByHash", serde_json::json!([])),
+            ("eth_getBlockByHash", serde_json::json!(["0x1234", false])),
+            ("eth_getBlockByHash", serde_json::json!([hash, "false"])),
+            ("eth_getBlockByHash", serde_json::json!([hash, false, 1])),
+            ("eth_getBlockByNumber", serde_json::json!(["latest", null])),
+            ("eth_getBlockByNumber", serde_json::json!(["0x01", false])),
+            ("eth_feeHistory", serde_json::json!(["0x0", "latest", []])),
+            ("eth_feeHistory", serde_json::json!(["0x401", "latest", []])),
+            ("eth_feeHistory", serde_json::json!(["0x01", "latest", []])),
+            ("eth_feeHistory", serde_json::json!([1, "latest", []])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "0x2", []])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "0x0", []])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", [-1]])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", [101]])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", [50, 20]])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", [50, 50]])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", ["50"]])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", vec![0; 101]])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", null])),
+            ("eth_feeHistory", serde_json::json!(["0x1", "latest", [], 1])),
+            ("eth_syncing", serde_json::json!([1])),
+            ("eth_maxPriorityFeePerGas", serde_json::json!([1])),
+        ];
+        for (method, params) in cases {
+            let response = call_rpc(addr, method, params.clone()).await;
+            assert_eq!(response["error"]["code"], -32602, "{method}: {params}: {response}");
+            assert!(response.get("result").is_none());
+        }
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn json_rpc_error_codes_and_ids_conform_over_http() {
+        let (addr, handle) = start_test_server(funded_state(&signing_key(14), 10)).await;
+        for (payload, code) in [
+            ("{", -32700),
+            (r#"{"jsonrpc":"2.0","id":1}"#, -32600),
+            (r#"{"jsonrpc":"2.0","id":1,"method":"missing","params":[]}"#, -32601),
+            (r#"{"jsonrpc":"2.0","id":1,"method":"eth_getBalance","params":[]}"#, -32602),
+        ] {
+            let response = rpc_payload(addr, payload).await;
+            assert_eq!(response["jsonrpc"], "2.0");
+            assert_eq!(response["error"]["code"], code, "{response}");
+            assert!(response.get("result").is_none());
+        }
+        for method in ["eth_getLogs", "eth_subscribe"] {
+            let response = call_rpc(addr, method, serde_json::json!([])).await;
+            assert_eq!(response["error"]["code"], -32004);
+            assert_eq!(response["id"], 1);
+        }
+        let unknown =
+            call_rpc(addr, "eth_getProof", serde_json::json!([Address::ZERO.to_string()])).await;
+        assert_eq!(unknown["error"]["code"], -32000);
+        let batch = rpc_request(
+            addr,
+            serde_json::json!([
+                {"jsonrpc":"2.0","id":"sync","method":"eth_syncing","params":[]},
+                {"jsonrpc":"2.0","method":"eth_syncing","params":[]},
+                {"jsonrpc":"2.0","id":7,"method":"missing","params":[]}
+            ]),
+        )
+        .await;
+        let responses = batch.as_array().unwrap();
+        assert_eq!(responses.len(), 2, "notifications have no response");
+        assert!(responses.iter().any(|r| r["id"] == "sync" && r["result"] == false));
+        assert!(responses.iter().any(|r| r["id"] == 7 && r["error"]["code"] == -32601));
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn empty_history_has_no_synthetic_genesis_block() {
+        let (addr, handle) = start_test_server(RpcState::in_memory(1).unwrap()).await;
+        let response =
+            call_rpc(addr, "eth_feeHistory", serde_json::json!(["0x1", "latest", [50]])).await;
+        assert_eq!(
+            response["result"],
+            serde_json::json!({
+                "oldestBlock": "0x0", "baseFeePerGas": [], "gasUsedRatio": [], "reward": [],
+            })
+        );
+        let invalid =
+            call_rpc(addr, "eth_getBlockByNumber", serde_json::json!(["0x01", false])).await;
+        assert_eq!(invalid["error"]["code"], -32602);
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn persistence_error_is_internal_and_does_not_expose_local_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(15);
+        let state = RpcState::with_data_dir(1, dir.path()).unwrap();
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        state.seed_accounts([(sender, 100_000)]).unwrap();
+        let manifest = dir.path().join("ledger/manifest.json");
+        std::fs::remove_file(&manifest).unwrap();
+        std::fs::create_dir(&manifest).unwrap();
+        let probe = state.clone();
+        let (addr, handle) = start_test_server(state).await;
+        let response =
+            call_rpc(addr, "eth_sendTransaction", serde_json::json!([send_params(&key, 0)])).await;
+        assert_eq!(response["error"]["code"], -32603);
+        assert_eq!(response["error"]["message"], "state persistence failed");
+        assert!(!response.to_string().contains(dir.path().to_str().unwrap()));
+        assert_eq!(probe.block_height(), 0);
+        assert_eq!(probe.balance(&sender), 100_000);
+        assert_eq!(probe.pending_count(), 0);
+        handle.stop().unwrap();
+        handle.stopped().await;
     }
 
     #[test]
