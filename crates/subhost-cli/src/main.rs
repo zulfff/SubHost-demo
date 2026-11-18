@@ -14,7 +14,11 @@ use subhost_core::{
     Address, Amount, ChainId, GenesisConfig, Transaction, TransactionSignature, TransactionType,
     ValidatorInfo,
 };
-use subhost_node::{Node, NodeConfig, P2pConfig, GENESIS_FILE_NAME};
+use subhost_crypto::{BLSScheme, PrivateKey};
+use subhost_node::{
+    read_producer_key, write_producer_key, Node, NodeConfig, P2pConfig, GENESIS_FILE_NAME,
+    PRODUCER_KEY_FILE_NAME,
+};
 use subhost_storage::{LedgerStore, MigrationOutcome, PruneOutcome};
 use subhost_telemetry::{TelemetryConfig, Verbosity};
 use subhost_wallet::Wallet;
@@ -56,9 +60,17 @@ enum Commands {
         #[arg(long = "alloc", value_name = "ADDRESS=BALANCE")]
         allocations: Vec<String>,
 
-        /// Initial validator, repeatable: `--validator ADDRESS=PUBKEY_HEX:POWER`.
-        #[arg(long = "validator", value_name = "ADDRESS=PUBKEY_HEX:POWER")]
+        /// Initial validator, repeatable. Forms:
+        /// `ADDRESS:POWER` uses the producer key for the public key and proof,
+        /// `ADDRESS=PUBKEY_HEX:POWER` requires the key to match,
+        /// `ADDRESS=PUBKEY_HEX:POWER:POP_HEX` stores a proof signed elsewhere.
+        #[arg(long = "validator", value_name = "ADDRESS[=PUBKEY_HEX]:POWER[:POP_HEX]")]
         validators: Vec<String>,
+
+        /// Producer key file used for validator proofs.
+        /// Defaults to `<data-dir>/producer.key`, generated when missing.
+        #[arg(long)]
+        producer_key_file: Option<PathBuf>,
 
         /// Overwrite an existing genesis file.
         #[arg(long)]
@@ -70,6 +82,11 @@ enum Commands {
         /// Require a genesis validator set and refuse to start without one.
         #[arg(long)]
         validator: bool,
+
+        /// Producer key file used to sign blocks. Defaults to
+        /// `<data-dir>/producer.key`.
+        #[arg(long, requires = "validator")]
+        producer_key_file: Option<PathBuf>,
 
         #[arg(short, long, default_value = DEFAULT_RPC_URL.trim_start_matches("http://"))]
         listen: String,
@@ -289,11 +306,19 @@ fn main() -> Result<()> {
 
     runtime.block_on(async move {
         match cli.command {
-            Commands::Init { chain_id, data_dir, allocations, validators, force } => {
-                init_genesis(chain_id, data_dir, allocations, validators, force)
+            Commands::Init {
+                chain_id,
+                data_dir,
+                allocations,
+                validators,
+                producer_key_file,
+                force,
+            } => {
+                init_genesis(chain_id, data_dir, allocations, validators, producer_key_file, force)
             }
             Commands::Node {
                 validator,
+                producer_key_file,
                 listen,
                 data_dir,
                 metrics_addr,
@@ -305,6 +330,7 @@ fn main() -> Result<()> {
             } => {
                 run_node(
                     validator,
+                    producer_key_file,
                     listen,
                     data_dir,
                     metrics_addr,
@@ -349,6 +375,7 @@ fn init_genesis(
     data_dir: Option<PathBuf>,
     allocations: Vec<String>,
     validators: Vec<String>,
+    producer_key_file: Option<PathBuf>,
     force: bool,
 ) -> Result<()> {
     let data_dir = match data_dir {
@@ -371,9 +398,9 @@ fn init_genesis(
             bail!("duplicate genesis allocation for {address}");
         }
     }
-    for validator in &validators {
-        genesis.initial_validators.push(parse_validator(validator)?);
-    }
+    let specs =
+        validators.iter().map(|value| parse_validator(value)).collect::<Result<Vec<_>>>()?;
+    genesis.initial_validators = resolve_validators(specs, &data_dir, producer_key_file)?;
 
     genesis
         .save(&genesis_path)
@@ -407,31 +434,171 @@ fn parse_allocation(value: &str) -> Result<(Address, Amount)> {
     Ok((address, balance))
 }
 
-/// `ADDRESS=PUBKEY_HEX:POWER`
-fn parse_validator(value: &str) -> Result<ValidatorInfo> {
-    let (address, rest) = value
-        .split_once('=')
-        .with_context(|| format!("validator {value:?} must use ADDRESS=PUBKEY_HEX:POWER"))?;
-    let (public_key, power) = rest
-        .rsplit_once(':')
-        .with_context(|| format!("validator {value:?} must use ADDRESS=PUBKEY_HEX:POWER"))?;
+/// One `--validator` argument, before the producer key is resolved.
+struct ValidatorSpec {
+    address: Address,
+    public_key: Option<Vec<u8>>,
+    power: u64,
+    proof_of_possession: Option<Vec<u8>>,
+}
+
+/// `ADDRESS[=PUBKEY_HEX]:POWER[:POP_HEX]`
+fn parse_validator(value: &str) -> Result<ValidatorSpec> {
+    let (address, public_key, power, proof_of_possession) = match value.split_once('=') {
+        Some((address, rest)) => {
+            let fields = rest.split(':').collect::<Vec<_>>();
+            match fields.as_slice() {
+                [public_key, power] => (address, Some(*public_key), *power, None),
+                [public_key, power, proof] => (address, Some(*public_key), *power, Some(*proof)),
+                _ => bail!("validator {value:?} must use ADDRESS[=PUBKEY_HEX]:POWER[:POP_HEX]"),
+            }
+        }
+        None => {
+            let (address, power) = value.rsplit_once(':').with_context(|| {
+                format!("validator {value:?} must use ADDRESS[=PUBKEY_HEX]:POWER[:POP_HEX]")
+            })?;
+            (address, None, power, None)
+        }
+    };
     let address = Address::from_hex(address.trim())
         .with_context(|| format!("invalid validator address in {value:?}"))?;
-    let public_key = hex::decode(public_key.trim().trim_start_matches("0x"))
-        .with_context(|| format!("invalid validator public key in {value:?}"))?;
-    if public_key.is_empty() {
-        bail!("validator {value:?} has an empty public key");
-    }
+    let public_key = match public_key.map(str::trim) {
+        Some("") => bail!("validator {value:?} has an empty public key"),
+        Some(text) => {
+            let key = hex::decode(text.trim_start_matches("0x"))
+                .with_context(|| format!("invalid validator public key in {value:?}"))?;
+            if BLSScheme::decode_public_key(&key).is_none() {
+                bail!("validator {value:?} public key is not a compressed BLS12-381 G1 point");
+            }
+            Some(key)
+        }
+        None => None,
+    };
     let power = power
         .trim()
         .parse::<u64>()
         .with_context(|| format!("invalid validator power in {value:?}"))?;
-    Ok(ValidatorInfo { address, public_key, power, proof_of_possession: Vec::new() })
+    if power == 0 {
+        bail!("validator {value:?} has zero voting power");
+    }
+    let proof_of_possession = match proof_of_possession.map(str::trim) {
+        Some(text) if !text.is_empty() => Some(
+            hex::decode(text.trim_start_matches("0x"))
+                .with_context(|| format!("invalid proof of possession in {value:?}"))?,
+        ),
+        Some(_) => bail!("validator {value:?} has an empty proof of possession"),
+        None => None,
+    };
+    Ok(ValidatorSpec { address, public_key, power, proof_of_possession })
+}
+
+/// Turn the parsed entries into genesis validators, generating the proof of
+/// possession from the producer key when one was not supplied.
+fn resolve_validators(
+    specs: Vec<ValidatorSpec>,
+    data_dir: &Path,
+    producer_key_file: Option<PathBuf>,
+) -> Result<Vec<ValidatorInfo>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let key_path = producer_key_file.unwrap_or_else(|| data_dir.join(PRODUCER_KEY_FILE_NAME));
+    let mut secret = None;
+    if specs.iter().any(|spec| spec.proof_of_possession.is_none()) {
+        secret = Some(load_or_create_producer_key(&key_path)?);
+    }
+    let derived =
+        secret.as_ref().map(|secret| BLSScheme::encode_public_key(&BLSScheme::public_key(secret)));
+
+    let mut validators = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let public_key = match (&spec.public_key, &spec.proof_of_possession) {
+            // A proof supplied from elsewhere is self-contained: this node's key
+            // has nothing to do with it.
+            (Some(public_key), Some(_)) => public_key.clone(),
+            (None, Some(_)) => bail!(
+                "validator {} needs a public key for a supplied proof of possession",
+                spec.address
+            ),
+            (public_key, None) => match (public_key, &derived) {
+                (Some(public_key), Some(derived)) if public_key != derived => bail!(
+                    "validator {} public key does not match the producer key in {}",
+                    spec.address,
+                    key_path.display()
+                ),
+                (Some(public_key), _) => public_key.clone(),
+                (None, Some(derived)) => derived.clone(),
+                (None, None) => bail!(
+                    "validator {} needs a proof of possession or a producer key",
+                    spec.address
+                ),
+            },
+        };
+        let proof_of_possession = match spec.proof_of_possession {
+            Some(proof) => {
+                let Some(point) = BLSScheme::decode_public_key(&public_key) else {
+                    bail!(
+                        "validator {} public key is not a compressed BLS12-381 G1 point",
+                        spec.address
+                    );
+                };
+                let Some(signature) = BLSScheme::decode_signature(&proof) else {
+                    bail!(
+                        "validator {} proof of possession is not a compressed BLS12-381 G2 point",
+                        spec.address
+                    );
+                };
+                if !BLSScheme::verify_possession(&point, &signature) {
+                    bail!(
+                        "validator {} proof of possession does not verify against its public key",
+                        spec.address
+                    );
+                }
+                proof
+            }
+            None => {
+                let Some(secret) = secret.as_ref() else {
+                    bail!(
+                        "validator {} needs a proof of possession or a producer key",
+                        spec.address
+                    );
+                };
+                BLSScheme::encode_signature(&BLSScheme::proof_of_possession(secret))
+            }
+        };
+        validators.push(ValidatorInfo {
+            address: spec.address,
+            public_key,
+            power: spec.power,
+            proof_of_possession,
+        });
+    }
+    Ok(validators)
+}
+
+/// Read the producer key, generating it when the file is absent.
+///
+/// Generation is only for the first `init` on a data directory: an existing file
+/// is never replaced, because replacing it would orphan every block signed with
+/// the old key.
+fn load_or_create_producer_key(path: &Path) -> Result<PrivateKey> {
+    if path.exists() {
+        return read_producer_key(path)
+            .with_context(|| format!("cannot use the producer key in {}", path.display()));
+    }
+    let (secret, public_key) = BLSScheme::keygen();
+    write_producer_key(path, &secret)
+        .with_context(|| format!("cannot write the producer key to {}", path.display()))?;
+    println!("Generated producer key {}", path.display());
+    println!("  public key: 0x{}", hex::encode(BLSScheme::encode_public_key(&public_key)));
+    println!("  mode 0600. Keep it: it is this validator's identity.");
+    Ok(secret)
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_node(
     validator: bool,
+    producer_key_file: Option<PathBuf>,
     listen: String,
     data_dir: Option<PathBuf>,
     metrics_addr: Option<SocketAddr>,
@@ -461,6 +628,7 @@ async fn run_node(
         max_rpc_connections: max_connections,
         metrics_addr,
         validator,
+        producer_key_file,
         fallback_chain_id: 1,
         network,
     })?;
@@ -891,9 +1059,14 @@ mod tests {
                 "./data",
                 "--alloc",
                 "0x1111111111111111111111111111111111111111=1000000",
+                "--validator",
+                "0x2222222222222222222222222222222222222222:100",
+                "--producer-key-file",
+                "./data/producer.key",
             ],
             &["subhost", "node", "--listen", "127.0.0.1:8545", "--data-dir", "./data"],
             &["subhost", "node", "--validator", "--metrics-addr", "127.0.0.1:9090"],
+            &["subhost", "node", "--validator", "--producer-key-file", "./data/validator.key"],
             &[
                 "subhost",
                 "node",
@@ -987,21 +1160,41 @@ mod tests {
     }
 
     #[test]
-    fn validator_parsing_accepts_valid_triples_and_rejects_junk() {
-        let validator =
-            parse_validator("0x2222222222222222222222222222222222222222=0xaabb:100").unwrap();
-        assert_eq!(validator.address, Address::new([0x22; 20]));
-        assert_eq!(validator.public_key, vec![0xaa, 0xbb]);
-        assert_eq!(validator.power, 100);
+    fn validator_parsing_accepts_the_three_forms_and_rejects_junk() {
+        let address = "0x2222222222222222222222222222222222222222";
+        let (secret, public) = BLSScheme::keygen();
+        let public_hex = hex::encode(BLSScheme::encode_public_key(&public));
+        let proof_hex =
+            hex::encode(BLSScheme::encode_signature(&BLSScheme::proof_of_possession(&secret)));
+
+        let derived = parse_validator(&format!("{address}:100")).unwrap();
+        assert_eq!(derived.address, Address::new([0x22; 20]));
+        assert_eq!(derived.power, 100);
+        assert!(derived.public_key.is_none());
+        assert!(derived.proof_of_possession.is_none());
+
+        let explicit = parse_validator(&format!("{address}=0x{public_hex}:100")).unwrap();
+        assert_eq!(explicit.public_key, Some(BLSScheme::encode_public_key(&public)));
+        assert!(explicit.proof_of_possession.is_none());
+
+        let with_proof =
+            parse_validator(&format!("{address}=0x{public_hex}:100:0x{proof_hex}")).unwrap();
+        assert_eq!(
+            with_proof.proof_of_possession,
+            Some(BLSScheme::encode_signature(&BLSScheme::proof_of_possession(&secret)))
+        );
 
         for bad in [
-            "0x2222222222222222222222222222222222222222=0xaabb",
-            "0x2222222222222222222222222222222222222222=:100",
-            "0x2222222222222222222222222222222222222222=0xzz:100",
-            "0x2222222222222222222222222222222222222222=0xaabb:notanumber",
-            "nope=0xaabb:100",
+            format!("{address}=0xaabb:100"),
+            format!("{address}=:100"),
+            format!("{address}=0xzz:100"),
+            format!("{address}=0x{public_hex}:0"),
+            format!("{address}=0x{public_hex}:notanumber"),
+            format!("{address}=0x{public_hex}:100:0xzz"),
+            format!("{address}=0x{public_hex}"),
+            "nope:100".to_string(),
         ] {
-            assert!(parse_validator(bad).is_err(), "{bad:?} must be rejected");
+            assert!(parse_validator(&bad).is_err(), "{bad:?} must be rejected");
         }
     }
 
@@ -1086,7 +1279,8 @@ mod tests {
             7,
             Some(data_dir.clone()),
             vec!["0x1111111111111111111111111111111111111111=1000".to_string()],
-            vec!["0x2222222222222222222222222222222222222222=0xaabb:10".to_string()],
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
             false,
         )
         .unwrap();
@@ -1097,10 +1291,110 @@ mod tests {
         assert_eq!(genesis.initial_validators.len(), 1);
         assert!(genesis.requires_validators().is_ok());
 
-        // A second run must not silently replace the file.
-        assert!(init_genesis(7, Some(data_dir.clone()), Vec::new(), Vec::new(), false).is_err());
-        assert!(init_genesis(9, Some(data_dir.clone()), Vec::new(), Vec::new(), true).is_ok());
+        // The generated key is the validator identity: its public key and the
+        // stored proof of possession must belong together.
+        let key_path = data_dir.join(PRODUCER_KEY_FILE_NAME);
+        let secret = read_producer_key(&key_path).unwrap();
+        let validator = &genesis.initial_validators[0];
+        assert_eq!(validator.address, Address::new([0x22; 20]));
+        assert_eq!(
+            validator.public_key,
+            BLSScheme::encode_public_key(&BLSScheme::public_key(&secret))
+        );
+        let public = BLSScheme::decode_public_key(&validator.public_key).unwrap();
+        let proof = BLSScheme::decode_signature(&validator.proof_of_possession).unwrap();
+        assert!(BLSScheme::verify_possession(&public, &proof));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the producer key must not be group/other readable");
+        }
+        let key_contents = std::fs::read_to_string(&key_path).unwrap();
+
+        // A second run must not silently replace the genesis file, and --force
+        // must keep the key that already signs this validator.
+        assert!(
+            init_genesis(7, Some(data_dir.clone()), Vec::new(), Vec::new(), None, false).is_err()
+        );
+        init_genesis(
+            9,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&key_path).unwrap(), key_contents);
         assert_eq!(GenesisConfig::load(&data_dir.join(GENESIS_FILE_NAME)).unwrap().chain_id, 9);
+    }
+
+    #[test]
+    fn init_refuses_a_validator_key_that_does_not_match_the_producer_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let (_, other) = BLSScheme::keygen();
+        let other = hex::encode(BLSScheme::encode_public_key(&other));
+
+        let result = init_genesis(
+            1,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec![format!("0x2222222222222222222222222222222222222222=0x{other}:10")],
+            None,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert!(
+            !data_dir.join(GENESIS_FILE_NAME).exists(),
+            "a refused genesis must not be written"
+        );
+    }
+
+    #[test]
+    fn init_accepts_a_proof_of_possession_signed_elsewhere() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let (secret, public) = BLSScheme::keygen();
+        let public = hex::encode(BLSScheme::encode_public_key(&public));
+        let proof =
+            hex::encode(BLSScheme::encode_signature(&BLSScheme::proof_of_possession(&secret)));
+
+        init_genesis(
+            1,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec![format!("0x2222222222222222222222222222222222222222=0x{public}:10:0x{proof}")],
+            None,
+            false,
+        )
+        .unwrap();
+
+        let genesis = GenesisConfig::load(&data_dir.join(GENESIS_FILE_NAME)).unwrap();
+        assert_eq!(genesis.initial_validators.len(), 1);
+        assert!(!data_dir.join(PRODUCER_KEY_FILE_NAME).exists(), "no local key was needed");
+    }
+
+    #[test]
+    fn init_rejects_a_proof_that_does_not_match_the_public_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (secret, _) = BLSScheme::keygen();
+        let (_, other) = BLSScheme::keygen();
+        let other = hex::encode(BLSScheme::encode_public_key(&other));
+        let proof =
+            hex::encode(BLSScheme::encode_signature(&BLSScheme::proof_of_possession(&secret)));
+
+        assert!(init_genesis(
+            1,
+            Some(dir.path().to_path_buf()),
+            Vec::new(),
+            vec![format!("0x2222222222222222222222222222222222222222=0x{other}:10:0x{proof}")],
+            None,
+            false,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1114,6 +1408,7 @@ mod tests {
                 "0x1111111111111111111111111111111111111111=2".to_string(),
             ],
             Vec::new(),
+            None,
             false,
         )
         .is_err());

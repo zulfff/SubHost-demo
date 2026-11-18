@@ -12,12 +12,15 @@
 
 use bincode::Options;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use subhost_core::{encode_canonical, Block, BlockHeight, ChainId, GenesisConfig};
+use subhost_consensus::ValidatorRegistry;
+use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, GenesisConfig};
+use subhost_crypto::{BLSScheme, PrivateKey};
 use subhost_metrics::{Metrics, MetricsConfig};
 use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessage};
-use subhost_rpc::{BlockEvent, RpcServer, RpcServerConfig, RpcState};
+use subhost_rpc::{BlockAuthority, BlockEvent, RpcServer, RpcServerConfig, RpcState};
 use subhost_storage::LedgerStore;
 use tracing::{debug, info, warn};
 
@@ -27,6 +30,12 @@ pub use subhost_network::NetworkConfig as P2pConfig;
 
 /// Genesis file name inside the data directory.
 pub const GENESIS_FILE_NAME: &str = "genesis.json";
+
+/// Producer key file name inside the data directory.
+///
+/// One hex-encoded canonical 32-byte BLS scalar, mode `0600`. It is not the
+/// wallet keystore and is not encrypted; `ROADMAP.md` S9.6 replaces it.
+pub const PRODUCER_KEY_FILE_NAME: &str = "producer.key";
 
 /// Everything needed to start a node.
 #[derive(Debug, Clone)]
@@ -41,6 +50,10 @@ pub struct NodeConfig {
     pub metrics_addr: Option<SocketAddr>,
     /// Whether this node intends to validate, which requires a validator set.
     pub validator: bool,
+    /// Producer key file to sign blocks with. `None` means
+    /// `<data_dir>/producer.key` when `validator` is set, and no signing
+    /// identity otherwise.
+    pub producer_key_file: Option<PathBuf>,
     /// Chain ID used when the data directory has no genesis file.
     pub fallback_chain_id: ChainId,
     /// Peer gossip settings. `None` keeps the node single-node and offline.
@@ -56,9 +69,18 @@ impl NodeConfig {
             max_rpc_connections: 1_000,
             metrics_addr: None,
             validator: false,
+            producer_key_file: None,
             fallback_chain_id: 1,
             network: None,
         }
+    }
+
+    /// The producer key path this node will read, if any.
+    pub fn producer_key_path(&self) -> Option<PathBuf> {
+        if let Some(path) = &self.producer_key_file {
+            return Some(path.clone());
+        }
+        self.validator.then(|| self.data_dir.join(PRODUCER_KEY_FILE_NAME))
     }
 
     pub fn genesis_path(&self) -> PathBuf {
@@ -99,9 +121,34 @@ impl Node {
             return Err(NodeError::InvalidChainId);
         }
 
+        // Build the signing registry before touching storage: a genesis set that
+        // cannot be trusted should not open a ledger at all.
+        let validators = match &genesis {
+            Some(genesis) if !genesis.initial_validators.is_empty() => {
+                Some(ValidatorRegistry::from_genesis(&genesis.initial_validators)?)
+            }
+            _ => None,
+        };
+
+        let authority = match (config.producer_key_path(), validators.as_ref()) {
+            (None, _) => None,
+            (Some(path), Some(validators)) => {
+                let (producer, secret) = load_producer(&path, genesis.as_ref())?;
+                info!(path = %path.display(), %producer, "loaded the producer key");
+                Some(BlockAuthority::new(validators.clone(), producer, secret)?)
+            }
+            (Some(path), None) => return Err(NodeError::NoValidatorSetForProducer(path)),
+        };
+
         let store = LedgerStore::open(chain_id, &config.data_dir)?;
         let fresh = !store.exists();
-        let state = RpcState::with_store(store)?;
+        let mut state = RpcState::with_store(store)?;
+        if let Some(validators) = validators {
+            state = state.with_validators(validators);
+        }
+        if let Some(authority) = authority {
+            state = state.with_authority(authority);
+        }
 
         if fresh {
             if let Some(genesis) = &genesis {
@@ -363,6 +410,108 @@ fn load_genesis(path: &Path) -> Result<Option<GenesisConfig>, NodeError> {
     Ok(Some(GenesisConfig::load(path)?))
 }
 
+/// Read and validate a producer key file.
+///
+/// The format is one lowercase hex-encoded canonical 32-byte BLS scalar, with an
+/// optional `0x` prefix and surrounding whitespace. A file that group or others
+/// can read is refused before it is parsed, and a scalar whose encoding does not
+/// round-trip is refused so that two files cannot name the same key.
+///
+/// This is the only loader for the format. `subhost-cli` uses it for `init`, so
+/// the genesis writer and the node cannot disagree about what a key file means.
+pub fn read_producer_key(path: &Path) -> Result<PrivateKey, NodeError> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|source| NodeError::ProducerKey { path: path.to_path_buf(), source })?;
+    check_producer_permissions(path, &metadata)?;
+
+    let text = std::fs::read_to_string(path)
+        .map_err(|source| NodeError::ProducerKey { path: path.to_path_buf(), source })?;
+    let text = text.trim();
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    let bytes =
+        hex::decode(digits).map_err(|_| NodeError::InvalidProducerKey(path.to_path_buf()))?;
+    let secret = BLSScheme::decode_secret_key(&bytes)
+        .ok_or_else(|| NodeError::InvalidProducerKey(path.to_path_buf()))?;
+    // Decoding already round-trips; compare again so a future format change
+    // cannot start a node on a different key than the one in the file.
+    if BLSScheme::encode_secret_key(&secret) != bytes {
+        return Err(NodeError::InvalidProducerKey(path.to_path_buf()));
+    }
+    Ok(secret)
+}
+
+/// Write a producer key file, refusing to overwrite an existing one.
+///
+/// The file is created with mode `0600` before its contents are written, so it is
+/// never readable by another user even for an instant. A partial write is removed
+/// instead of being left behind as a half key.
+pub fn write_producer_key(path: &Path, secret: &PrivateKey) -> Result<(), NodeError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| NodeError::ProducerKey { path: path.to_path_buf(), source })?;
+
+    let mut line = hex::encode(BLSScheme::encode_secret_key(secret));
+    line.push('\n');
+    if let Err(source) = file.write_all(line.as_bytes()).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(NodeError::ProducerKey { path: path.to_path_buf(), source });
+    }
+    Ok(())
+}
+
+/// Read the producer key and resolve which genesis validator it belongs to.
+///
+/// The file is the only input: the address is looked up by public key instead of
+/// being passed in, so a key file cannot be paired with an address it does not
+/// match. Zero or several matches are both errors.
+fn load_producer(
+    path: &Path,
+    genesis: Option<&GenesisConfig>,
+) -> Result<(Address, PrivateKey), NodeError> {
+    let secret = read_producer_key(path)?;
+
+    let genesis =
+        genesis.ok_or_else(|| NodeError::NoValidatorSetForProducer(path.to_path_buf()))?;
+    let public_key = BLSScheme::encode_public_key(&BLSScheme::public_key(&secret));
+    let mut matches =
+        genesis.initial_validators.iter().filter(|validator| validator.public_key == public_key);
+    match (matches.next(), matches.next()) {
+        (Some(validator), None) => Ok((validator.address, secret)),
+        (Some(_), Some(_)) => Err(NodeError::AmbiguousProducer(path.to_path_buf())),
+        (None, _) => Err(NodeError::UnknownProducer(path.to_path_buf())),
+    }
+}
+
+/// Refuse a key file that anyone but its owner can read.
+///
+/// Creation with `0600` is not enough on its own: a copied or restored file can
+/// arrive with a wider mode, and that must fail loudly rather than load.
+#[cfg(unix)]
+fn check_producer_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<(), NodeError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(NodeError::InsecureProducerKey { path: path.to_path_buf(), mode });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_producer_permissions(
+    _path: &Path,
+    _metadata: &std::fs::Metadata,
+) -> Result<(), NodeError> {
+    Ok(())
+}
+
 /// Resolve when the process is asked to terminate.
 async fn shutdown_signal() -> Result<(), NodeError> {
     #[cfg(unix)]
@@ -394,11 +543,38 @@ pub enum NodeError {
     #[error("a validator node requires a genesis file at {0}")]
     MissingGenesis(PathBuf),
 
+    #[error("cannot read the producer key file {path}: {source}")]
+    ProducerKey {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error(
+        "producer key file {path} is mode {mode:04o}; it must not be readable by group or others"
+    )]
+    InsecureProducerKey { path: PathBuf, mode: u32 },
+
+    #[error("producer key file {0} is not a canonical hex-encoded 32-byte BLS scalar")]
+    InvalidProducerKey(PathBuf),
+
+    #[error("producer key in {0} does not belong to any genesis validator")]
+    UnknownProducer(PathBuf),
+
+    #[error("producer key in {0} matches more than one genesis validator")]
+    AmbiguousProducer(PathBuf),
+
+    #[error("a producer key was configured for {0} but the genesis has no validator set")]
+    NoValidatorSetForProducer(PathBuf),
+
     #[error("chain ID cannot be zero")]
     InvalidChainId,
 
     #[error(transparent)]
     Genesis(#[from] subhost_core::CoreError),
+
+    #[error(transparent)]
+    Consensus(#[from] subhost_consensus::ConsensusError),
 
     #[error(transparent)]
     Storage(#[from] subhost_storage::StorageError),
@@ -434,6 +610,40 @@ mod tests {
         }
         genesis
     }
+
+    /// A genesis with one real validator at `[9; 20]`, and its signing secret.
+    fn genesis_with_validator(chain_id: ChainId) -> (GenesisConfig, Address, PrivateKey) {
+        let (secret, _) = BLSScheme::keygen();
+        let address = Address::new([9; 20]);
+        let mut genesis = genesis_with(chain_id, None);
+        genesis.initial_validators = vec![ValidatorInfo {
+            address,
+            public_key: BLSScheme::encode_public_key(&BLSScheme::public_key(&secret)),
+            power: 100,
+            proof_of_possession: BLSScheme::encode_signature(&BLSScheme::proof_of_possession(
+                &secret,
+            )),
+        }];
+        (genesis, address, secret)
+    }
+
+    /// Write a producer key the way `subhost init --validator` will.
+    fn write_test_producer_key(dir: &Path, secret: &PrivateKey) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join(PRODUCER_KEY_FILE_NAME);
+        std::fs::write(&path, hex::encode(BLSScheme::encode_secret_key(secret))).unwrap();
+        set_mode_0600(&path);
+        path
+    }
+
+    #[cfg(unix)]
+    fn set_mode_0600(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode_0600(_path: &Path) {}
 
     #[test]
     fn bootstrap_creates_the_data_directory_and_defaults_the_chain() {
@@ -481,19 +691,147 @@ mod tests {
 
         // Genesis with an empty validator set.
         genesis_with(1, None).save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
-        assert!(matches!(Node::bootstrap(config.clone()), Err(NodeError::Genesis(_))));
+        assert!(matches!(Node::bootstrap(config), Err(NodeError::Genesis(_))));
+    }
 
-        // Genesis with a real validator boots.
-        let mut genesis = genesis_with(1, None);
-        genesis.initial_validators = vec![ValidatorInfo {
-            address: Address::new([9; 20]),
-            public_key: vec![1, 2, 3],
-            power: 100,
-            proof_of_possession: Vec::new(),
-        }];
+    #[test]
+    fn validator_mode_boots_with_the_default_producer_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (genesis, address, secret) = genesis_with_validator(1);
         genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+        let key_path = write_test_producer_key(dir.path(), &secret);
+
+        let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
+        assert_eq!(config.producer_key_path(), Some(key_path));
         let node = Node::bootstrap(config).unwrap();
+
         assert_eq!(node.genesis().unwrap().total_voting_power(), 100);
+        let tx_key = signing_key(7);
+        let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+        node.state().seed_accounts([(sender, 1_000_000)]).unwrap();
+        node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+
+        let block = node.state().block_at_height(1).unwrap();
+        assert_eq!(
+            block.header.validator, address,
+            "blocks must be signed as the genesis validator"
+        );
+        assert_eq!(block.signatures.len(), 1);
+    }
+
+    #[test]
+    fn validator_mode_without_a_producer_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (genesis, _, _) = genesis_with_validator(1);
+        genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+        let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
+        assert!(matches!(Node::bootstrap(config), Err(NodeError::ProducerKey { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_producer_key_that_others_can_read_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (genesis, _, secret) = genesis_with_validator(1);
+        genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+        let key_path = write_test_producer_key(dir.path(), &secret);
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
+        match Node::bootstrap(config) {
+            Err(NodeError::InsecureProducerKey { path, mode }) => {
+                assert_eq!(path, key_path);
+                assert_eq!(mode, 0o644);
+            }
+            Err(other) => panic!("expected InsecureProducerKey, got {other:?}"),
+            Ok(_) => panic!("a world-readable producer key must not boot a validator"),
+        }
+    }
+
+    #[test]
+    fn a_producer_key_outside_the_genesis_set_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (genesis, _, _) = genesis_with_validator(1);
+        genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+        let (stranger, _) = BLSScheme::keygen();
+        write_test_producer_key(dir.path(), &stranger);
+
+        let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
+        assert!(matches!(Node::bootstrap(config), Err(NodeError::UnknownProducer(_))));
+    }
+
+    #[test]
+    fn a_malformed_producer_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (genesis, _, _) = genesis_with_validator(1);
+        genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+        let path = dir.path().join(PRODUCER_KEY_FILE_NAME);
+        std::fs::write(&path, "not-a-scalar").unwrap();
+        set_mode_0600(&path);
+
+        let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
+        assert!(matches!(Node::bootstrap(config), Err(NodeError::InvalidProducerKey(_))));
+    }
+
+    #[test]
+    fn the_producer_key_writer_round_trips_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRODUCER_KEY_FILE_NAME);
+        let (secret, _) = BLSScheme::keygen();
+        write_producer_key(&path, &secret).unwrap();
+
+        let loaded = read_producer_key(&path).unwrap();
+        assert_eq!(BLSScheme::encode_secret_key(&loaded), BLSScheme::encode_secret_key(&secret));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a fresh producer key must be owner-only");
+        }
+
+        // `subhost init` calls this on every run: an existing key is the
+        // validator identity, so replacing it must fail instead.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (other, _) = BLSScheme::keygen();
+        assert!(write_producer_key(&path, &other).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_non_validator_node_with_a_validator_set_verifies_peer_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (genesis, _, secret) = genesis_with_validator(1);
+        genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+        // A follower: no producer key, so it has no signing identity but it still
+        // knows who may produce.
+        let node = Node::bootstrap(NodeConfig::new(dir.path())).unwrap();
+        let registry = ValidatorRegistry::from_genesis(&genesis.initial_validators).unwrap();
+        let address = genesis.initial_validators[0].address;
+        let producer = RpcState::in_memory(1)
+            .unwrap()
+            .with_authority(BlockAuthority::new(registry, address, secret).unwrap());
+
+        let tx_key = signing_key(7);
+        let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+        producer.seed_accounts([(sender, 1_000_000)]).unwrap();
+        producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+        node.state().seed_accounts([(sender, 1_000_000)]).unwrap();
+
+        let block = producer.block_at_height(1).unwrap();
+        let mut unsigned = block.clone();
+        unsigned.signatures.clear();
+        assert!(matches!(
+            node.state().accept_block(unsigned),
+            Err(subhost_rpc::RpcError::UnauthorizedProducer)
+        ));
+        assert_eq!(node.state().block_height(), 0);
+
+        node.state().accept_block(block).unwrap();
+        assert_eq!(node.state().block_height(), 1);
+        assert_eq!(node.state().balance(&Address::new([2; 20])), 10);
     }
 
     #[test]

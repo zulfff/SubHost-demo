@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `1761e8f` · S0.1–S0.3, S1.1–S1.3 and S4.1–S4.4 merged · S4.3 in review · `Q-001`–`Q-005` agreed
+Status: 2026-11-18 · baseline `main` = `13fb843` · S0.1–S0.3, S1.1–S1.3 and S4.1–S4.4 merged · S1.4 in review · `Q-001`–`Q-006` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -190,9 +190,14 @@ cannot load quietly.
 **S1.4 Node and CLI wiring** (`subhost-node/src/lib.rs`, `subhost-cli/src/main.rs`)
 - Build the registry from `genesis.initial_validators` at bootstrap.
 - `subhost node --validator` requires a producer key; add
-  `--producer-key-file <path>` (hex or JSON keystore) and refuse to start as a
-  validator without it.
-- `init --validator` now also accepts and stores a proof of possession.
+  `--producer-key-file <path>`. The format is one hex-encoded canonical 32-byte
+  BLS scalar (see `Q-002`); an encrypted keystore is S9.6, not this stage. Refuse to
+  start as a validator without the file.
+- `init --validator` now also accepts and stores a proof of possession:
+  `ADDRESS:POWER` derives it from the producer key, `ADDRESS=PUBKEY_HEX:POWER` adds
+  the key match, and `ADDRESS=PUBKEY_HEX:POWER:POP_HEX` stores a proof signed
+  elsewhere. A missing producer key is generated once with mode `0600` and never
+  overwritten.
 
 **S1.5 Tests and docs**
 - Reject: missing signature, wrong signer address, unknown validator, malformed BLS,
@@ -386,6 +391,11 @@ ledger repair, reorg investigation, incident checklist.
 checksum manifest.
 **S9.4 Upgrade docs** — supported versions, ledger migration, rollback.
 **S9.5 Image hygiene** — non-root (already), read-only rootfs, image scan in CI.
+**S9.6 Encrypted producer keystore** — replace the plaintext 32-byte
+`producer.key` scalar from S1.4 with a password- or credential-store-wrapped
+keystore, and migrate an existing key file at start-up. Until then the file is
+`0600` and must be treated as the validator's identity: a copy is a copy of the
+right to produce blocks.
 
 ### S10 — Execution layer (Track C, XL)
 

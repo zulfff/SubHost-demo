@@ -42,8 +42,8 @@ should be treated as production ready.
 | `subhost-state` | Complete. Balances, nonce ordering, replay rejection, checked arithmetic, Merkle state root bound to the chain ID, per-account inclusion proofs. |
 | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
 | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
-| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, producer-signature verification when a validator registry is configured, full re-validation of peer blocks, persist-before-commit. |
-| `subhost-node` | Complete. Genesis load, ledger restore, RPC and metrics wiring, graceful shutdown, optional peer gossip that publishes locally produced blocks and applies peer blocks in height order. |
+| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit. |
+| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, optional peer gossip that publishes locally produced blocks and applies peer blocks in height order. |
 | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
 | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
 | `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and a `2f + 1` view-by-view agreement driver. No networking, timeouts, view changes, or leader rotation. |
@@ -127,10 +127,12 @@ the explorer refuses to bind to anything but a loopback address.
 ```bash
 subhost init --chain-id 1 --data-dir ./data \
   --alloc ADDRESS=BALANCE \
-  --validator ADDRESS=PUBKEY_HEX:POWER
+  [--validator ADDRESS[=PUBKEY_HEX]:POWER[:POP_HEX]] \
+  [--producer-key-file PATH]
 
 subhost node --listen 127.0.0.1:8545 --data-dir ./data \
-  [--validator] [--metrics-addr 127.0.0.1:9090] [--max-connections 1000] \
+  [--validator [--producer-key-file PATH]] \
+  [--metrics-addr 127.0.0.1:9090] [--max-connections 1000] \
   [--p2p-listen /ip4/0.0.0.0/tcp/30333 [--bootstrap-peer MULTIADDR] [--no-mdns] [--max-peers 50]]
 
 subhost wallet new --password <password> [--name alice]
@@ -152,6 +154,40 @@ subhost query chain
 Wallets live in `$SUBHOST_HOME/wallets` (default `~/.subhost/wallets`). The CLI
 queries `--nonce` and `--chain-id` from the node when you omit them. `--verbose`
 and `--quiet` control log level; `RUST_LOG` overrides both.
+
+`node --validator` is a validator node. It requires a genesis whose validator entries
+each carry a proof of possession, and it reads `<data-dir>/producer.key`: one
+hex-encoded canonical 32-byte BLS scalar with mode `0600`. The node derives the public
+key from that file and uses the genesis validator whose `public_key` matches, then
+signs every block it produces with it. A missing file, a wider mode, a scalar that
+does not decode, and a key that belongs to no genesis validator all refuse to start.
+A node without `--validator` still builds the registry from genesis and rejects peer
+blocks that are not signed by one of those validators; only a genesis with no
+validators at all accepts unsigned blocks.
+
+`init --validator` writes the proof of possession that `node --validator` and every
+follower verify at start-up. It offers three forms, and only one needs a local key:
+
+- `ADDRESS:POWER` derives the public key from the producer key and signs the proof
+  with it. This is the single-validator bootstrap form.
+- `ADDRESS=PUBKEY_HEX:POWER` asserts the public key; the producer key must match it,
+  and the proof is still generated locally.
+- `ADDRESS=PUBKEY_HEX:POWER:POP_HEX` stores a proof signed on another machine, which
+  is how a coordinator assembles a genesis from several validators. No local key is
+  read in that case.
+
+The producer key is `<data-dir>/producer.key` unless `--producer-key-file` says
+otherwise. When the file is missing, `init` generates it with mode `0600`, refuses to
+overwrite an existing one, and prints its public key. The file is one hex-encoded
+canonical 32-byte BLS scalar. It is not encrypted: treat a copy as a copy of the
+right to produce blocks. `node --validator` reads the same file, derives the public
+key, and refuses to start if the file is missing, has group/other permission bits,
+does not decode, or matches zero or several genesis validators. The encrypted
+keystore in `ROADMAP.md` S9.6 replaces the plaintext file before production.
+
+`init` without `--validator` writes no key and no validator entries; that genesis
+still runs a single-node chain, because only a genesis with a validator set requires
+signed blocks.
 
 ---
 

@@ -185,6 +185,26 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Validator registry and producer key at bootstrap.** `Node::bootstrap` builds a
+  `ValidatorRegistry` from `genesis.initial_validators` whenever the genesis has a
+  validator set, and `RpcState::with_validators` enables peer-block verification
+  without a signing key, so a follower rejects unsigned blocks. `node --validator`
+  additionally reads `<data_dir>/producer.key` (or `NodeConfig::producer_key_file`),
+  refuses a file that group or others can read, decodes one canonical 32-byte BLS
+  scalar, and resolves the validator by matching the derived public key against
+  genesis: zero or several matches refuse to start. New `NodeError` variants carry
+  the path, and `PRODUCER_KEY_FILE_NAME` names the default. `read_producer_key` and
+  `write_producer_key` keep the format and permission rules in one place, and
+  `node --producer-key-file` overrides the default path.
+- **Validator genesis from the CLI.** `subhost init --validator` now writes the proof
+  of possession that registration verifies, so a genesis it produces boots a
+  validator instead of being refused. `ADDRESS:POWER` derives the public key from the
+  producer key and signs the proof; `ADDRESS=PUBKEY_HEX:POWER` requires the key to
+  match; `ADDRESS=PUBKEY_HEX:POWER:POP_HEX` stores a proof signed elsewhere so a
+  coordinator can assemble a set. A missing producer key is generated once at
+  `<data_dir>/producer.key` (or `--producer-key-file`) with mode `0600` and is never
+  overwritten; a mismatched key, an invalid proof, and a zero-power validator all
+  fail before the genesis file is written.
 - **Segment pruning and height mapping.** `subhost db prune --keep-segments N`
   drops the oldest `ledger/segments/NNNNNN.log` files and records the new
   `base_height` in `ledger/manifest.json` (manifest version 2; version 1 is still

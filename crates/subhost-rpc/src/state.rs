@@ -5,6 +5,7 @@ use jsonrpsee::types::error::ErrorObject;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use subhost_consensus::ValidatorRegistry;
 use subhost_core::{Address, Amount, Block, ChainId, Hash, Nonce, Receipt, TransactionType};
 use subhost_mempool::Mempool;
 use subhost_state::{AccountProof, State};
@@ -118,6 +119,11 @@ pub struct RpcState {
     pub(crate) block_events: broadcast::Sender<BlockEvent>,
     /// Signing identity for blocks this node produces, when it is a validator.
     pub(crate) authority: Option<Arc<BlockAuthority>>,
+    /// Who may produce a block, when this node has a genesis validator set.
+    ///
+    /// Separate from `authority`: a follower verifies peer blocks without holding
+    /// a signing key, and a producer needs both.
+    pub(crate) validators: Option<Arc<ValidatorRegistry>>,
 }
 
 /// Buffered block events per subscriber. A node only needs the newest few.
@@ -155,14 +161,29 @@ impl RpcState {
             commit_lock: Arc::new(Mutex::new(())),
             block_events: broadcast::channel(BLOCK_EVENT_CAPACITY).0,
             authority: None,
+            validators: None,
         })
+    }
+
+    /// Require blocks from peers to be signed by a registered validator.
+    ///
+    /// This is the follower half: it enables verification without giving the node
+    /// a signing key. Without it the node keeps the pre-S1 behaviour and accepts
+    /// unsigned blocks, which is documented as a limitation rather than a
+    /// guarantee.
+    pub fn with_validators(mut self, validators: ValidatorRegistry) -> Self {
+        self.validators = Some(Arc::new(validators));
+        self
     }
 
     /// Attach the validator identity that signs blocks this node produces.
     ///
     /// Without one, the node keeps the single-node behaviour: `validator` is
-    /// [`Address::ZERO`] and `signatures` is empty.
+    /// [`Address::ZERO`] and `signatures` is empty. An authority also enables
+    /// verification, because producing without checking peer blocks is not a
+    /// coherent stance.
     pub fn with_authority(mut self, authority: BlockAuthority) -> Self {
+        self.validators = Some(Arc::new(authority.validators().clone()));
         self.authority = Some(Arc::new(authority));
         self
     }

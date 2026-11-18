@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 subhost-core = { workspace = true }
+subhost-crypto = { workspace = true }
 subhost-node = { workspace = true }
 subhost-storage = { workspace = true }
 subhost-telemetry = { workspace = true }

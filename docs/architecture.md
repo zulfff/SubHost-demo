@@ -132,32 +132,40 @@ cannot succeed.
 
 ## 3. Who may produce a block
 
-Today: any node that can reach its own JSON-RPC port. Producer authorization is
-enforced only on a node that has a configured authority.
+Today: any node that can reach its own JSON-RPC port can submit a transaction, and
+any node whose genesis carries a validator set rejects blocks that do not come from
+one of those validators. On a genesis with no validators, the single-node path is
+unchanged and unsigned blocks are accepted.
 
-- A node configured with a `BlockAuthority` sets `header.validator` to its producer
-  address and attaches one BLS signature over `Block::signing_payload()`.
-  Construction checks that the producer is in the registry and that the supplied
-  secret belongs to the registered public key; it fails with
-  `RpcError::UnauthorizedProducer` otherwise.
-- A node without an authority keeps the single-node behaviour: `validator` is
-  `Address::ZERO` and `signatures` is empty.
-- `accept_block` on a node with an authority requires `header.validator` to be in
-  the registry and exactly one signature from that validator over the payload,
-  checked before the state transition. A missing, extra, foreign, malformed, or
-  stale signature is rejected with `RpcError::UnauthorizedProducer`.
-- A node without an authority does not check block signatures, so an unsigned
-  block still passes there. The guarantee becomes network-wide only when every
-  node has a registry; S1.4 wires genesis into that decision.
+- Bootstrap builds a `ValidatorRegistry` from `genesis.initial_validators` on every
+  node that has a validator set, so a follower verifies peer blocks without holding
+  a signing key. If any entry has a bad public key, a missing or invalid proof of
+  possession, zero power, or a duplicate address, start-up fails before the ledger is
+  opened.
+- A node started with `--validator` also reads `<data_dir>/producer.key` (one
+  hex-encoded canonical 32-byte BLS scalar, mode `0600`). It derives the public key,
+  looks for the genesis validator whose `public_key` matches, and refuses to start if
+  there are zero or several matches. A file that group or others can read is refused.
+  That lookup is why there is no producer address argument: a key file cannot be
+  paired with an address it does not match.
+- A node with a `BlockAuthority` sets `header.validator` to the resolved address and
+  attaches exactly one BLS signature over `Block::signing_payload()`. Construction
+  also checks that the secret belongs to the registered public key.
+- `accept_block` on a node with a registry requires `header.validator` to be
+  registered and exactly one signature from that validator over the payload, checked
+  before the state transition. A missing, extra, foreign, malformed, or stale
+  signature is rejected with `RpcError::UnauthorizedProducer`.
+- A node without a registry, which means a genesis with no validators, does not check
+  block signatures. That is the development path, and it is not a network guarantee.
 - The JSON-RPC surface has no authentication, so the only thing that limits block
   production is who can reach the listening address. The node binds loopback by
   default.
 
-This is the gap S1 closes. `ADR-001` fixes BLS12-381 as the scheme, a dedicated
-producer key file, and a mandatory proof of possession. S1.2 signs
-`Block::signing_payload()` on produce, S1.3 verifies one registered producer
-signature on accept, and S1.4 wires the key file and genesis registration into the
-node and CLI.
+`subhost init --validator` closes the bootstrap path: it derives the public key from
+the producer key file, signs the proof of possession, and stores it in genesis. A
+genesis assembled on another machine can carry a supplied proof instead. Every
+validator entry therefore boots through the same registry check, whether it was
+written by `init` or by hand.
 
 ## 4. What the ledger guarantees
 
@@ -243,10 +251,10 @@ What the ledger does not guarantee:
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
 - no authentication for JSON-RPC or metrics clients. Producer authorization on
-  gossip is enforced only by nodes with a configured validator registry; a node
-  without one still accepts unsigned blocks, so the guarantee is not network-wide.
-  The gossip transport encrypts and authenticates peer connections, but any peer
-  may publish a block proposal.
+  gossip is enforced by every node whose genesis carries a validator set; a genesis
+  with no validators is the development path and accepts unsigned blocks. The gossip
+  transport encrypts and authenticates peer connections, but any peer may publish a
+  block proposal.
 
 ## 5. Component ownership
 

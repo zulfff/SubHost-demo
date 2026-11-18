@@ -14,10 +14,13 @@ workspace = true
 [dependencies]
 subhost-core = { workspace = true }
 bincode = { workspace = true }
+subhost-consensus = { workspace = true }
+subhost-crypto = { workspace = true }
 subhost-metrics = { workspace = true }
 subhost-network = { workspace = true }
 subhost-rpc = { workspace = true }
 subhost-storage = { workspace = true }
+hex = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
