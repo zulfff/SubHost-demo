@@ -20,7 +20,7 @@ Start the node on loopback with token authentication enabled; a rate limit is
 optional:
 
 ```sh
-subhost node --listen 127.0.0.1:8545 --data-dir ./data \
+subhost node --single-writer --listen 127.0.0.1:8545 --data-dir ./data \
   --rpc-auth-token-file ./rpc-token --rpc-rate-limit 50
 ```
 
@@ -38,3 +38,9 @@ JSON-RPC bind, but does not provide TLS and is not the recommended edge setup.
 
 See [README security posture](../README.md#security-posture) for the flags and
 client behavior, and [manual testing](manual-testing.md) for verification steps.
+
+The command above selects an unsigned single-writer demo. For a genesis with
+validators, use consensus mode and add `--validator` for the local producer key;
+omit it for an observer. A validator genesis cannot bypass quorum policy with
+`--single-writer`. An optional `--view-timeout-ms N` overrides the node timeout;
+zero and negative values are refused before startup.

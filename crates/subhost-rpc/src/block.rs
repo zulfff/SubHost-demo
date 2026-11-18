@@ -1,12 +1,16 @@
 //! Block selection, sealing, persistence, and acceptance.
 
+#[cfg(test)]
+#[path = "proposal_budget_tests.rs"]
+mod proposal_budget_tests;
+
 use crate::state::{lock, read, write, BlockEvent, RpcError, RpcState};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use subhost_consensus::{ConsensusConfig, HotStuff, QuorumCertificate, ValidatorRegistry};
 use subhost_core::{
-    tx_root_of, Address, Block, BlockHeader, Gas, Hash, Receipt, ReceiptStatus, Transaction,
-    ValidatorSignature, BLOCK_GAS_LIMIT,
+    encode_canonical, tx_root_of, Address, Block, BlockHeader, Gas, Hash, Receipt, ReceiptStatus,
+    Transaction, ValidatorSignature, BLOCK_GAS_LIMIT,
 };
 use subhost_crypto::{BLSScheme, PrivateKey};
 use subhost_mempool::Mempool;
@@ -142,16 +146,28 @@ impl RpcState {
 
         let mut selected = Vec::new();
         let mut gas_used: Gas = 0;
+        // Fixed-width header/signature framing is below this conservative
+        // reserve. Transaction bodies are measured using the actual codec.
+        let transaction_budget = self.proposal_bytes_limit.map(|limit| limit.saturating_sub(512));
+        let mut selected_bytes = 0usize;
         for sender in senders {
             for tx in pool.ready_for(&sender, state.nonce(&sender)) {
                 let Some(next_gas) = gas_used.checked_add(tx.gas_limit) else { break };
                 if next_gas > BLOCK_GAS_LIMIT {
                     break;
                 }
+                let Some(next_bytes) = selected_bytes.checked_add(encode_canonical(&tx).len())
+                else {
+                    break;
+                };
+                if transaction_budget.is_some_and(|budget| next_bytes > budget) {
+                    break;
+                }
                 if state.apply_transaction(&tx).is_err() {
                     break;
                 }
                 gas_used = next_gas;
+                selected_bytes = next_bytes;
                 selected.push(tx);
             }
         }
@@ -357,25 +373,87 @@ impl RpcState {
         qc: &QuorumCertificate,
     ) -> Result<Vec<Receipt>, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
+        self.validate_final_qc(&block, qc)?;
+        let receipts = self.accept_validated(block)?;
+        self.committed_view.store(qc.view, Ordering::SeqCst);
+        self.verified_view.store(true, Ordering::SeqCst);
+        Ok(receipts)
+    }
+
+    /// Independently verify a certified next block without writing the ledger,
+    /// changing the pool or releasing any state. Archive consumers use this
+    /// exact commit boundary before recording a certified item.
+    pub fn validate_certified_block(
+        &self,
+        block: &Block,
+        qc: &QuorumCertificate,
+    ) -> Result<(), RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        self.validate_final_qc(block, qc)?;
+        self.validate_candidate(block).map(|_| ())
+    }
+
+    /// Recover verified view metadata from the current ledger tip's final QC.
+    /// The certificate must match the actual retained tip and genesis namespace.
+    pub fn restore_committed_qc(&self, qc: &QuorumCertificate) -> Result<(), RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        let block = read(&self.blocks).last().cloned().ok_or_else(|| {
+            RpcError::BlockRejected("genesis has no committed certificate".into())
+        })?;
+        if qc.block_hash != block.hash()
+            || qc.view < block.header.height
+            || qc.protocol_context != self.consensus_context
+            || self.committed_view().is_some_and(|view| qc.view < view)
+        {
+            return Err(RpcError::BlockRejected(
+                "tip certificate does not match restored history".into(),
+            ));
+        }
+        self.verify_block_authority(&block)?;
+        self.verify_final_qc(qc)?;
+        self.committed_view.store(qc.view, Ordering::SeqCst);
+        self.verified_view.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn validate_final_qc(&self, block: &Block, qc: &QuorumCertificate) -> Result<(), RpcError> {
+        let committed_view = self.committed_view().ok_or_else(|| {
+            RpcError::BlockRejected(
+                "verified tip certificate is required before extending restored validator history"
+                    .into(),
+            )
+        })?;
+        if qc.block_hash != block.hash()
+            || qc.view < block.header.height
+            || qc.view <= committed_view
+            || qc.protocol_context != self.consensus_context
+        {
+            return Err(RpcError::BlockRejected(
+                "final certificate does not match the block, genesis or newer view".into(),
+            ));
+        }
+        self.verify_final_qc(qc)
+    }
+
+    fn verify_final_qc(&self, qc: &QuorumCertificate) -> Result<(), RpcError> {
         let validators = self.validators.as_ref().ok_or_else(|| {
             RpcError::BlockRejected("a quorum commit requires a validator registry".into())
         })?;
-        // With no view changes yet, the linear driver's view equals block height.
-        if qc.block_hash != block.hash() || qc.view != block.header.height {
-            return Err(RpcError::BlockRejected(
-                "certificate does not match the block and view".into(),
-            ));
-        }
-        let config = ConsensusConfig::new(validators.len())
+        let mut config = ConsensusConfig::new(validators.len())
             .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
+        config.protocol_context = self.consensus_context;
         HotStuff::new(config, (**validators).clone())
             .validate_qc(qc)
-            .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
-        self.accept_validated(block)
+            .map_err(|error| RpcError::BlockRejected(error.to_string()))
     }
 
     /// Validate before persistence; caller holds the commit lock.
     fn validate_candidate(&self, block: &Block) -> Result<State, RpcError> {
+        if self.proposal_bytes_limit.is_some_and(|limit| encode_canonical(block).len() > limit) {
+            return Err(RpcError::BlockRejected(
+                "canonical block exceeds proposal/recovery budget".into(),
+            ));
+        }
         let previous = read(&self.blocks).last().cloned();
         let expected_height = match previous.as_ref() {
             Some(previous) => previous.header.height.checked_add(1).ok_or(RpcError::Internal)?,
@@ -547,6 +625,7 @@ mod tests {
         let block_hash = block.hash();
         let payload = QuorumCertificate::payload_for(view, &block_hash);
         QuorumCertificate {
+            protocol_context: Hash::ZERO,
             view,
             block_hash,
             signatures: signers

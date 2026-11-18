@@ -104,7 +104,7 @@ In a second terminal:
 ```bash
 export SUBHOST_BIN="$(pwd)/target/debug/subhost"
 export SUBHOST_TEST_DATA="/tmp/subhost-data.REPLACE_ME"
-"$SUBHOST_BIN" node --listen 127.0.0.1:8545 --data-dir "$SUBHOST_TEST_DATA"
+"$SUBHOST_BIN" node --single-writer --listen 127.0.0.1:8545 --data-dir "$SUBHOST_TEST_DATA"
 ```
 
 Leave it running. The endpoint is unauthenticated, so keep it on loopback.
@@ -249,12 +249,12 @@ cp "$SUBHOST_PRODUCER_DATA/genesis.json" "$SUBHOST_FOLLOWER_DATA/genesis.json"
 
 ```bash
 # Terminal A: the producer.
-"$SUBHOST_BIN" node --listen 127.0.0.1:8545 --data-dir "$SUBHOST_PRODUCER_DATA" \
+"$SUBHOST_BIN" node --single-writer --listen 127.0.0.1:8545 --data-dir "$SUBHOST_PRODUCER_DATA" \
   --p2p-listen /ip4/127.0.0.1/tcp/30333 --no-mdns
 
 # Terminal B: the follower. It restores the same genesis and never receives a
 # transaction of its own.
-"$SUBHOST_BIN" node --listen 127.0.0.1:18545 --data-dir "$SUBHOST_FOLLOWER_DATA" \
+"$SUBHOST_BIN" node --single-writer --listen 127.0.0.1:18545 --data-dir "$SUBHOST_FOLLOWER_DATA" \
   --p2p-listen /ip4/127.0.0.1/tcp/30334 \
   --bootstrap-peer /ip4/127.0.0.1/tcp/30333 --no-mdns
 ```
@@ -341,7 +341,7 @@ Stop the node, then create a token and restart with auth plus a slow rate limit:
 ```bash
 openssl rand -hex 32 > "$SUBHOST_TEST_HOME/rpc-token"
 chmod 600 "$SUBHOST_TEST_HOME/rpc-token"
-subhost node --listen 127.0.0.1:8545 --data-dir "$SUBHOST_TEST_DATA" \
+subhost node --single-writer --listen 127.0.0.1:8545 --data-dir "$SUBHOST_TEST_DATA" \
   --rpc-auth-token-file "$SUBHOST_TEST_HOME/rpc-token" --rpc-rate-limit 1
 ```
 
@@ -382,10 +382,10 @@ A non-loopback bind is refused before the socket opens unless the operator opts 
 and the CLI will not accept the opt-in without a token:
 
 ```bash
-subhost node --listen 0.0.0.0:8545 --data-dir "$SUBHOST_TEST_DATA"
+subhost node --single-writer --listen 0.0.0.0:8545 --data-dir "$SUBHOST_TEST_DATA"
 # refusing to bind JSON-RPC to the non-loopback address 0.0.0.0:8545: pass
 # --rpc-allow-public to expose it deliberately
-subhost node --listen 0.0.0.0:8545 --data-dir "$SUBHOST_TEST_DATA" --rpc-allow-public
+subhost node --single-writer --listen 0.0.0.0:8545 --data-dir "$SUBHOST_TEST_DATA" --rpc-allow-public
 # error: the following required arguments were not provided:
 #   --rpc-auth-token-file <RPC_AUTH_TOKEN_FILE>
 ```
@@ -429,17 +429,21 @@ That only removes the `/tmp` directories created above.
 On a genesis containing validators, a successful submission returns a hash before
 its receipt exists. Poll `eth_getTransactionReceipt` until a QC commits the block;
 `eth_blockNumber` and balances stay unchanged while quorum is absent. Submit to a
-node with its producer key: transaction gossip is not implemented.
+potential leader with its producer key: transaction gossip is not implemented.
+The local smoke runner submits identical transactions to all potential leaders.
 
-For a four-validator set, three distinct valid votes commit; two votes leave the
+For a four-validator set, three distinct Prepare votes lock a block and three Commit votes finalize it;
+two live validators leave the
 ledger unchanged. Two- and three-validator sets require all their validators,
 rather than a single signer. Run the node's loopback regression to exercise real
-proposal → vote → commit delivery:
+proposal → Prepare quorum → Commit quorum delivery:
 
 ```sh
 cargo test -p subhost-node two_validators_commit_over_real_loopback_gossip
 ```
 
 See [consensus wiring and limitations](consensus.md) before running a devnet.
-Timeout/view change remains pending; open-round vote recovery is journalled. This
-slice does not establish production finality or long-offline catch-up.
+Signed timeout reports rotate leaders while preserving prepared locks; both vote
+phases and active views are journalled. Legacy BLS proofs/journals are refused:
+use fresh corrected-suite genesis proofs and directories, preserving old data.
+Native long-offline catch-up and independent audit/soak gates remain pending.

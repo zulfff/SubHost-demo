@@ -4,10 +4,10 @@
 //! Scope: these are the verifiable pieces of the protocol — vertex admission,
 //! quorum support, QC signature validation, and stake accounting. The
 //! [`driver`] module turns them into an in-process agreement loop: one view at a
-//! time, a `n - f` BLS quorum commits a block, and every proposal must extend
-//! the committed tip. The driver has no networking, timeouts, view changes, or
-//! leader rotation yet, so it is a tested state machine rather than a
-//! decentralized testnet.
+//! time, separate `n - f` prepare and commit quorums decide a block, and every
+//! proposal must extend the committed tip. Signed leader envelopes and quorum
+//! view-change reports preserve prepared locks across timeouts. The node owns
+//! execution checks, durable checkpoints, and network dissemination.
 
 use ark_serialize::CanonicalDeserialize;
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,10 @@ pub struct ConsensusConfig {
     pub max_faulty: usize,
     pub block_time_ms: u64,
     pub dag_round_timeout_ms: u64,
+    /// Initial per-view timeout; retries back off to tolerate delayed peers.
+    pub view_timeout_ms: u64,
+    /// Immutable genesis commitment binding nil view-change reports to a network.
+    pub protocol_context: Hash,
 }
 
 impl ConsensusConfig {
@@ -52,6 +56,8 @@ impl ConsensusConfig {
             max_faulty,
             block_time_ms: subhost_core::DEFAULT_BLOCK_TIME_MS,
             dag_round_timeout_ms: 500,
+            view_timeout_ms: 2_000,
+            protocol_context: Hash::ZERO,
         })
     }
 }
@@ -81,9 +87,15 @@ impl ValidatorRegistry {
         if !BLSScheme::verify_possession(&public_key, proof_of_possession) {
             return Err(ConsensusError::InvalidProofOfPossession(address));
         }
-        if self.keys.insert(address, public_key).is_some() {
+        if self.keys.contains_key(&address) {
             return Err(ConsensusError::DuplicateValidator(address));
         }
+        if self.keys.values().any(|registered| *registered == public_key) {
+            return Err(ConsensusError::InvalidConfig(
+                "validator public key is already registered".into(),
+            ));
+        }
+        self.keys.insert(address, public_key);
         Ok(())
     }
 
@@ -336,6 +348,7 @@ impl DAG {
 /// A quorum certificate over one block at one view.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumCertificate {
+    pub protocol_context: Hash,
     pub view: u64,
     pub block_hash: Hash,
     /// One `(validator, BLS signature)` pair per signer.
@@ -348,12 +361,17 @@ impl QuorumCertificate {
     /// Binding the view as well as the block hash stops a signature from being
     /// replayed into a different view.
     pub fn signing_payload(&self) -> Vec<u8> {
-        Self::payload_for(self.view, &self.block_hash)
+        Self::payload_for_context(self.protocol_context, self.view, &self.block_hash)
     }
 
     pub fn payload_for(view: u64, block_hash: &Hash) -> Vec<u8> {
-        let mut payload = Vec::with_capacity(8 + subhost_core::HASH_SIZE + 16);
-        payload.extend_from_slice(b"subhost-qc-v1");
+        Self::payload_for_context(Hash::ZERO, view, block_hash)
+    }
+
+    pub fn payload_for_context(context: Hash, view: u64, block_hash: &Hash) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(32 + 8 + subhost_core::HASH_SIZE + 24);
+        payload.extend_from_slice(b"subhost-qc-v2-commit");
+        payload.extend_from_slice(context.as_bytes());
         payload.extend_from_slice(&view.to_be_bytes());
         payload.extend_from_slice(block_hash.as_bytes());
         payload
@@ -413,10 +431,20 @@ impl HotStuff {
     /// a valid signature. Unknown signers, duplicates, and malformed signature
     /// bytes are all rejected.
     pub fn validate_qc(&self, qc: &QuorumCertificate) -> Result<(), ConsensusError> {
+        if qc.protocol_context != self.config.protocol_context {
+            return Err(ConsensusError::InvalidProposal(
+                "certificate genesis context mismatch".into(),
+            ));
+        }
         if self.registry.is_empty() {
             return Err(ConsensusError::EmptyValidatorRegistry);
         }
 
+        if qc.signatures.len() > self.config.validator_count {
+            return Err(ConsensusError::InvalidProposal(
+                "certificate has too many signatures".into(),
+            ));
+        }
         let payload = qc.signing_payload();
         let mut verified: HashSet<Address> = HashSet::with_capacity(qc.signatures.len());
 
@@ -701,6 +729,7 @@ mod tests {
     ) -> QuorumCertificate {
         let payload = QuorumCertificate::payload_for(view, &block_hash);
         QuorumCertificate {
+            protocol_context: Hash::ZERO,
             view,
             block_hash,
             signatures: signers
@@ -916,12 +945,18 @@ mod tests {
 
         // Empty signatures never satisfy a quorum.
         assert!(hotstuff
-            .validate_qc(&QuorumCertificate { view: 1, block_hash, signatures: Vec::new() })
+            .validate_qc(&QuorumCertificate {
+                protocol_context: Hash::ZERO,
+                view: 1,
+                block_hash,
+                signatures: Vec::new()
+            })
             .is_err());
 
         // Zero-length signature bytes are malformed, not "trusted".
         assert!(matches!(
             hotstuff.validate_qc(&QuorumCertificate {
+                protocol_context: Hash::ZERO,
                 view: 1,
                 block_hash,
                 signatures: validators[..3].iter().map(|(addr, _)| (*addr, Vec::new())).collect(),
@@ -932,6 +967,7 @@ mod tests {
         // Right length, wrong bytes.
         assert!(matches!(
             hotstuff.validate_qc(&QuorumCertificate {
+                protocol_context: Hash::ZERO,
                 view: 1,
                 block_hash,
                 signatures: validators[..3]
@@ -960,14 +996,22 @@ mod tests {
         // A signature over a different block must not validate.
         let wrong_block = certificate(1, Hash::from_data(b"other"), &validators[..3]);
         assert!(matches!(
-            hotstuff.validate_qc(&QuorumCertificate { block_hash, ..wrong_block }),
+            hotstuff.validate_qc(&QuorumCertificate {
+                protocol_context: Hash::ZERO,
+                block_hash,
+                ..wrong_block
+            }),
             Err(ConsensusError::InvalidSignature(_))
         ));
 
         // A signature from another view must not be replayable.
         let other_view = certificate(9, block_hash, &validators[..3]);
         assert!(matches!(
-            hotstuff.validate_qc(&QuorumCertificate { view: 1, ..other_view }),
+            hotstuff.validate_qc(&QuorumCertificate {
+                protocol_context: Hash::ZERO,
+                view: 1,
+                ..other_view
+            }),
             Err(ConsensusError::InvalidSignature(_))
         ));
     }
@@ -977,6 +1021,7 @@ mod tests {
         let hotstuff = HotStuff::new(ConsensusConfig::new(4).unwrap(), ValidatorRegistry::new());
         assert!(matches!(
             hotstuff.validate_qc(&QuorumCertificate {
+                protocol_context: Hash::ZERO,
                 view: 1,
                 block_hash: Hash::ZERO,
                 signatures: Vec::new(),

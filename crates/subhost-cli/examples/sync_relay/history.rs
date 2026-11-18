@@ -10,7 +10,9 @@ use subhost_core::{encode_canonical, Address, Block, GenesisConfig, Hash};
 use subhost_network::{NetworkMessage, MAX_TRANSMIT_BYTES};
 use subhost_rpc::RpcState;
 
-const VERSION: u32 = 1;
+// v2 requires RFC 9380 BLS and genesis-bound final-commit certificates.
+// Legacy archives must be preserved separately, never silently reinterpreted.
+const VERSION: u32 = 2;
 const MAX_ENTRY_BYTES: u64 = (MAX_TRANSMIT_BYTES * 4) as u64;
 const MAX_AHEAD: u64 = 64;
 
@@ -50,9 +52,14 @@ impl History {
     pub(super) fn open(directory: &Path, genesis: &GenesisConfig, limit: u64) -> Result<Self> {
         genesis.validate()?;
         genesis.requires_validators()?;
+        let genesis_hash = genesis.consensus_context();
         let registry = ValidatorRegistry::from_genesis(&genesis.initial_validators)?;
-        let verifier = HotStuff::new(ConsensusConfig::new(registry.len())?, registry.clone());
-        let state = RpcState::in_memory(genesis.chain_id)?.with_validators(registry);
+        let mut config = ConsensusConfig::new(registry.len())?;
+        config.protocol_context = genesis_hash;
+        let verifier = HotStuff::new(config, registry.clone());
+        let state = RpcState::in_memory(genesis.chain_id)?
+            .with_validators(registry)
+            .with_consensus_context(genesis_hash);
         state
             .seed_accounts(genesis.allocations.iter().map(|(address, value)| (*address, *value)))?;
         std::fs::create_dir_all(directory)?;
@@ -63,7 +70,6 @@ impl History {
             .truncate(false)
             .open(directory.join("archive.lock"))?;
         lock.try_lock().context("certified-history archive is already in use")?;
-        let genesis_hash = Hash::from_data(&encode_canonical(genesis));
         let binding = directory.join("genesis.bin");
         if binding.exists() {
             if std::fs::read(&binding)? != genesis_hash.as_bytes() {
@@ -132,19 +138,20 @@ impl History {
     }
 
     fn decode(&self, message: NetworkMessage) -> Result<Certified> {
+        let block = decode_block(&message)?;
+        self.certify(message, block)
+    }
+
+    fn certify(&self, message: NetworkMessage, block: Block) -> Result<Certified> {
         message.validate()?;
-        let NetworkMessage::BlockCommit { view, data, signatures } = &message else {
+        let NetworkMessage::BlockCommit { view, signatures, .. } = &message else {
             bail!("certified-history archive only accepts quorum-certified blocks");
         };
-        let block: Block = bincode::options()
-            .with_fixint_encoding()
-            .with_limit(MAX_TRANSMIT_BYTES as u64)
-            .reject_trailing_bytes()
-            .deserialize(data)?;
-        if block.header.chain_id != self.state.chain_id() || *view != block.header.height {
+        if block.header.chain_id != self.state.chain_id() || *view < block.header.height {
             bail!("certified block belongs to a different chain or view");
         }
         let qc = QuorumCertificate {
+            protocol_context: self.genesis,
             view: *view,
             block_hash: block.hash(),
             signatures: signatures
@@ -160,22 +167,17 @@ impl History {
         &mut self,
         message: NetworkMessage,
     ) -> std::result::Result<usize, IngestError> {
-        let NetworkMessage::BlockCommit { view, .. } = &message else {
+        let NetworkMessage::BlockCommit { .. } = &message else {
             return Ok(0);
         };
-        // Ignoring stale/far-future envelopes does not trust or apply them. This
-        // avoids repeated pairing work while archives replay the same prefix.
-        if *view <= self.height() || *view > self.height().saturating_add(MAX_AHEAD) {
+        let block = decode_block(&message).map_err(IngestError::Invalid)?;
+        let height = block.header.height;
+        // Ordering and resource bounds use block height; timeout views can be
+        // independent. Ignoring a stale envelope does not trust or apply it.
+        if height <= self.height() || height > self.height().saturating_add(MAX_AHEAD) {
             return Ok(0);
         }
-        let certified = self.decode(message).map_err(IngestError::Invalid)?;
-        let height = certified.block.header.height;
-        if height <= self.height() {
-            return Ok(0);
-        }
-        if height > self.height().saturating_add(MAX_AHEAD) {
-            return Ok(0);
-        }
+        let certified = self.certify(message, block).map_err(IngestError::Invalid)?;
         if height != self.height() + 1 {
             self.pending.entry(height).or_insert(certified);
             return Ok(0);
@@ -197,7 +199,7 @@ impl History {
 
     fn append(&mut self, certified: Certified) -> std::result::Result<(), IngestError> {
         self.state
-            .validate_proposal(&certified.block)
+            .validate_certified_block(&certified.block, &certified.qc)
             .map_err(|e| IngestError::Invalid(e.into()))?;
         let envelope = Envelope {
             version: VERSION,
@@ -222,6 +224,19 @@ impl History {
         self.messages.push(certified.message);
         Ok(())
     }
+}
+
+fn decode_block(message: &NetworkMessage) -> Result<Block> {
+    message.validate()?;
+    let NetworkMessage::BlockCommit { data, .. } = message else {
+        bail!("history replay requires a certified block envelope");
+    };
+    bincode::options()
+        .with_fixint_encoding()
+        .with_limit(MAX_TRANSMIT_BYTES as u64)
+        .reject_trailing_bytes()
+        .deserialize(data)
+        .map_err(Into::into)
 }
 
 fn checksum(genesis: Hash, message: &NetworkMessage) -> Hash {

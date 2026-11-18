@@ -45,13 +45,15 @@ because the peer address is not exposed to the middleware.
 using a password taken from the request body. The explorer refuses to bind to a
 non-loopback address for that reason. Do not expose it.
 
-**Validator consensus is a prototype linear quorum driver.** With a genesis
-validator set, RPC submissions remain pending and only a verified `n - f` QC can
-commit a block. There is no timeout, view change, leader rotation, historical sync
-or reorg. Open voting rounds and the latest QC are durably journalled before votes
-are published, but historical QCs are not stored/authenticated by ledger replay.
-Concurrent proposals can stall. This slice must not be treated as production BFT or a finality guarantee. Demo chains
-without validators still seal synchronously. See `docs/consensus.md`.
+**Validator consensus uses authenticated prepare/commit rounds.** Validator
+RPC submissions stay pending until a final Commit-domain `n - f` QC is verified
+and durably appended. Signed leaders rotate through authenticated timeout
+certificates while prepared locks survive timeouts and restart. All consensus
+signatures bind the full genesis context. Signing obligations are journalled
+before release; historical QC replay/sync remains S3 and network abuse controls
+remain S7. This prototype still needs independent protocol review and the real
+audit/soak gates. Unsigned demo genesis requires explicit `--single-writer`.
+See `docs/consensus.md`.
 
 **The producer key is an unencrypted file.** `<data_dir>/producer.key` holds one
 hex-encoded 32-byte BLS scalar with mode `0600`, and the node refuses to load it if
@@ -67,10 +69,14 @@ limit or request for a missed range, so an offline node cannot catch up across a
 history gap. Gossip retransmission is best effort; configured bootstrap endpoints retry with
 capped backoff after connection failure or peer restart.
 
-**BLS hash-to-curve is non-standard.** `subhost-crypto` uses a domain-separated,
-length-prefixed hash-and-multiply onto the prime-order G2 subgroup, not an RFC 9380
-suite. It is deterministic and domain separated, which is sufficient for internal
-use, but it will not interoperate with another BLS implementation.
+**Legacy validator BLS authentication is broken and refused.** The old
+hash-and-multiply construction allows arbitrary signatures to be forged by
+rescaling a public proof of possession. The corrected implementation uses RFC
+9380 G2 `XMD:SHA-256_SSWU_RO` with separate BLS POP signature/proof domains,
+official vector tests and a legacy-forgery regression. There is no old-suite
+fallback. Upgrade all validator peers together with fresh genesis proofs and
+fresh signing/history directories, preserving old data and keys. Independent
+cryptographic audit and constant-time signing assurance remain pending.
 
 **Aggregate BLS verification requires proofs of possession.** Verifying an
 aggregate over a shared message is vulnerable to the rogue-key attack unless every
@@ -136,8 +142,8 @@ A regression in any of these is a genuine vulnerability and worth reporting.
   are rejected.
 - Quorum certificates are accepted only when the required number of distinct,
   registered validators each contribute a signature that verifies over a payload
-  binding both the view and the block hash.
-- The consensus driver commits only on an `n - f` quorum for one proposal, counts
+  binding genesis context, the final Commit domain, view and block hash.
+- The consensus driver commits only on an `n - f` final Commit quorum for one proposal, counts
   each validator once per view, and refuses a proposal that does not extend the
   committed tip by exactly one height.
 - Merkle leaves, internal nodes, and padding use separate domain tags, so a leaf

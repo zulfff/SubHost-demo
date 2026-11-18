@@ -424,6 +424,24 @@ impl Default for GenesisConfig {
 }
 
 impl GenesisConfig {
+    /// Stable namespace for consensus signatures, journals, and certified history.
+    ///
+    /// Allocations are sorted explicitly because their in-memory `HashMap`
+    /// iteration order is process-local and must never change a signature domain.
+    pub fn consensus_context(&self) -> Hash {
+        let mut allocations: Vec<_> =
+            self.allocations.iter().map(|(address, balance)| (*address, *balance)).collect();
+        allocations.sort_unstable();
+        Hash::from_data(&encode_canonical(&(
+            self.chain_id,
+            &self.initial_validators,
+            allocations,
+            self.block_time_ms,
+            self.gas_limit,
+            self.genesis_time,
+        )))
+    }
+
     /// Structural validation applied on every load and before every save.
     ///
     /// Note this deliberately does *not* require a validator set: the
@@ -795,6 +813,7 @@ mod tests {
         second.allocations.insert(Address::new([1; ADDRESS_SIZE]), 1);
         second.allocations.insert(Address::new([2; ADDRESS_SIZE]), 2);
         assert_eq!(serde_json::to_string(&first).unwrap(), serde_json::to_string(&second).unwrap());
+        assert_eq!(first.consensus_context(), second.consensus_context());
     }
 
     #[test]

@@ -61,6 +61,9 @@ async fn relay(
                 }
             }
             _ = ticker.tick(), if history.len() > 0 => {
+                if handle.subscribed_peer_count() == 0 {
+                    continue;
+                }
                 cursor %= history.len();
                 if let Some(message) = history.message(cursor) {
                     match handle.outbound.try_send(message.clone()) {

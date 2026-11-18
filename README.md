@@ -24,15 +24,18 @@ blocks that carry several transactions at once. The ledger is crash-safe, and th
 node replays it on load. Blocks commit to Merkle state and receipt roots, and
 accounts can be proven against the state root. An optional libp2p transport
 gossips blocks between nodes. The workspace also holds an IBC packet state machine
-with a single-signer light client, and a linear quorum driver wired into validator
+with a single-signer light client, and a prepare/commit quorum driver wired into validator
 nodes.
 
-This is not a production network. Validator nodes commit only with a verified
-quorum certificate; RPC submissions remain pending until then. There is no timeout,
-view change, leader rotation, or historical sync. Concurrent proposals may stall,
-and historical QCs are not authenticated on ledger replay. Demo chains without a
-validator set keep the single-writer path. See [consensus limits](docs/consensus.md) and the runnable
-[four-validator local testnet](docs/local-testnet.md).
+Validator submissions stay pending until an authenticated final Commit quorum
+durably appends a block. Signed leaders rotate using quorum timeout reports;
+prepared locks and both vote phases survive restart. Historical QC replay/native
+sync remains S3 and peer abuse controls remain S7. Unsigned demos require explicit
+`--single-writer`. The corrected RFC 9380 BLS suite refuses legacy proofs and
+journals, so upgrades require fresh genesis proofs and signing/history directories.
+Preserve old data and keys. See [consensus limits](docs/consensus.md) and the
+[four-validator local testnet](docs/local-testnet.md). Independent audit and the
+actual testnet soak remain required before production assurance.
 The table below lists what each crate does today, and nothing in this repository
 should be treated as production ready.
 
@@ -41,16 +44,16 @@ should be treated as production ready.
 | Crate | Status |
 |-------|--------|
 | `subhost-core` | Complete. Hash/Address (BLAKE3), block, transaction (with sender public key), receipt, genesis document, canonical encoding, domain-separated Merkle tree. |
-| `subhost-crypto` | Complete. BLS12-381 sign/verify/aggregate with proof of possession, ed25519, X25519 (contributory-checked), ChaCha20-Poly1305. |
+| `subhost-crypto` | RFC 9380 G2 BLS sign/verify/aggregate with proof of possession and legacy-forgery/vector regressions, ed25519, X25519 (contributory-checked), ChaCha20-Poly1305. |
 | `subhost-wallet` | Complete. scrypt + AES-256-GCM keystore, atomic `0600` writes, address verified against the decrypted key. |
 | `subhost-state` | Complete. Balances, nonce ordering, replay rejection, checked arithmetic, Merkle state root bound to the chain ID, per-account inclusion proofs. |
 | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
 | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
 | `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, pending admission and QC-gated commit when validators are configured (one block per submission on demo chains), optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit, and opt-in bearer-token authentication, per-connection rate limiting and non-loopback bind policy (no in-process TLS; use a TLS-terminating reverse proxy). |
-| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, a genesis-backed consensus driver, durable vote recovery, optional gossip for proposals/votes/certified commits, and legacy demo block buffering. |
+| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, a genesis-backed consensus driver, durable phase-vote/lock recovery, bounded consensus frames, controlled shutdown/cancellation cleanup, optional gossip for proposals/votes/certified commits, and legacy demo block buffering. |
 | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
 | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
-| `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and an `n - f` linear agreement driver wired into the node. Durable open-round checkpoints; no timeouts, view changes, or leader rotation. |
+| `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and an `n - f` prepare/final-commit driver wired into the node. Signed leaders, authenticated timeouts, durable phase votes and prepared locks. |
 | `subhost-network` | Transport. libp2p gossip publish and receive, connection limits, and proposal, vote and QC-certified block delivery consumed by `subhost-node`. Bootstrap retry with capped backoff; no Dandelion++ relay, peer scoring or block sync protocol. |
 | `subhost-ibc` | State machine plus a single-signer light client. Channel lifecycle, sequencing, timeouts, replay rejection, signed-header verification with monotonic height/time, and Merkle commitment proofs for packet delivery. No validator-set rotation or multisig quorum certificates. |
 | `subhost-faucet` | Complete. Signs and submits real transfers from an encrypted wallet, per-address cooldown. |
@@ -83,7 +86,7 @@ cargo build -p subhost-cli
   --alloc 0x1111111111111111111111111111111111111111=1000000
 
 # Run the node.
-./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir ./data
+./target/debug/subhost node --single-writer --listen 127.0.0.1:8545 --data-dir ./data
 ```
 
 In another terminal:
@@ -103,7 +106,7 @@ real `~/.subhost` is never touched:
 cargo build -p subhost-cli
 scripts/two-user-setup.sh          # creates Alice and Bob, writes genesis
 # then, following the printed instructions:
-./target/debug/subhost node --listen 127.0.0.1:8545 --data-dir /tmp/subhost-demo-data.XXXX
+./target/debug/subhost node --single-writer --listen 127.0.0.1:8545 --data-dir /tmp/subhost-demo-data.XXXX
 source /tmp/subhost-two-users-current.env && scripts/user1-alice.sh
 source /tmp/subhost-two-users-current.env && scripts/user2-bob.sh
 ```
@@ -135,7 +138,7 @@ subhost init --chain-id 1 --data-dir ./data \
   [--producer-key-file PATH]
 
 subhost node --listen 127.0.0.1:8545 --data-dir ./data \
-  [--validator [--producer-key-file PATH]] \
+  [--single-writer | --validator [--producer-key-file PATH]] [--view-timeout-ms N] \
   [--metrics-addr 127.0.0.1:9090] [--max-connections 1000] \
   [--rpc-auth-token-file PATH] [--rpc-rate-limit N] [--rpc-allow-public] \
   [--p2p-listen /ip4/0.0.0.0/tcp/30333 [--bootstrap-peer MULTIADDR] [--no-mdns] [--max-peers 50]]
@@ -159,6 +162,12 @@ subhost query chain
 Wallets live in `$SUBHOST_HOME/wallets` (default `~/.subhost/wallets`). The CLI
 queries `--nonce` and `--chain-id` from the node when you omit them. `--verbose`
 and `--quiet` control log level; `RUST_LOG` overrides both.
+
+Unsigned demo chains require `node --single-writer`. A genesis with validators
+uses consensus mode: `--validator` selects a registered local signing identity,
+and omitting it runs an observer. `--single-writer` is refused for a validator
+genesis. `--view-timeout-ms` must be positive; its default comes from the node
+configuration (2000 ms).
 
 `node --validator` is a validator node. It requires a genesis whose validator entries
 each carry a proof of possession, and it reads `<data-dir>/producer.key`: one

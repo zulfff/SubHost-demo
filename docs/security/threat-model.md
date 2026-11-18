@@ -16,14 +16,15 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
 > subset that requires a valid signature bound to the sender; Merkle state and
 > receipt commitments with per-account inclusion proofs; multi-transaction block
 > production and full re-validation of peer blocks; BLS-verified quorum
-> certificates with an `n - f` linear driver wired into validator nodes;
+> certificates with separate `n - f` Prepare/Commit quorums, genesis-bound signed
+> leaders, durable prepared locks and authenticated timeout rotation;
 > stake-deducting slashing; a
 > libp2p gossip transport that the node uses for live block propagation; and an IBC
 > light client that verifies a single ed25519 signer's headers and Merkle
 > commitment proofs.
 >
-> **Not implemented:** authenticated historical QC replay, timeout/view change, leader
-> rotation, fork choice, reorg handling,
+> **Not implemented:** authenticated historical QC replay, native catch-up,
+> finalized-fork incident handling,
 > block sync/backfill, peer scoring, an encrypted mempool, Dandelion++ routing,
 > threshold encryption, on-chain governance, EVM or WASM execution, zk proofs, a
 > Merkle Patricia Trie, non-membership proofs, validator-set rotation or multisig
@@ -38,8 +39,8 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
 
 Subhost aims to provide the following security guarantees:
 
-- **Liveness**: The network must continue processing transactions even if some
-  validators fail or act maliciously (up to 1/3 of stake)
+- **Liveness**: The network must continue processing transactions under eventual bounded delivery and
+  at most `f = (n - 1) / 3` faulty distinct validator identities
 - **Safety**: Validators cannot finalize conflicting transactions (no
   double-spends)
 - **Data Availability**: All transaction data must be available for verification
@@ -50,12 +51,14 @@ Subhost aims to provide the following security guarantees:
 
 ### What we assume
 
-- At least 2/3 of staked tokens are controlled by honest validators, and the BLS
-  keys registered on chain are the ones the validators actually hold
+- At most `f = (n - 1) / 3` registered identities are Byzantine; distinct
+  standard-suite BLS keys have valid proofs and honest signers preserve their
+  newest signing journal across restart. Genesis power is not quorum weight
 - The IBC light client's genesis header and its single ed25519 key were obtained
   out of band; if that key is replaced, the bridge trusts the replacement
 - Network partitions are temporary and eventually resolve
-- Cryptographic primitives (BLS12-381, SHA3, Blake3) remain secure
+- The corrected RFC 9380 G2 BLS POP suite, ed25519 and BLAKE3 remain secure;
+  legacy hash-and-multiply BLS signatures/proofs are forgeable and refused
 - Economic incentives align validator behavior with protocol health
 
 ### What we do not assume

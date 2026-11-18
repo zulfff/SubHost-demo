@@ -23,13 +23,15 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
 /// Gossip topic carrying application messages.
 pub const TOPIC: &str = "subhost-txs";
 /// Largest gossip payload accepted, matching the RPC request bound.
-pub const MAX_TRANSMIT_BYTES: usize = 256 * 1024;
+pub const MAX_TRANSMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Application envelope limit, leaving room for signed gossipsub framing.
+pub const MAX_WIRE_BYTES: usize = MAX_TRANSMIT_BYTES - 1024;
 /// Capacity of the inbound and outbound channels.
 const CHANNEL_CAPACITY: usize = 1_000;
 
@@ -136,6 +138,16 @@ pub enum NetworkMessage {
     Vote { view: u64, validator: [u8; 20], block_hash: [u8; 32], signature: Vec<u8> },
     /// A committed block and its independently verifiable quorum certificate.
     BlockCommit { view: u64, data: Vec<u8>, signatures: Vec<([u8; 20], Vec<u8>)> },
+    /// Canonical authenticated leader proposal, including timeout evidence.
+    ConsensusProposal { data: Vec<u8> },
+    /// Canonical phase-bound prepare or final-commit vote.
+    ConsensusVote { data: Vec<u8> },
+    /// Canonical prepare certificate and its authenticated block.
+    PreparedBlock { data: Vec<u8> },
+    /// Canonical signed target-view report with prepared-lock evidence.
+    ViewChange { data: Vec<u8> },
+    /// A complete authenticated target-view certificate for lagging peers.
+    TimeoutCertificate { data: Vec<u8> },
 }
 
 impl NetworkMessage {
@@ -149,7 +161,13 @@ impl NetworkMessage {
                 data.len()
             }
             Self::TransactionFluff { data, .. } => data.len(),
-            Self::DagVertex { data } | Self::BlockProposal { data, .. } => data.len(),
+            Self::DagVertex { data }
+            | Self::BlockProposal { data, .. }
+            | Self::ConsensusProposal { data }
+            | Self::ConsensusVote { data }
+            | Self::PreparedBlock { data }
+            | Self::ViewChange { data }
+            | Self::TimeoutCertificate { data } => data.len(),
             Self::BlockCommit { data, signatures, .. } => {
                 if data.is_empty() || signatures.is_empty() {
                     return Err(NetworkError::InvalidMessage("empty block or certificate".into()));
@@ -170,10 +188,18 @@ impl NetworkMessage {
         if payload_len == 0 {
             return Err(NetworkError::InvalidMessage("empty payload".into()));
         }
-        if payload_len > MAX_TRANSMIT_BYTES {
+        if payload_len > MAX_WIRE_BYTES {
             return Err(NetworkError::InvalidMessage(format!(
                 "payload of {payload_len} bytes exceeds the {MAX_TRANSMIT_BYTES} byte limit"
             )));
+        }
+        let wire_len = serde_json::to_vec(self)
+            .map_err(|error| NetworkError::InvalidMessage(error.to_string()))?
+            .len();
+        if wire_len > MAX_WIRE_BYTES {
+            return Err(NetworkError::InvalidMessage(
+                "serialized envelope exceeds wire budget".into(),
+            ));
         }
         Ok(())
     }
@@ -186,6 +212,18 @@ pub struct NetworkHandle {
     /// Messages received from peers.
     pub inbound: mpsc::Receiver<NetworkMessage>,
     pub local_peer_id: PeerId,
+    subscribed_peers: watch::Receiver<usize>,
+}
+
+impl NetworkHandle {
+    /// Peers that have announced a subscription to the application topic.
+    ///
+    /// A transport connection alone is not enough to publish reliably: sending
+    /// before the remote subscription arrives can consume gossipsub's duplicate
+    /// cache without delivering the message.
+    pub fn subscribed_peer_count(&self) -> usize {
+        *self.subscribed_peers.borrow()
+    }
 }
 
 /// Owns the libp2p swarm and pumps messages in both directions.
@@ -193,6 +231,8 @@ pub struct NetworkManager {
     swarm: Swarm<SubhostBehavior>,
     config: NetworkConfig,
     connected_peers: HashSet<PeerId>,
+    subscribed_peers: HashSet<PeerId>,
+    subscribed_peer_count: watch::Sender<usize>,
     topic: IdentTopic,
     outbound_rx: mpsc::Receiver<NetworkMessage>,
     inbound_tx: mpsc::Sender<NetworkMessage>,
@@ -269,19 +309,27 @@ impl NetworkManager {
 
         let (outbound_tx, outbound_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_CAPACITY);
+        let (subscribed_peer_count, subscribed_peers) = watch::channel(0);
 
         Ok((
             Self {
                 swarm,
                 config,
                 connected_peers: HashSet::new(),
+                subscribed_peers: HashSet::new(),
+                subscribed_peer_count,
                 topic,
                 outbound_rx,
                 inbound_tx,
                 local_peer_id,
                 bootstrap,
             },
-            NetworkHandle { outbound: outbound_tx, inbound: inbound_rx, local_peer_id },
+            NetworkHandle {
+                outbound: outbound_tx,
+                inbound: inbound_rx,
+                local_peer_id,
+                subscribed_peers,
+            },
         ))
     }
 
@@ -346,6 +394,9 @@ impl NetworkManager {
             return;
         }
         self.connected_peers.remove(&peer_id);
+        if self.subscribed_peers.remove(&peer_id) {
+            self.subscribed_peer_count.send_replace(self.subscribed_peers.len());
+        }
         for peer in &mut self.bootstrap {
             if peer.connected == Some(peer_id) {
                 peer.connected = None;
@@ -353,6 +404,18 @@ impl NetworkManager {
                 peer.delay = Duration::from_secs(1);
                 peer.next_attempt = Instant::now() + peer.delay;
             }
+        }
+    }
+
+    fn note_subscribed(&mut self, peer_id: PeerId) {
+        if self.subscribed_peers.insert(peer_id) {
+            self.subscribed_peer_count.send_replace(self.subscribed_peers.len());
+        }
+    }
+
+    fn note_unsubscribed(&mut self, peer_id: PeerId) {
+        if self.subscribed_peers.remove(&peer_id) {
+            self.subscribed_peer_count.send_replace(self.subscribed_peers.len());
         }
     }
 
@@ -408,6 +471,16 @@ impl NetworkManager {
                 message,
                 ..
             })) => self.handle_gossip(&message.data),
+            SwarmEvent::Behaviour(SubhostBehaviorEvent::Gossipsub(
+                gossipsub::Event::Subscribed { peer_id, topic },
+            )) if topic == self.topic.hash() => {
+                self.note_subscribed(peer_id);
+            }
+            SwarmEvent::Behaviour(SubhostBehaviorEvent::Gossipsub(
+                gossipsub::Event::Unsubscribed { peer_id, topic },
+            )) if topic == self.topic.hash() => {
+                self.note_unsubscribed(peer_id);
+            }
             SwarmEvent::Behaviour(SubhostBehaviorEvent::Mdns(mdns::Event::Discovered(peers))) => {
                 for (peer_id, address) in peers {
                     debug!(%peer_id, %address, "mDNS discovered peer");
@@ -423,6 +496,10 @@ impl NetworkManager {
     /// Previously inbound messages were dropped, so the transport could publish
     /// but never deliver.
     fn handle_gossip(&mut self, data: &[u8]) {
+        if data.len() > MAX_WIRE_BYTES {
+            debug!(bytes = data.len(), "discarding an oversized gossip envelope");
+            return;
+        }
         let message: NetworkMessage = match serde_json::from_slice(data) {
             Ok(message) => message,
             Err(error) => {
@@ -612,7 +689,7 @@ mod tests {
 
     #[test]
     fn manager_construction_yields_working_channels() {
-        let (manager, handle) = NetworkManager::new(NetworkConfig {
+        let (mut manager, handle) = NetworkManager::new(NetworkConfig {
             // mDNS binds a socket, so keep it off in tests.
             enable_mdns: false,
             ..Default::default()
@@ -621,6 +698,13 @@ mod tests {
 
         assert_eq!(manager.local_peer_id(), handle.local_peer_id);
         assert_eq!(manager.connected_peer_count(), 0);
+        assert_eq!(handle.subscribed_peer_count(), 0);
+        let peer = PeerId::random();
+        manager.note_subscribed(peer);
+        manager.note_subscribed(peer);
+        assert_eq!(handle.subscribed_peer_count(), 1);
+        manager.note_unsubscribed(peer);
+        assert_eq!(handle.subscribed_peer_count(), 0);
         // The receiver is retained by the handle, so sending must not fail.
         handle
             .outbound
@@ -656,5 +740,52 @@ mod tests {
             &serde_json::to_vec(&NetworkMessage::DagVertex { data: Vec::new() }).unwrap(),
         );
         assert!(handle.inbound.try_recv().is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connected_peers_report_their_topic_subscriptions() {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let first_port = first.local_addr().unwrap().port();
+        let second_port = second.local_addr().unwrap().port();
+        drop((first, second));
+
+        let (first_manager, first_handle) = NetworkManager::new(NetworkConfig {
+            listen_addr: format!("/ip4/127.0.0.1/tcp/{first_port}"),
+            bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/{second_port}")],
+            enable_mdns: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let (second_manager, second_handle) = NetworkManager::new(NetworkConfig {
+            listen_addr: format!("/ip4/127.0.0.1/tcp/{second_port}"),
+            bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/{first_port}")],
+            enable_mdns: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let first_task = tokio::spawn(first_manager.run());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tokio::net::TcpStream::connect(("127.0.0.1", first_port)).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first peer must start listening");
+        let second_task = tokio::spawn(second_manager.run());
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while first_handle.subscribed_peer_count() == 0
+                || second_handle.subscribed_peer_count() == 0
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("connected peers must announce the application topic subscription");
+
+        drop((first_handle, second_handle));
+        assert!(first_task.await.unwrap().is_ok());
+        assert!(second_task.await.unwrap().is_ok());
     }
 }
