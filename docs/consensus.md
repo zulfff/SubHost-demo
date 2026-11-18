@@ -16,7 +16,8 @@ an observer verifies proposals, votes and certificates without signing.
 3. Gossip carries `BlockProposal { view, data }` and `Vote { view, validator,
    block_hash, signature }`. A proposal must extend the current tip, authenticate
    its producer, and reproduce all transaction/state/receipt commitments before
-   any validator signs. A vote without a matching open proposal is discarded.
+   any vote is released. The candidate round is durably journalled before
+   publishing its votes. A vote without a matching open proposal is discarded.
 4. Distinct registered BLS keys sign the QC-domain payload. Quorum is `n - f`,
    where `f = (n - 1) / 3`; for four validators it is three. `2f + 1` is equivalent
    only when `n = 3f + 1`. An exact proposal retransmission reuses the existing
@@ -26,7 +27,9 @@ an observer verifies proposals, votes and certificates without signing.
    the block. Only after success are account state, receipts, pool and height
    published and the candidate driver adopted.
 6. Failed persistence leaves the live driver tip and visible state unchanged.
-   The ready tally remains in memory and the next ticker retries the same block.
+   The ready tally is journalled and the next ticker retries the same block.
+   A certified commit intent is saved before ledger append, and bootstrap
+   reconciles an interrupted append without applying the block twice.
    `BlockCommit { view, data, signatures }` carries a verified next-block QC to
    peers that missed the final vote. Proposal/vote/latest-commit dissemination is
    retried as peers join the mesh; duplicates cannot add quorum weight.
@@ -42,11 +45,19 @@ protocol or production BFT. There is no timeout, view change or leader rotation.
 Concurrent proposals can stall, and two silent validators in a set of four prevent
 commit indefinitely. No new empty blocks are created to advance time.
 
-Unfinished votes/locks are not durable; restarting during an open round can permit
-another vote for that height. Committed heights restore the linear view, but QCs
-remain in memory and the existing ledger does not authenticate historical QCs on
-replay. Durable vote recovery belongs to S2.4 and a QC-aware ledger to S3.4.
-Do not claim crash/partition safety or finality from this slice.
+Open proposals, verified votes and the latest QC are saved in the node-local
+`consensus-state.bin`, bound to the chain, genesis and signing identity. Restart
+restores the same vote, and a concurrent process in that directory is refused.
+An existing validator ledger with a missing journal is refused. Older builds
+without a journal need a new local testnet directory; there is no automatic
+migration that can prove an earlier vote was never sent. The ledger still does
+not authenticate historical QCs on replay; that belongs to S3.4.
+
+Keep the latest voting state with the ledger, genesis and producer key. Restoring
+an older whole-directory backup can forget votes sent after that backup; never
+roll back the signing journal. A ledger behind the newer journal is refused until
+a reviewed recovery procedure can restore the missing history. This journal
+does not establish complete crash/partition safety or production finality.
 
 There is no historical block sync/backfill, fork choice or reorg. Certified gossip
 accepts only the next block. A long-offline node cannot recover a history gap from
@@ -56,16 +67,21 @@ are logged; there is no health/readiness guarantee before S8.
 
 The explicit `--single-writer` CLI policy remains part of the Track B contract for
 S2.3; this slice retains implicit demo mode for genesis without validators. The
-wire layout changed, so all peers in a devnet must upgrade together. No ledger
-format or producer-key format changes are introduced here.
+wire layout changed, so all peers in a devnet must upgrade together. The journal
+is a new node-local format; ledger and producer-key formats are unchanged.
+Bootstrap endpoints retry with backoff capped at 30 seconds, and a peer stays
+counted until its last connection closes. See the
+[four-validator local testnet](local-testnet.md) for setup and recovery checks.
 
 ## Verification
 
 The node tests cover four validators with four/three/two voting participants,
 unchanged manifest bytes without quorum, a failed write followed by certificate
-retry, restart at a committed tip, forged/unseen traffic, and two validators over
-real libp2p loopback gossip. RPC tests reject missing/insufficient/duplicate/invalid
-certificates and check that admission/building never exposes state or receipts.
+retry, open-round restart, damaged journals, ledger rollback against newer voting
+state, shared RPC/exporter metrics, forged/unseen traffic, and two validators over
+real libp2p loopback gossip. A four-validator test covers an initially unreachable
+bootstrap, two-vote shortfall, a late fourth peer and hub restart. RPC tests reject
+missing/insufficient/duplicate/invalid certificates and check that admission/building never exposes state or receipts.
 
 ```sh
 cargo test -p subhost-consensus -p subhost-rpc -p subhost-node -p subhost-network --all-features

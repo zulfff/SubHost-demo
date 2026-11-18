@@ -11,9 +11,9 @@ let (addr, handle) = rpc.start(subhost_rpc::RpcServerConfig::default()).await?;
 // Serve metrics.router() or metrics.serve(...) with this same registry.
 ```
 
-This is the S5.3a server/API contract. The bundled node does not yet pass its
-registry to `with_metrics`; that bootstrap change belongs to Track A after this
-contract lands. Its RPC counters remain zero until that wiring is implemented.
+The bundled node passes its existing registry to `with_metrics` (S5.3b), so
+completed calls and returned RPC errors appear in its `/metrics` exporter. The
+server/API contract is ADR-004; registry construction remains owned by the node.
 `RpcServer::new` remains available without metrics for existing callers.
 
 ## What is recorded

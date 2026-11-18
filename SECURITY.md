@@ -48,9 +48,9 @@ non-loopback address for that reason. Do not expose it.
 **Validator consensus is a prototype linear quorum driver.** With a genesis
 validator set, RPC submissions remain pending and only a verified `n - f` QC can
 commit a block. There is no timeout, view change, leader rotation, historical sync
-or reorg. Unfinished votes are not durable across restarts, and historical QCs are
-not stored/authenticated by ledger replay. Concurrent proposals can stall. This
-slice must not be treated as production BFT or a finality guarantee. Demo chains
+or reorg. Open voting rounds and the latest QC are durably journalled before votes
+are published, but historical QCs are not stored/authenticated by ledger replay.
+Concurrent proposals can stall. This slice must not be treated as production BFT or a finality guarantee. Demo chains
 without validators still seal synchronously. See `docs/consensus.md`.
 
 **The producer key is an unencrypted file.** `<data_dir>/producer.key` holds one
@@ -64,7 +64,8 @@ an encrypted keystore. Back the file up as carefully as the identity it represen
 producer-authenticated proposals, verified votes and QC-certified next blocks.
 Demo chains without validators accept unsigned blocks. There is no per-peer rate
 limit or request for a missed range, so an offline node cannot catch up across a
-history gap. Gossip retransmission is best effort.
+history gap. Gossip retransmission is best effort; configured bootstrap endpoints retry with
+capped backoff after connection failure or peer restart.
 
 **BLS hash-to-curve is non-standard.** `subhost-crypto` uses a domain-separated,
 length-prefixed hash-and-multiply onto the prime-order G2 subgroup, not an RFC 9380

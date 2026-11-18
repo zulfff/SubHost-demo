@@ -30,8 +30,9 @@ nodes.
 This is not a production network. Validator nodes commit only with a verified
 quorum certificate; RPC submissions remain pending until then. There is no timeout,
 view change, leader rotation, or historical sync. Concurrent proposals may stall,
-and unfinished votes are not durable across restarts. Demo chains without a
-validator set keep the single-writer path. See [consensus limits](docs/consensus.md).
+and historical QCs are not authenticated on ledger replay. Demo chains without a
+validator set keep the single-writer path. See [consensus limits](docs/consensus.md) and the runnable
+[four-validator local testnet](docs/local-testnet.md).
 The table below lists what each crate does today, and nothing in this repository
 should be treated as production ready.
 
@@ -46,11 +47,11 @@ should be treated as production ready.
 | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
 | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
 | `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, pending admission and QC-gated commit when validators are configured (one block per submission on demo chains), optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit, and opt-in bearer-token authentication, per-connection rate limiting and non-loopback bind policy (no in-process TLS; use a TLS-terminating reverse proxy). |
-| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, a genesis-backed consensus driver, optional gossip for proposals/votes/certified commits, and legacy demo block buffering. |
+| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, a genesis-backed consensus driver, durable vote recovery, optional gossip for proposals/votes/certified commits, and legacy demo block buffering. |
 | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
 | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
-| `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and an `n - f` linear agreement driver wired into the node. No timeouts, durable unfinished votes, view changes, or leader rotation. |
-| `subhost-network` | Transport. libp2p gossip publish and receive, connection limits, and proposal, vote and QC-certified block delivery consumed by `subhost-node`. No Dandelion++ relay, no peer scoring, no block sync protocol. |
+| `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and an `n - f` linear agreement driver wired into the node. Durable open-round checkpoints; no timeouts, view changes, or leader rotation. |
+| `subhost-network` | Transport. libp2p gossip publish and receive, connection limits, and proposal, vote and QC-certified block delivery consumed by `subhost-node`. Bootstrap retry with capped backoff; no Dandelion++ relay, peer scoring or block sync protocol. |
 | `subhost-ibc` | State machine plus a single-signer light client. Channel lifecycle, sequencing, timeouts, replay rejection, signed-header verification with monotonic height/time, and Merkle commitment proofs for packet delivery. No validator-set rotation or multisig quorum certificates. |
 | `subhost-faucet` | Complete. Signs and submits real transfers from an encrypted wallet, per-address cooldown. |
 | `subhost-cli` | Complete. Every command performs a real operation. |

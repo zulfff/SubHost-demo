@@ -17,24 +17,35 @@ use crate::{
     BLS_SIGNATURE_BYTES,
 };
 use ark_serialize::CanonicalSerialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use subhost_core::{Address, Block, Hash};
 use subhost_crypto::{BLSScheme, PrivateKey};
 
 /// A block put forward for one view.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockProposal {
     pub view: u64,
     pub block: Block,
 }
 
 /// One validator's signature over [`QuorumCertificate::payload_for`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Vote {
     pub view: u64,
     pub block_hash: Hash,
     pub validator: Address,
     pub signature: Vec<u8>,
+}
+
+/// Key-free recovery state. The node must durably save it before relaying votes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverCheckpoint {
+    pub height: u64,
+    pub tip: Hash,
+    pub high_qc: Option<QuorumCertificate>,
+    pub proposal: Option<BlockProposal>,
+    pub votes: Vec<Vote>,
 }
 
 /// What happened to a vote.
@@ -70,6 +81,56 @@ pub struct ConsensusDriver {
 }
 
 impl ConsensusDriver {
+    /// Capture the current voting obligation without serializing the identity key.
+    pub fn checkpoint(&self) -> DriverCheckpoint {
+        DriverCheckpoint {
+            height: self.height,
+            tip: self.tip,
+            high_qc: self.hotstuff.high_qc().cloned(),
+            proposal: self.proposal.clone(),
+            votes: self.votes.values().cloned().collect(),
+        }
+    }
+
+    /// Restore a checkpoint, independently validating every saved vote and QC.
+    /// A validator's open proposal must retain its own previously released vote.
+    pub fn from_checkpoint(
+        config: ConsensusConfig,
+        registry: ValidatorRegistry,
+        identity: Option<(Address, PrivateKey)>,
+        checkpoint: DriverCheckpoint,
+    ) -> Result<Self, ConsensusError> {
+        let mut driver =
+            Self::with_tip(config, registry, identity, checkpoint.height, checkpoint.tip)?;
+        if let Some(qc) = checkpoint.high_qc {
+            if qc.view != driver.height || qc.block_hash != driver.tip || driver.height == 0 {
+                return Err(ConsensusError::InvalidProposal(
+                    "saved QC does not match the tip".into(),
+                ));
+            }
+            driver.hotstuff.update_high_qc(qc)?;
+        }
+        if let Some(proposal) = checkpoint.proposal {
+            driver.observe_proposal(proposal)?;
+            // Verify saved signatures even for our own address, rather than
+            // treating a corrupted own vote as an already-tallied duplicate.
+            driver.votes.clear();
+            for vote in checkpoint.votes {
+                if !driver.record_vote(vote)? {
+                    return Err(ConsensusError::InvalidProposal("duplicate saved vote".into()));
+                }
+            }
+            if driver.is_validator() && driver.own_vote().is_none() {
+                return Err(ConsensusError::InvalidProposal(
+                    "saved round is missing our vote".into(),
+                ));
+            }
+        } else if !checkpoint.votes.is_empty() {
+            return Err(ConsensusError::InvalidProposal("saved votes have no proposal".into()));
+        }
+        Ok(driver)
+    }
+
     /// Build a driver for a full validator set.
     ///
     /// `identity` must be a registered validator when present; `None` makes the
@@ -90,8 +151,9 @@ impl ConsensusDriver {
     /// height zero.
     ///
     /// In this linear driver each committed height consumes exactly one view,
-    /// so the restored height also restores the committed view. Votes for an
-    /// unfinished round are not durable yet; crash-safe vote recovery is S2.4.
+    /// so the restored height also restores the committed view. Use
+    /// [`Self::from_checkpoint`] for unfinished rounds; the node persists the
+    /// checkpoint before publishing votes.
     pub fn with_tip(
         config: ConsensusConfig,
         registry: ValidatorRegistry,
@@ -677,6 +739,42 @@ mod tests {
             Some((keys[0].0, keys[1].1.clone()))
         )
         .is_err());
+    }
+
+    #[test]
+    fn checkpoints_reverify_votes_and_never_fabricate_a_missing_own_vote() {
+        let (registry, keys) = registry(4);
+        let config = ConsensusConfig::new(4).unwrap();
+        let identity = Some(keys[0].clone());
+        let mut driver =
+            ConsensusDriver::new(config.clone(), registry.clone(), identity.clone()).unwrap();
+        driver.propose(block(1, Hash::ZERO, 1)).unwrap();
+        let checkpoint = driver.checkpoint();
+        let restored = ConsensusDriver::from_checkpoint(
+            config.clone(),
+            registry.clone(),
+            identity.clone(),
+            checkpoint.clone(),
+        )
+        .unwrap();
+        assert_eq!(restored.checkpoint(), checkpoint);
+        let mut missing = checkpoint.clone();
+        missing.votes.clear();
+        let mut forged = checkpoint.clone();
+        forged.votes[0].signature = vec![0xff; 96];
+        let mut duplicate = checkpoint.clone();
+        duplicate.votes.push(duplicate.votes[0].clone());
+        let mut detached = checkpoint;
+        detached.proposal = None;
+        for bad in [missing, forged, duplicate, detached] {
+            assert!(ConsensusDriver::from_checkpoint(
+                config.clone(),
+                registry.clone(),
+                identity.clone(),
+                bad
+            )
+            .is_err());
+        }
     }
 
     #[test]

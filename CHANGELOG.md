@@ -201,6 +201,19 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Recoverable four-validator local testnet.** A node-local, checksummed voting
+  journal saves open proposals, verified votes and the latest QC before votes
+  are published. Prepared commit intents reconcile interruption before/after
+  ledger append; corrupt/missing journals, incompatible genesis/identity and
+  a ledger behind newer voting state are refused. A data-directory lock prevents
+  concurrent local signers. Bootstrap endpoints retry with capped backoff and
+  connection counts retain a peer until its final connection closes. The
+  `local-testnet` example creates distinct keys/shared genesis and checks signed
+  RPC submissions and equal tips/state roots across four loopback validators.
+  See `docs/local-testnet.md` for restart, backup and remaining protocol limits.
+- **Node RPC metrics reach the exporter (S5.3b).** The bundled node injects its
+  existing registry through ADR-004; an HTTP regression verifies exported success,
+  error and latency counts without unbounded caller labels.
 - **Validator consensus wiring (S2.1–S2.2 and the S2.3 commit API).** RPC admission
   stays pending when genesis defines validators. Nodes exchange signed proposals,
   votes and certified commits; `commit_qc` checks the certificate before the
@@ -208,7 +221,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   certificate for retry and never advances the visible or driver tip. Quorums
   require `n - f` validators, preventing single-signer commits for sets of two or
   three. Demo chains without validators retain synchronous single-writer blocks.
-  Timeout/view change, durable unfinished votes/QCs, historical sync and the
+  Timeout/view change, authenticated historical QCs, historical sync and the
   explicit CLI single-writer flag remain deferred; see `docs/consensus.md`.
 
 - **Opt-in JSON-RPC call metrics.** `RpcServer::with_metrics` records completed

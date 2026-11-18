@@ -15,7 +15,8 @@ A node is one process assembled in `subhost-node`:
   behind a bearer-token and per-connection rate-limit HTTP middleware. Both are
   off unless the operator configures them.
 - A linear consensus driver for a genesis validator set, verifying `n - f` votes
-  before commit. Observers hold no signing key.
+  before commit. Observers hold no signing key. A node-local journal preserves
+  the open proposal/votes and latest QC before votes are published.
 - The optional metrics exporter, the optional libp2p gossip task, and a five-second
   observer that copies block height and pending count into metrics.
 - `subhost-cli` parses operator flags, writes genesis files, and calls
@@ -24,7 +25,11 @@ A node is one process assembled in `subhost-node`:
 `Node::bootstrap` loads `genesis.json` when present, opens the ledger, and applies
 genesis allocations only when no ledger exists yet. A restarted node
 restores the ledger and logs the restored height instead of re-applying allocations.
-The mempool is not persisted, so a restart loses pending transactions.
+The mempool is not persisted, so a restart loses pool entries. Transactions in
+a journalled open proposal survive with their voting obligation. Bootstrap
+reconciles certified commit intents with the ledger and refuses missing, corrupt
+or incompatible validator voting state. The journal does not authenticate
+historical QCs in the block ledger.
 
 A node started with `--validator` refuses to start without a genesis file that
 contains at least one initial validator. A node without that flag may run with no

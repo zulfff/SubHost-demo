@@ -21,11 +21,14 @@ subhost-network = { workspace = true }
 subhost-rpc = { workspace = true }
 subhost-storage = { workspace = true }
 hex = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 ed25519-dalek = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

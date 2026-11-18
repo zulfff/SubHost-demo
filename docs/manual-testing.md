@@ -4,9 +4,9 @@ This walkthrough runs a chain end to end: wallet creation, ed25519 signing,
 balances, nonces, fees, block production, account proofs, restart persistence, and
 two-node block gossip.
 
-It is not a multi-node testnet. `--p2p-listen` relays blocks between nodes, but the
-node has no consensus, no fork choice, and no block sync, so only one node may
-produce.
+This walkthrough uses the single-writer demo chain without genesis validators.
+For quorum commits over P2P, use the [four-validator local testnet](local-testnet.md).
+Historical sync, fork choice and leader rotation remain pending.
 
 ## 1. Build
 
@@ -441,5 +441,5 @@ cargo test -p subhost-node two_validators_commit_over_real_loopback_gossip
 ```
 
 See [consensus wiring and limitations](consensus.md) before running a devnet.
-Timeout/view change and durable unfinished vote recovery remain pending; this
+Timeout/view change remains pending; open-round vote recovery is journalled. This
 slice does not establish production finality or long-offline catch-up.

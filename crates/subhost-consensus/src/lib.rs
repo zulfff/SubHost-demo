@@ -10,6 +10,7 @@
 //! decentralized testnet.
 
 use ark_serialize::CanonicalDeserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use subhost_core::{encode_canonical, Address, Block, Hash, ValidatorInfo};
 use subhost_crypto::{BLSScheme, PublicKey, Signature};
@@ -333,7 +334,7 @@ impl DAG {
 }
 
 /// A quorum certificate over one block at one view.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuorumCertificate {
     pub view: u64,
     pub block_hash: Hash,

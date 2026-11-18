@@ -22,7 +22,7 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
 > light client that verifies a single ed25519 signer's headers and Merkle
 > commitment proofs.
 >
-> **Not implemented:** durable unfinished votes/QCs, timeout/view change, leader
+> **Not implemented:** authenticated historical QC replay, timeout/view change, leader
 > rotation, fork choice, reorg handling,
 > block sync/backfill, peer scoring, an encrypted mempool, Dandelion++ routing,
 > threshold encryption, on-chain governance, EVM or WASM execution, zk proofs, a
