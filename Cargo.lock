@@ -3975,7 +3975,11 @@ dependencies = [
 name = "subhost-mempool"
 version = "0.1.0"
 dependencies = [
+ "bincode",
+ "blake3",
+ "ed25519-dalek",
  "subhost-core",
+ "tempfile",
  "thiserror 2.0.21",
  "tracing",
 ]
