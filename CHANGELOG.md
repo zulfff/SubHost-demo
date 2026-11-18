@@ -208,6 +208,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   single-node form stays `Address::ZERO` with an empty signature list.
   `BlockAuthority::new` refuses an unregistered producer, or a secret whose public
   key is not the registered one, with `RpcError::UnauthorizedProducer`.
+- **`subhost db migrate`.** A version 2 `node-state.bin` can now be converted
+  without starting a node. The command validates the whole legacy file, writes the
+  segmented ledger, re-reads it and compares the head with the legacy head, keeps the
+  original as `node-state.bin.v2-backup`, and is a no-op on an already-segmented
+  ledger. Corrupt or unknown-version files fail without writing anything, so an
+  interrupted run can simply be repeated.
 - **Segmented ledger store.** `subhost-storage` keeps history in
   `ledger/manifest.json` plus append-only `ledger/segments/NNNNNN.log` (framed
   records, BLAKE3 per record) and account state in
