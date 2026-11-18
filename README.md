@@ -42,7 +42,7 @@ should be treated as production ready.
 | `subhost-state` | Complete. Balances, nonce ordering, replay rejection, checked arithmetic, Merkle state root bound to the chain ID, per-account inclusion proofs. |
 | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
 | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
-| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit. |
+| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit, and opt-in bearer-token authentication, per-connection rate limiting and non-loopback bind policy (no in-process TLS; use a TLS-terminating reverse proxy). |
 | `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, optional peer gossip that publishes locally produced blocks and applies peer blocks in height order. |
 | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
 | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
@@ -133,6 +133,7 @@ subhost init --chain-id 1 --data-dir ./data \
 subhost node --listen 127.0.0.1:8545 --data-dir ./data \
   [--validator [--producer-key-file PATH]] \
   [--metrics-addr 127.0.0.1:9090] [--max-connections 1000] \
+  [--rpc-auth-token-file PATH] [--rpc-rate-limit N] [--rpc-allow-public] \
   [--p2p-listen /ip4/0.0.0.0/tcp/30333 [--bootstrap-peer MULTIADDR] [--no-mdns] [--max-peers 50]]
 
 subhost wallet new --password <password> [--name alice]
@@ -241,9 +242,30 @@ empty proof.
 
 ### Security posture
 
-The JSON-RPC and metrics endpoints have **no authentication and no TLS**. Bind
-them to loopback, or put an authenticating reverse proxy in front. The node logs a
-warning when it binds a non-loopback address.
+JSON-RPC is unauthenticated by default and binds loopback. Three flags change that:
+
+- `--rpc-auth-token-file PATH` (or `SUBHOST_RPC_AUTH_TOKEN_FILE`) requires a
+  bearer token on every HTTP and WebSocket request. The token is read from a file
+  so it does not appear in a process list, compared in constant time, and a
+  mismatch answers HTTP 401 with JSON-RPC error `-32000`.
+- `--rpc-rate-limit N` allows `N` requests per second **per connection** and
+  answers HTTP 429 with `Retry-After` and JSON-RPC error `-32005`. jsonrpsee 0.24
+  does not expose the peer address, so this is not a per-IP limit; many
+  connections multiply the effective rate. `--max-connections` is still the bound
+  on how many exist.
+- `--rpc-allow-public` is required to bind anything other than a loopback
+  address, and only together with a token. `subhost-rpc::start` refuses the bind
+  otherwise, so a test or an embedder cannot bypass the rule.
+
+`subhost tx`, every `subhost query`, the faucet (`SUBHOST_RPC_AUTH_TOKEN_FILE`),
+and the explorer (`SUBHOST_RPC_AUTH_TOKEN_FILE`) send the token and name the
+missing setting when the node answers 401.
+
+There is **no in-process TLS**: the pinned jsonrpsee release has no server-side
+TLS feature. The supported deployment is a TLS-terminating reverse proxy in front
+of a loopback bind. The metrics endpoint has no authentication and no TLS; keep it
+on loopback or behind the same proxy. See the [deployment guidance](docs/deployment.md)
+for the recommended proxy setup.
 
 ---
 
@@ -253,8 +275,13 @@ warning when it binds a non-loopback address.
 export SUBHOST_FAUCET_PASSWORD='...'
 FAUCET_WALLET_PATH=./faucet-wallet.json \
 SUBHOST_RPC_URL=http://127.0.0.1:8545 \
+SUBHOST_RPC_AUTH_TOKEN_FILE=./rpc-token \
   ./target/debug/subhost-faucet
 ```
+
+`SUBHOST_RPC_AUTH_TOKEN_FILE` is optional and must match the node's
+`--rpc-auth-token-file`; without it, a protected node answers 401 and the faucet
+reports which variable to set.
 
 `POST /drip {"address":"0x..."}` signs a real transfer from the faucet wallet and
 returns the hash the node accepted. `GET /status` reports the faucet address,

@@ -25,8 +25,9 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
 > block sync/backfill, peer scoring, an encrypted mempool, Dandelion++ routing,
 > threshold encryption, on-chain governance, EVM or WASM execution, zk proofs, a
 > Merkle Patricia Trie, non-membership proofs, validator-set rotation or multisig
-> light clients, oracle or MEV defences, an HSM program, and any authentication on
-> the JSON-RPC, metrics, or faucet surfaces. There is no bug bounty.
+> light clients, oracle or MEV defences, an HSM program, per-IP rate limiting,
+> in-process TLS, and authentication on the metrics or faucet surfaces. JSON-RPC
+> authentication exists but is opt-in and defaults to off. There is no bug bounty.
 >
 > `SECURITY.md` is the authoritative, code-verified statement of the current
 > posture. Where this document and `SECURITY.md` disagree, `SECURITY.md` wins.

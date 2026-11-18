@@ -11,8 +11,9 @@ A node is one process assembled in `subhost-node`:
 - `RpcState` holds the chain ID, the mempool, the account state, the block history,
   the receipt index, the ledger store, and a commit lock. Every field is shared
   behind an `Arc`, so cloning the state is cheap and all clones see one ledger.
-- `RpcServer` serves the JSON-RPC surface over HTTP and WebSocket. There is no
-  authentication on that surface.
+- `RpcServer` serves the JSON-RPC surface over HTTP and WebSocket, optionally
+  behind a bearer-token and per-connection rate-limit HTTP middleware. Both are
+  off unless the operator configures them.
 - The optional metrics exporter, the optional libp2p gossip task, and a five-second
   observer that copies block height and pending count into metrics.
 - `subhost-cli` parses operator flags, writes genesis files, and calls
@@ -132,10 +133,11 @@ cannot succeed.
 
 ## 3. Who may produce a block
 
-Today: any node that can reach its own JSON-RPC port can submit a transaction, and
-any node whose genesis carries a validator set rejects blocks that do not come from
-one of those validators. On a genesis with no validators, the single-node path is
-unchanged and unsigned blocks are accepted.
+Today: JSON-RPC is unauthenticated by default, so any client that can reach the
+port can submit a transaction; with the optional bearer-token policy enabled, only
+clients with the token can. Any node whose genesis carries a validator set rejects
+blocks that do not come from one of those validators. On a genesis with no validators,
+the single-node path is unchanged and unsigned blocks are accepted.
 
 - Bootstrap builds a `ValidatorRegistry` from `genesis.initial_validators` on every
   node that has a validator set, so a follower verifies peer blocks without holding
@@ -157,9 +159,12 @@ unchanged and unsigned blocks are accepted.
   signature is rejected with `RpcError::UnauthorizedProducer`.
 - A node without a registry, which means a genesis with no validators, does not check
   block signatures. That is the development path, and it is not a network guarantee.
-- The JSON-RPC surface has no authentication, so the only thing that limits block
-  production is who can reach the listening address. The node binds loopback by
-  default.
+- JSON-RPC authentication is opt-in: without a token, any client that can reach the
+  port can submit signed transactions. `--rpc-rate-limit` is per connection, not per
+  IP. The listener binds loopback by default and refuses a non-loopback bind unless
+  `--rpc-allow-public` and a token are both set. There is no in-process TLS; use a
+  TLS-terminating reverse proxy for public deployment.
+
 
 `subhost init --validator` closes the bootstrap path: it derives the public key from
 the producer key file, signs the proof of possession, and stores it in genesis. A
@@ -250,11 +255,16 @@ What the ledger does not guarantee:
   is no backfill (that returns with block sync in S3/S7);
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
-- no authentication for JSON-RPC or metrics clients. Producer authorization on
-  gossip is enforced by every node whose genesis carries a validator set; a genesis
-  with no validators is the development path and accepts unsigned blocks. The gossip
-  transport encrypts and authenticates peer connections, but any peer may publish a
-  block proposal.
+- JSON-RPC authentication is opt-in and the metrics endpoint has none: without
+  `--rpc-auth-token-file` any client that can reach the port can submit
+  transactions, and `--rpc-rate-limit` is per connection rather than per IP
+  because jsonrpsee 0.24 does not expose the peer address to middleware. WebSocket
+  tokens are checked only at the upgrade. There is no in-process TLS, so a public
+  deployment needs a TLS-terminating reverse proxy. Producer authorization on
+  gossip is enforced by nodes whose genesis carries a validator set; a genesis
+  without validators accepts unsigned blocks, so that guarantee is not network-wide.
+  The gossip transport encrypts and authenticates peer connections, but any peer
+  may publish a block proposal.
 
 ## 5. Component ownership
 
@@ -287,5 +297,6 @@ Decision boundary rule: a crate may validate its own inputs, but only
 | Submission rejected as not executable | `select_transactions` and `State::apply_transaction` |
 | Peer block rejected | `accept_block` in `subhost-rpc/src/block.rs`, then `validate_chain` in `subhost-storage` |
 | Node will not start with a ledger on disk | `LedgerStore::load` validation order |
+| JSON-RPC answers 401 or the node refuses to bind | `subhost-rpc/src/security.rs`: token file, `allow_public`, then the middleware layer |
 | Block height stuck behind a peer | the ordering buffer in `subhost-node` and its 64-block window |
 | State root mismatch after restart | `State::root`, account leaf sorting, and chain-ID binding |
