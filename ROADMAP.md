@@ -291,14 +291,13 @@ Platform consumer slice (Track B, ADR-006): the optional CLI `sync-relay`
 records and revalidates full block/QC history from genesis and automatically
 rebroadcasts it in bounded ascending messages. Fresh and offline nodes apply
 the history through the existing QC/journal path; real P2P backfill covers 100
-blocks. This does not complete native range request/response sync, QC-aware
-ledger pruning, fork choice, reorg, timeout/view change or leader rotation.
+blocks. Archive v2 consumes RFC 9380 BLS and genesis-bound final-commit QCs;
+full certified-block prevalidation precedes persistence. Views may skip after
+timeouts while record order/buffering follows height. Legacy proofs/archives
+are refused. This does not complete native range request/response sync, QC-aware
+ledger pruning, fork choice or reorg. Node timeout/leader rules are separate.
 Redundant archives must retain QCs from the first block; reaching the configured
 archive byte cap stops ingestion. See `docs/operations/certified-sync.md`.
-The stable prototype requires corrected RFC 9380 BLS, official-vector and
-public-PoP forgery rejection tests, and fresh genesis proofs; legacy signatures
-are refused. Its linear QC view/height rule is retained until the separately
-tested phased Protocol revision and coordinated archive upgrade are ready.
 
 - Bounded range request/response with item and byte caps, retries and ascending
   parent-linked certified items.

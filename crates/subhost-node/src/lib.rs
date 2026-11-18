@@ -184,7 +184,8 @@ impl Node {
         } else {
             None
         };
-        let protocol_context = genesis.as_ref().map_or(Hash::ZERO, consensus_genesis_hash);
+        let protocol_context =
+            genesis.as_ref().map_or(Hash::ZERO, GenesisConfig::consensus_context);
 
         // Build the signing registry before touching storage: a genesis set that
         // cannot be trusted should not open a ledger at all.
@@ -429,22 +430,6 @@ pub fn consensus_block_budget(validators: usize) -> Result<usize, NodeError> {
 
 /// How far ahead of the local tip a peer block may be buffered.
 const MAX_BLOCKS_AHEAD: BlockHeight = 64;
-
-fn consensus_genesis_hash(genesis: &GenesisConfig) -> Hash {
-    // HashMap iteration order changes across processes; account allocations
-    // must be ordered before binding a recovery file to its genesis.
-    let mut allocations: Vec<_> =
-        genesis.allocations.iter().map(|(address, balance)| (*address, *balance)).collect();
-    allocations.sort_unstable();
-    Hash::from_data(&encode_canonical(&(
-        genesis.chain_id,
-        &genesis.initial_validators,
-        allocations,
-        genesis.block_time_ms,
-        genesis.gas_limit,
-        genesis.genesis_time,
-    )))
-}
 
 /// Holds peer blocks that arrived before their parent.
 ///

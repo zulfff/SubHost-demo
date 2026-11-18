@@ -35,7 +35,7 @@ fn genesis_binding_is_stable_across_allocation_insertion_orders() {
     for index in (1..=20u8).rev() {
         reordered.allocations.insert(Address::new([index; 20]), index as u128);
     }
-    assert_eq!(consensus_genesis_hash(&genesis), consensus_genesis_hash(&reordered));
+    assert_eq!(genesis.consensus_context(), reordered.consensus_context());
 }
 
 #[tokio::test]

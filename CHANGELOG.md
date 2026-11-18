@@ -233,6 +233,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   future buffering and a configurable byte cap. Redundant archives preserve
   history across relay downtime. Native range requests and history pruning are
   separate work; see `docs/operations/certified-sync.md` and ADR-006.
+  Archive v2 requires RFC 9380 BLS and genesis-bound final-commit certificates,
+  prevalidates the complete commit boundary before writing, and orders records
+  by block height independently of timeout views. Legacy v1 archives/signatures,
+  prepare-phase replay, public-PoP forgery and stale views are rejected. Replay
+  waits for a peer's topic subscription so startup messages are not consumed by
+  gossipsub's duplicate cache before any receiver is ready.
 
 - **Bounded atomic mempool snapshot API.** `subhost_mempool::MempoolStore` loads
   and persists chain/genesis-bound `mempool.bin` snapshots, validates signed
