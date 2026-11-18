@@ -70,6 +70,7 @@ ark-ff = "0.6"
 ark-serialize = "0.6"
 sha3 = "0.12"
 blake3 = "1.5"
+subtle = "2.6"
 rand = "0.10"
 chacha20poly1305 = "0.11"
 x25519-dalek = { version = "2.0", features = ["static_secrets"] }
@@ -83,13 +84,15 @@ aes-gcm = "0.11"
 # async-std is discontinued (RUSTSEC-2025-0052).
 libp2p = { version = "0.57", features = ["tcp", "dns", "tokio", "noise", "yamux", "ping", "kad", "gossipsub", "mdns", "macros"] }
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
+http = "1"
+tower = { version = "0.4", features = ["util"] }
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors", "limit"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 prometheus = { version = "0.14", default-features = false }
 
 # Utilities
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
 dashmap = "6.2"
 hex = "0.4"
 time = { version = "0.3", features = ["formatting"] }

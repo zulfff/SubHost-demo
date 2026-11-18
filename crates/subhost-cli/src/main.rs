@@ -116,6 +116,18 @@ enum Commands {
         /// Maximum number of peer connections.
         #[arg(long, default_value_t = 50, requires = "p2p_listen")]
         max_peers: usize,
+
+        /// File holding the bearer token every JSON-RPC caller must present.
+        #[arg(long, env = "SUBHOST_RPC_AUTH_TOKEN_FILE")]
+        rpc_auth_token_file: Option<PathBuf>,
+
+        /// Requests per second allowed per JSON-RPC connection.
+        #[arg(long)]
+        rpc_rate_limit: Option<u32>,
+
+        /// Permit a non-loopback bind. Requires --rpc-auth-token-file.
+        #[arg(long, requires = "rpc_auth_token_file")]
+        rpc_allow_public: bool,
     },
 
     /// Manage local wallets.
@@ -242,6 +254,10 @@ enum TxCommands {
 
         #[arg(long, default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
+
+        /// File holding the bearer token for an authenticated node.
+        #[arg(long, env = "SUBHOST_RPC_AUTH_TOKEN_FILE")]
+        rpc_auth_token_file: Option<PathBuf>,
     },
 
     /// Fetch a transaction receipt.
@@ -250,6 +266,10 @@ enum TxCommands {
 
         #[arg(long, default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
+
+        /// File holding the bearer token for an authenticated node.
+        #[arg(long, env = "SUBHOST_RPC_AUTH_TOKEN_FILE")]
+        rpc_auth_token_file: Option<PathBuf>,
     },
 }
 
@@ -261,6 +281,10 @@ enum QueryCommands {
 
         #[arg(long, default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
+
+        /// File holding the bearer token for an authenticated node.
+        #[arg(long, env = "SUBHOST_RPC_AUTH_TOKEN_FILE")]
+        rpc_auth_token_file: Option<PathBuf>,
     },
 
     /// Next expected nonce for an account.
@@ -269,6 +293,10 @@ enum QueryCommands {
 
         #[arg(long, default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
+
+        /// File holding the bearer token for an authenticated node.
+        #[arg(long, env = "SUBHOST_RPC_AUTH_TOKEN_FILE")]
+        rpc_auth_token_file: Option<PathBuf>,
     },
 
     /// A block by height, or the latest block.
@@ -283,12 +311,20 @@ enum QueryCommands {
 
         #[arg(long, default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
+
+        /// File holding the bearer token for an authenticated node.
+        #[arg(long, env = "SUBHOST_RPC_AUTH_TOKEN_FILE")]
+        rpc_auth_token_file: Option<PathBuf>,
     },
 
     /// Chain ID and current height.
     Chain {
         #[arg(long, default_value = DEFAULT_RPC_URL)]
         rpc_url: String,
+
+        /// File holding the bearer token for an authenticated node.
+        #[arg(long, env = "SUBHOST_RPC_AUTH_TOKEN_FILE")]
+        rpc_auth_token_file: Option<PathBuf>,
     },
 }
 
@@ -327,6 +363,9 @@ fn main() -> Result<()> {
                 bootstrap_peers,
                 no_mdns,
                 max_peers,
+                rpc_auth_token_file,
+                rpc_rate_limit,
+                rpc_allow_public,
             } => {
                 run_node(
                     validator,
@@ -339,6 +378,9 @@ fn main() -> Result<()> {
                     bootstrap_peers,
                     no_mdns,
                     max_peers,
+                    rpc_auth_token_file,
+                    rpc_rate_limit,
+                    rpc_allow_public,
                 )
                 .await
             }
@@ -607,6 +649,9 @@ async fn run_node(
     bootstrap_peers: Vec<String>,
     no_mdns: bool,
     max_peers: usize,
+    rpc_auth_token_file: Option<PathBuf>,
+    rpc_rate_limit: Option<u32>,
+    rpc_allow_public: bool,
 ) -> Result<()> {
     let data_dir = match data_dir {
         Some(dir) => dir,
@@ -622,10 +667,22 @@ async fn run_node(
         enable_mdns: !no_mdns,
     });
 
+    let rpc_security = subhost_rpc::RpcSecurityConfig {
+        auth_token: rpc_auth_token_file
+            .as_deref()
+            .map(subhost_rpc::SecretToken::from_file)
+            .transpose()
+            .with_context(|| "cannot load the RPC auth token")?,
+        rate_limit_per_sec: rpc_rate_limit,
+        allow_public: rpc_allow_public,
+    };
+    rpc_security.validate()?;
+
     let node = Node::bootstrap(NodeConfig {
         data_dir,
         rpc_addr,
         max_rpc_connections: max_connections,
+        rpc_security,
         metrics_addr,
         validator,
         producer_key_file,
@@ -745,7 +802,18 @@ fn find_wallet(dir: &Path, address: &Address) -> Result<(PathBuf, Wallet)> {
 
 async fn handle_transaction(cmd: TxCommands) -> Result<()> {
     match cmd {
-        TxCommands::Send { from, to, amount, password, gas_price, nonce, chain_id, rpc_url } => {
+        TxCommands::Send {
+            from,
+            to,
+            amount,
+            password,
+            gas_price,
+            nonce,
+            chain_id,
+            rpc_url,
+            rpc_auth_token_file,
+        } => {
+            let rpc = RpcClient::new(rpc_url, rpc_auth_token_file.as_deref())?;
             if amount == 0 {
                 bail!("amount must be greater than zero");
             }
@@ -764,16 +832,13 @@ async fn handle_transaction(cmd: TxCommands) -> Result<()> {
             // stale hand-written nonce cannot silently produce a rejected tx.
             let chain_id = match chain_id {
                 Some(chain_id) => chain_id,
-                None => {
-                    quantity(&rpc_call_value(&rpc_url, "eth_chainId", serde_json::json!([])).await?)
-                        .context("node returned an invalid chain ID")?
-                }
+                None => quantity(&rpc.call_value("eth_chainId", serde_json::json!([])).await?)
+                    .context("node returned an invalid chain ID")?,
             };
             let nonce = match nonce {
                 Some(nonce) => nonce,
                 None => quantity(
-                    &rpc_call_value(
-                        &rpc_url,
+                    &rpc.call_value(
                         "eth_getTransactionCount",
                         serde_json::json!([from.to_string(), "latest"]),
                     )
@@ -797,33 +862,33 @@ async fn handle_transaction(cmd: TxCommands) -> Result<()> {
             };
             let signature = signing_key.sign(&unsigned.signing_payload()).to_bytes();
 
-            let hash: String = rpc_call(
-                &rpc_url,
-                "eth_sendTransaction",
-                serde_json::json!([{
-                    "from": from.to_string(),
-                    "to": to.to_string(),
-                    "value": format!("0x{amount:x}"),
-                    "nonce": format!("0x{nonce:x}"),
-                    "gasPrice": format!("0x{gas_price:x}"),
-                    "gas": format!("0x{TRANSFER_GAS_LIMIT:x}"),
-                    "chainId": format!("0x{chain_id:x}"),
-                    "data": "0x",
-                    "publicKey": format!("0x{}", hex::encode(public_key)),
-                    "signature": format!("0x{}", hex::encode(signature)),
-                }]),
-            )
-            .await?;
+            let hash: String = rpc
+                .call(
+                    "eth_sendTransaction",
+                    serde_json::json!([{
+                        "from": from.to_string(),
+                        "to": to.to_string(),
+                        "value": format!("0x{amount:x}"),
+                        "nonce": format!("0x{nonce:x}"),
+                        "gasPrice": format!("0x{gas_price:x}"),
+                        "gas": format!("0x{TRANSFER_GAS_LIMIT:x}"),
+                        "chainId": format!("0x{chain_id:x}"),
+                        "data": "0x",
+                        "publicKey": format!("0x{}", hex::encode(public_key)),
+                        "signature": format!("0x{}", hex::encode(signature)),
+                    }]),
+                )
+                .await?;
             println!("{hash}");
         }
 
-        TxCommands::Status { tx_hash, rpc_url } => {
+        TxCommands::Status { tx_hash, rpc_url, rpc_auth_token_file } => {
+            let rpc = RpcClient::new(rpc_url, rpc_auth_token_file.as_deref())?;
             if !is_tx_hash(&tx_hash) {
                 bail!("transaction hash must be 0x followed by 64 hex characters");
             }
             let receipt =
-                rpc_call_value(&rpc_url, "eth_getTransactionReceipt", serde_json::json!([tx_hash]))
-                    .await?;
+                rpc.call_value("eth_getTransactionReceipt", serde_json::json!([tx_hash])).await?;
             if receipt.is_null() {
                 println!("pending or unknown");
             } else {
@@ -836,51 +901,48 @@ async fn handle_transaction(cmd: TxCommands) -> Result<()> {
 
 async fn handle_query(cmd: QueryCommands) -> Result<()> {
     match cmd {
-        QueryCommands::Balance { address, rpc_url } => {
+        QueryCommands::Balance { address, rpc_url, rpc_auth_token_file } => {
+            let rpc = RpcClient::new(rpc_url, rpc_auth_token_file.as_deref())?;
             let address = parse_address(&address)?;
-            let raw = rpc_call_value(
-                &rpc_url,
-                "eth_getBalance",
-                serde_json::json!([address.to_string(), "latest"]),
-            )
-            .await?;
+            let raw = rpc
+                .call_value("eth_getBalance", serde_json::json!([address.to_string(), "latest"]))
+                .await?;
             let balance = amount(&raw).context("node returned an invalid balance")?;
             println!("{address}\t{balance}");
         }
 
-        QueryCommands::Nonce { address, rpc_url } => {
+        QueryCommands::Nonce { address, rpc_url, rpc_auth_token_file } => {
+            let rpc = RpcClient::new(rpc_url, rpc_auth_token_file.as_deref())?;
             let address = parse_address(&address)?;
-            let raw = rpc_call_value(
-                &rpc_url,
-                "eth_getTransactionCount",
-                serde_json::json!([address.to_string(), "latest"]),
-            )
-            .await?;
+            let raw = rpc
+                .call_value(
+                    "eth_getTransactionCount",
+                    serde_json::json!([address.to_string(), "latest"]),
+                )
+                .await?;
             println!("{address}\t{}", quantity(&raw).context("node returned an invalid nonce")?);
         }
 
-        QueryCommands::Block { height, full, rpc_url } => {
+        QueryCommands::Block { height, full, rpc_url, rpc_auth_token_file } => {
+            let rpc = RpcClient::new(rpc_url, rpc_auth_token_file.as_deref())?;
             let tag = match height {
                 Some(height) => format!("0x{height:x}"),
                 None => "latest".to_string(),
             };
             let block =
-                rpc_call_value(&rpc_url, "eth_getBlockByNumber", serde_json::json!([tag, full]))
-                    .await?;
+                rpc.call_value("eth_getBlockByNumber", serde_json::json!([tag, full])).await?;
             if block.is_null() {
                 bail!("no such block");
             }
             println!("{}", serde_json::to_string_pretty(&block)?);
         }
 
-        QueryCommands::Chain { rpc_url } => {
-            let chain_id =
-                quantity(&rpc_call_value(&rpc_url, "eth_chainId", serde_json::json!([])).await?)
-                    .context("node returned an invalid chain ID")?;
-            let height = quantity(
-                &rpc_call_value(&rpc_url, "eth_blockNumber", serde_json::json!([])).await?,
-            )
-            .context("node returned an invalid height")?;
+        QueryCommands::Chain { rpc_url, rpc_auth_token_file } => {
+            let rpc = RpcClient::new(rpc_url, rpc_auth_token_file.as_deref())?;
+            let chain_id = quantity(&rpc.call_value("eth_chainId", serde_json::json!([])).await?)
+                .context("node returned an invalid chain ID")?;
+            let height = quantity(&rpc.call_value("eth_blockNumber", serde_json::json!([])).await?)
+                .context("node returned an invalid height")?;
             println!("chain_id\t{chain_id}");
             println!("height\t{height}");
         }
@@ -983,58 +1045,97 @@ fn amount(value: &serde_json::Value) -> Option<Amount> {
     }
 }
 
-async fn rpc_call<T: DeserializeOwned>(
-    rpc_url: &str,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<T> {
-    let value = rpc_call_value(rpc_url, method, params).await?;
-    serde_json::from_value(value)
-        .with_context(|| format!("RPC {method} returned an unexpected result shape"))
+/// A JSON-RPC client for one node, with an optional bearer token.
+struct RpcClient {
+    url: String,
+    token: Option<subhost_rpc::SecretToken>,
 }
 
-async fn rpc_call_value(
-    rpc_url: &str,
-    method: &str,
-    params: serde_json::Value,
-) -> Result<serde_json::Value> {
-    let mut response = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        // The CLI talks to one configured node; never chase a redirect.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?
-        .post(rpc_url)
-        .json(&serde_json::json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params,
-            "id": 1,
-        }))
-        .send()
-        .await
-        .with_context(|| format!("cannot reach the node at {rpc_url}"))?
-        .error_for_status()?;
-
-    // Bound the body so a broken node cannot exhaust memory.
-    if response.content_length().is_some_and(|length| length > MAX_RPC_RESPONSE_BYTES as u64) {
-        bail!("RPC {method} response exceeds {MAX_RPC_RESPONSE_BYTES} bytes");
+impl RpcClient {
+    fn new(url: String, token_file: Option<&Path>) -> Result<Self> {
+        let token = token_file
+            .map(subhost_rpc::SecretToken::from_file)
+            .transpose()
+            .with_context(|| "cannot load the RPC auth token")?;
+        Ok(Self { url, token })
     }
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        if body.len().saturating_add(chunk.len()) > MAX_RPC_RESPONSE_BYTES {
+
+    async fn call<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<T> {
+        let value = self.call_value(method, params).await?;
+        serde_json::from_value(value)
+            .with_context(|| format!("RPC {method} returned an unexpected result shape"))
+    }
+
+    async fn call_value(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let mut request = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            // The CLI talks to one configured node; never chase a redirect.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?
+            .post(&self.url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": 1,
+            }));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token.expose());
+        }
+
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("cannot reach the node at {}", self.url))?;
+
+        // Say what the operator has to fix instead of a bare status code.
+        match response.status() {
+            reqwest::StatusCode::UNAUTHORIZED => bail!(
+                "the node at {} requires authentication; pass --rpc-auth-token-file",
+                self.url
+            ),
+            reqwest::StatusCode::TOO_MANY_REQUESTS => bail!(
+                "the node at {} rate-limited this client; retry after {}s",
+                self.url,
+                response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("1")
+            ),
+            _ => {}
+        }
+        let mut response = response.error_for_status()?;
+
+        // Bound the body so a broken node cannot exhaust memory.
+        if response.content_length().is_some_and(|length| length > MAX_RPC_RESPONSE_BYTES as u64) {
             bail!("RPC {method} response exceeds {MAX_RPC_RESPONSE_BYTES} bytes");
         }
-        body.extend_from_slice(&chunk);
-    }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len().saturating_add(chunk.len()) > MAX_RPC_RESPONSE_BYTES {
+                bail!("RPC {method} response exceeds {MAX_RPC_RESPONSE_BYTES} bytes");
+            }
+            body.extend_from_slice(&chunk);
+        }
 
-    let body: serde_json::Value = serde_json::from_slice(&body)
-        .with_context(|| format!("RPC {method} returned invalid JSON"))?;
-    if let Some(error) = body.get("error") {
-        let message =
-            error.get("message").and_then(serde_json::Value::as_str).unwrap_or("unknown error");
-        bail!("RPC {method} failed: {message}");
+        let body: serde_json::Value = serde_json::from_slice(&body)
+            .with_context(|| format!("RPC {method} returned invalid JSON"))?;
+        if let Some(error) = body.get("error") {
+            let message =
+                error.get("message").and_then(serde_json::Value::as_str).unwrap_or("unknown error");
+            bail!("RPC {method} failed: {message}");
+        }
+        body.get("result").cloned().with_context(|| format!("RPC {method} response has no result"))
     }
-    body.get("result").cloned().with_context(|| format!("RPC {method} response has no result"))
 }
 
 #[cfg(test)]
@@ -1412,5 +1513,62 @@ mod tests {
             false,
         )
         .is_err());
+    }
+
+    async fn serve_once(
+        status: &'static str,
+        body: String,
+    ) -> (SocketAddr, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = vec![0u8; 8192];
+            let read = socket.read(&mut buffer).await.unwrap();
+            let request = String::from_utf8_lossy(&buffer[..read]).into_owned();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            request
+        });
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn the_rpc_client_sends_the_bearer_token() {
+        let (addr, server) =
+            serve_once("200 OK", r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#.to_string()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("rpc-token");
+        std::fs::write(&token_path, "0123456789abcdef\n").unwrap();
+
+        let client = RpcClient::new(format!("http://{addr}"), Some(&token_path)).unwrap();
+        let value: String = client.call("eth_chainId", serde_json::json!([])).await.unwrap();
+        assert_eq!(value, "0x1");
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer 0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn a_401_names_the_token_flag_instead_of_a_bare_status() {
+        let (addr, server) = serve_once(
+            "401 Unauthorized",
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"unauthorized"}}"#
+                .to_string(),
+        )
+        .await;
+
+        let client = RpcClient::new(format!("http://{addr}"), None).unwrap();
+        let error = client.call_value("eth_chainId", serde_json::json!([])).await.unwrap_err();
+        assert!(error.to_string().contains("--rpc-auth-token-file"));
+
+        server.await.unwrap();
     }
 }
