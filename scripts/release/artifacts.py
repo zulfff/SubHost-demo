@@ -30,6 +30,15 @@ CRATE_NAMES = {name: ("subhost-cli" if name == "subhost" else name) for name in 
 TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(alpha|beta|rc)\.(0|[1-9][0-9]*))?\Z")
 
 
+def allow_publication(tag, stable_approved):
+    match = TAG.fullmatch(tag)
+    if not match:
+        raise ValueError("invalid release tag")
+    prerelease = match[1] == "0" or match[4] is not None
+    if not prerelease and stable_approved != "true":
+        raise ValueError("stable v1 requires the completed S12 review and maintainer approval")
+
+
 def git(root, *args):
     return subprocess.check_output(["git", "-C", str(root), *args], text=True).strip()
 
@@ -158,14 +167,19 @@ def main():
     build.add_argument("--output", type=Path, required=True)
     validate = subcommands.add_parser("verify")
     validate.add_argument("directory", type=Path)
+    publish = subcommands.add_parser("allow-publication")
+    publish.add_argument("--tag", required=True)
+    publish.add_argument("--stable-approved", default="false")
     arguments = parser.parse_args()
     try:
         if arguments.command == "check":
             print(json.dumps(identity(arguments.root, arguments.tag), sort_keys=True))
         elif arguments.command == "package":
             package(arguments.root, arguments.tag, arguments.binaries, arguments.output)
-        else:
+        elif arguments.command == "verify":
             verify(arguments.directory)
+        else:
+            allow_publication(arguments.tag, arguments.stable_approved)
     except (ValueError, OSError, KeyError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"release validation failed: {error}\n")
 

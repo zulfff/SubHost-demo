@@ -64,15 +64,8 @@ jobs:
           RELEASE_TAG: ${{ github.ref_name }}
           STABLE_APPROVED: ${{ vars.SUBHOST_STABLE_RELEASE_APPROVED }}
         run: |
-          python3 - <<'PY'
-          import os, re
-          tag = os.environ['RELEASE_TAG']
-          match = re.fullmatch(r'v(\d+)\.\d+\.\d+(?:-(alpha|beta|rc)\.\d+)?', tag)
-          if not match:
-              raise SystemExit('invalid release tag')
-          if int(match[1]) >= 1 and match[2] is None and os.environ['STABLE_APPROVED'] != 'true':
-              raise SystemExit('stable v1 requires the completed S12 review and maintainer approval')
-          PY
+          python3 scripts/release/artifacts.py allow-publication \
+            --tag "$RELEASE_TAG" --stable-approved "$STABLE_APPROVED"
       - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
         with:
           cosign-release: v3.1.4

@@ -116,6 +116,20 @@ class ArtifactsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "immutable release build policy"):
             artifacts.identity(self.root, "v0.1.0")
 
+    def test_rc_version_is_explicitly_supported_without_stable_readiness(self):
+        (self.root / "Cargo.toml").write_text('[workspace.package]\nversion = "1.0.0-rc.1"\n')
+        self.git("add", "Cargo.toml")
+        self.git("commit", "-qm", "rc fixture")
+        self.assertEqual(artifacts.identity(self.root, "v1.0.0-rc.1")["version"], "1.0.0-rc.1")
+        artifacts.allow_publication("v1.0.0-rc.1", "")
+        artifacts.allow_publication("v0.1.0", "")
+        for approval in ["", "false", "TRUE", "yes"]:
+            with self.assertRaisesRegex(ValueError, "S12"):
+                artifacts.allow_publication("v1.0.0", approval)
+        artifacts.allow_publication("v1.0.0", "true")
+        with self.assertRaisesRegex(ValueError, "invalid release tag"):
+            artifacts.allow_publication("v1.0.0;command", "true")
+
     def test_tampering_and_missing_inventory_are_detected(self):
         release = self.package()
         artifact = release / "RELEASE-METADATA.json"
