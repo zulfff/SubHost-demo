@@ -20,7 +20,9 @@ use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, Genes
 use subhost_crypto::{BLSScheme, PrivateKey};
 use subhost_metrics::{Metrics, MetricsConfig};
 use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessage};
-use subhost_rpc::{BlockAuthority, BlockEvent, RpcSecurityConfig, RpcServer, RpcServerConfig, RpcState};
+use subhost_rpc::{
+    BlockAuthority, BlockEvent, RpcSecurityConfig, RpcServer, RpcServerConfig, RpcState,
+};
 use subhost_storage::LedgerStore;
 use tracing::{debug, info, warn};
 
