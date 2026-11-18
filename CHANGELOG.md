@@ -445,6 +445,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Changed
 
+- The CLI constructs nodes through `NodeConfig::new` and overrides the selected
+  options, retaining node-owned defaults when additive policy/timeout settings
+  are introduced. Current command behavior is unchanged (Q-014 consumer contract).
+
 - **The on-disk ledger is now segmented (format v3).** A version 2
   `node-state.bin` is still read and validated, and the first `persist` migrates it
   to segments and renames it to `node-state.bin.v2-backup`; it is never loaded again

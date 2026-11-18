@@ -3,7 +3,7 @@
 use crate::block::BlockAuthority;
 use jsonrpsee::types::error::ErrorObject;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use subhost_consensus::ValidatorRegistry;
 use subhost_core::{Address, Amount, Block, ChainId, Hash, Nonce, Receipt, TransactionType};
@@ -98,6 +98,13 @@ pub enum BlockEvent {
 #[derive(Clone)]
 pub struct RpcState {
     pub(crate) chain_id: ChainId,
+    /// Genesis namespace used by every signed consensus object.
+    pub(crate) consensus_context: Hash,
+    /// Latest verified final-QC view, not inferred from restored block height.
+    pub(crate) committed_view: Arc<AtomicU64>,
+    pub(crate) verified_view: Arc<AtomicBool>,
+    /// Optional canonical proposal bound configured before serving.
+    pub(crate) proposal_bytes_limit: Option<usize>,
     /// Height of the newest committed block, backing `eth_blockNumber`.
     pub(crate) block_height: Arc<AtomicU64>,
     /// Pending transaction pool.
@@ -151,6 +158,10 @@ impl RpcState {
             restored.receipts.into_iter().map(|receipt| (receipt.tx_hash, receipt)).collect();
         Ok(Self {
             chain_id: store.chain_id(),
+            consensus_context: Hash::ZERO,
+            committed_view: Arc::new(AtomicU64::new(0)),
+            verified_view: Arc::new(AtomicBool::new(height == 0)),
+            proposal_bytes_limit: None,
             block_height: Arc::new(AtomicU64::new(height)),
             mempool: Arc::new(RwLock::new(Mempool::default())),
             state: Arc::new(RwLock::new(restored.state)),
@@ -187,6 +198,29 @@ impl RpcState {
         self.authority = Some(Arc::new(authority));
         self
     }
+
+    /// Bind signature verification to a deterministic genesis commitment.
+    pub fn with_consensus_context(mut self, context: Hash) -> Self {
+        self.consensus_context = context;
+        self
+    }
+
+    /// Bound canonical proposal construction/admission before serving.
+    pub fn with_proposal_bytes_limit(mut self, max_bytes: usize) -> Self {
+        self.proposal_bytes_limit = Some(max_bytes);
+        self
+    }
+
+    pub fn consensus_context(&self) -> Hash { self.consensus_context }
+
+    /// Latest verified final-QC view. None means restored certificate evidence
+    /// is still missing; block height is never treated as a verified view.
+    pub fn committed_view(&self) -> Option<u64> {
+        self.verified_view.load(Ordering::SeqCst)
+            .then(|| self.committed_view.load(Ordering::SeqCst))
+    }
+
+    pub fn proposal_bytes_limit(&self) -> Option<usize> { self.proposal_bytes_limit }
 
     pub fn chain_id(&self) -> ChainId {
         self.chain_id
