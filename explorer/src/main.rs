@@ -861,7 +861,7 @@ mod tests {
     async fn rpc_calls_carry_the_bearer_token() {
         use axum::http::{header, HeaderMap};
 
-        let seen: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let recorder = seen.clone();
         let app = Router::new().route(
             "/",
