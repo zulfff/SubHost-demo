@@ -1,88 +1,98 @@
-# Validator consensus wiring
+# Validator consensus
 
-When genesis contains validators, `Node::bootstrap` owns a linear consensus driver
-at the restored ledger height/hash. A node with a producer key can propose and vote;
-an observer verifies proposals, votes and certificates without signing.
+Node owns a per-height prepare/commit driver for validator genesis. Validators
+sign with distinct BLS keys; observers verify without signing. The sorted
+validator at `(view - 1) % n` leads. Views start at one, rotate on authenticated
+timeout evidence, and advance independently from block height.
 
-## Transaction and block flow
+## Admission and final commitment
 
-1. JSON-RPC checks transaction authentication. Admission dry-runs deterministic
-   selection, then leaves an executable transaction in the pool and returns its
-   hash. Height, account state and receipts stay unchanged. Clients poll for a
-   receipt; a returned hash does not establish finality.
-2. The producer's block ticker calls `build_block()` to assemble and sign a block
-   against a state clone. Proposal construction neither writes the ledger nor
-   removes pending transactions.
-3. Gossip carries `BlockProposal { view, data }` and `Vote { view, validator,
-   block_hash, signature }`. A proposal must extend the current tip, authenticate
-   its producer, and reproduce all transaction/state/receipt commitments before
-   any vote is released. The candidate round is durably journalled before
-   publishing its votes. A vote without a matching open proposal is discarded.
-4. Distinct registered BLS keys sign the QC-domain payload. Quorum is `n - f`,
-   where `f = (n - 1) / 3`; for four validators it is three. `2f + 1` is equivalent
-   only when `n = 3f + 1`. An exact proposal retransmission reuses the existing
-   vote, and a conflicting open proposal cannot replace it.
-5. `commit_qc(block, qc)` independently checks every QC signer/signature, block
-   hash and linear view (equal to height), then revalidates execution and persists
-   the block. Only after success are account state, receipts, pool and height
-   published and the candidate driver adopted.
-6. Failed persistence leaves the live driver tip and visible state unchanged.
-   The ready tally is journalled and the next ticker retries the same block.
-   A certified commit intent is saved before ledger append, and bootstrap
-   reconciles an interrupted append without applying the block twice.
-   `BlockCommit { view, data, signatures }` carries a verified next-block QC to
-   peers that missed the final vote. Proposal/vote/latest-commit dissemination is
-   retried as peers join the mesh; duplicates cannot add quorum weight.
+1. RPC authenticates a transaction and dry-runs bounded deterministic selection.
+   Accepted transactions remain pending. A returned hash precedes its receipt
+   and changes neither account state nor committed height.
+2. The leader builds and producer-signs a block against cloned state. It signs a
+   genesis-bound proposal envelope including view and any timeout proof. Replicas
+   check parent, height, producer, signatures, gas, execution and all commitments
+   before voting.
+3. `n - f` distinct Prepare votes lock the block, where `f = (n - 1) / 3`.
+   A prepared replica sends a separate Commit vote. Only `n - f` Commit votes
+   form a final QC. Four validators require three votes in each phase. Genesis
+   power does not multiply quorum weight. Signatures bind genesis context,
+   phase/domain, view and block hash as applicable.
+4. The node journals signing obligations before publication and final commit
+   intent before ledger append. `commit_qc` independently authenticates the
+   final QC, newer committed view, block and execution. State, receipts, pool
+   cleanup and driver tip become visible after durable success. Restart
+   reconciles interrupted append without duplicate execution.
+5. Typed proposal/vote/prepare/report/timeout messages and the latest certified
+   commit are periodically disseminated as peers recover. Duplicate identities
+   cannot add quorum weight. A bounded positive signature cache avoids repeated
+   pairings for exactly authenticated bytes; semantic checks still run and cache
+   trust is never deserialized.
 
-A genesis with no validators retains the synchronous demo/benchmark path:
-submission seals immediately and legacy gossip uses view zero. `include_transaction`
-and uncertified `accept_block` refuse the validator path.
+Unsigned demo genesis requires explicit `--single-writer`, seals synchronously
+and uses view-zero block gossip. Validator mode rejects uncertified commits and
+old unphased proposal/vote messages.
 
-## Current limits
+## Timeouts and locks
 
-This is a prototype linear quorum driver, not the full three-phase HotStuff
-protocol or production BFT. There is no timeout, view change or leader rotation.
-Concurrent proposals can stall, and two silent validators in a set of four prevent
-commit indefinitely. No new empty blocks are created to advance time.
+The timeout defaults to 2000 ms. A timeout advances local view and signs a report
+with the complete highest prepared block/certificate. A rotated leader requires
+`n - f` exact-target reports and selects the highest prepared block. Time alone
+cannot authorize a replacement or erase a lock. The f+1-th highest authenticated
+target lets lagging replicas join. A lone timeout-only replica pauses until
+another honest replica supports progress. Backoff is capped at
+`max(base timeout, 30 seconds)`.
 
-Open proposals, verified votes and the latest QC are saved in the node-local
-`consensus-state.bin`, bound to the chain, genesis and signing identity. Restart
-restores the same vote, and a concurrent process in that directory is refused.
-An existing validator ledger with a missing journal is refused. Older builds
-without a journal need a new local testnet directory; there is no automatic
-migration that can prove an earlier vote was never sent. The ledger still does
-not authenticate historical QCs on replay; that belongs to S3.4.
+The first accepted proposal, Prepare certificate and timeout certificate each
+start a full interval for the next phase. Identical retransmissions and extra
+signatures on an existing proof cannot keep extending that deadline.
 
-Keep the latest voting state with the ledger, genesis and producer key. Restoring
-an older whole-directory backup can forget votes sent after that backup; never
-roll back the signing journal. A ledger behind the newer journal is refused until
-a reviewed recovery procedure can restore the missing history. This journal
-does not establish complete crash/partition safety or production finality.
+Two live validators out of four cannot commit; height, receipts, balances and
+manifest stay unchanged while views advance. No empty blocks advance time.
+See [ADR-008](agents/decisions/ADR-008-phased-consensus-standard-bls.md).
 
-There is no historical block sync/backfill, fork choice or reorg. Certified gossip
-accepts only the next block. A long-offline node cannot recover a history gap from
-the latest commit alone. There is no transaction gossip: submit to a producer.
-Accepted pool entries are volatile until S6 adds persistence. Failed gossip tasks
-are logged; there is no health/readiness guarantee before S8.
+## Recovery and upgrade
 
-The explicit `--single-writer` CLI policy remains part of the Track B contract for
-S2.3; this slice retains implicit demo mode for genesis without validators. The
-wire layout changed, so all peers in a devnet must upgrade together. The journal
-is a new node-local format; ledger and producer-key formats are unchanged.
-Bootstrap endpoints retry with backoff capped at 30 seconds, and a peer stays
-counted until its last connection closes. See the
-[four-validator local testnet](local-testnet.md) for setup and recovery checks.
+Version-two `consensus-state.bin` has magic `SUBVOTE2`, checksum and complete
+genesis/identity binding. It retains both vote phases, active view, prepared lock,
+reports, timeout proof and latest final QC. An OS lock refuses a second process
+in that data directory. Missing/damaged journals on existing validator ledgers
+are refused. A ledger alone establishes no verified committed view.
+
+Keep the newest journal with its ledger, genesis and producer key. Never restore
+older signing state or run the same identity in another directory. A ledger
+behind newer signing state is refused pending recovery.
+
+The RFC 9380 G2 BLS suite deliberately rejects old proofs/signatures: the legacy
+construction permits public-PoP signature forgery. Use fresh genesis proofs and
+fresh validator directories, preserving old data and keys. There is no legacy
+verifier or automatic journal migration. All validator peers upgrade together.
+
+## Bounds and remaining stages
+
+The 4 MiB transport reserves framing headroom and checks actual JSON envelopes.
+Canonical block budgets (at most 64 KiB, decreasing for larger sets) reserve
+repeated prepared blocks and proof signatures in full timeout envelopes and the
+16 MiB journal. Node sets support 1 through 64 validators. Oversized admission
+or replacement preserves the existing pool and committed state.
+
+Native historical sync is S3: latest-commit gossip repairs only the next block,
+and ledger replay does not yet authenticate every historical QC. Transaction
+gossip and peer abuse controls are S7; submit the same transaction to potential
+leaders until that stage lands. Pending transactions remain volatile until S6.
+The timer assumes eventual delivery within its configured capped bound.
+This PBFT-style prototype still needs independent review and real audit/soak
+gates before production assurance. It is not chained HotStuff.
 
 ## Verification
-
-The node tests cover four validators with four/three/two voting participants,
-unchanged manifest bytes without quorum, a failed write followed by certificate
-retry, open-round restart, damaged journals, ledger rollback against newer voting
-state, shared RPC/exporter metrics, forged/unseen traffic, and two validators over
-real libp2p loopback gossip. A four-validator test covers an initially unreachable
-bootstrap, two-vote shortfall, a late fourth peer and hub restart. RPC tests reject
-missing/insufficient/duplicate/invalid certificates and check that admission/building never exposes state or receipts.
 
 ```sh
 cargo test -p subhost-consensus -p subhost-rpc -p subhost-node -p subhost-network --all-features
 ```
+
+Regressions cover phase/context separation, timeout proof/lock retention,
+checkpoint validation, insufficient quorum, journal/append failures, bounded
+admission/envelopes, real gossip, silent leaders, partition recovery, different
+restored views and service cleanup. The [local-testnet runner](local-testnet.md)
+provides a four-validator smoke check.

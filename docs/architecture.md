@@ -14,7 +14,7 @@ A node is one process assembled in `subhost-node`:
 - `RpcServer` serves the JSON-RPC surface over HTTP and WebSocket, optionally
   behind a bearer-token and per-connection rate-limit HTTP middleware. Both are
   off unless the operator configures them.
-- A linear consensus driver for a genesis validator set, verifying `n - f` votes
+- A prepare/commit driver for a genesis validator set, verifying distinct `n - f` phase votes
   before commit. Observers hold no signing key. A node-local journal preserves
   the open proposal/votes and latest QC before votes are published.
 - The optional metrics exporter, the optional libp2p gossip task, and a five-second
@@ -32,8 +32,9 @@ or incompatible validator voting state. The journal does not authenticate
 historical QCs in the block ledger.
 
 A node started with `--validator` refuses to start without a genesis file that
-contains at least one initial validator. A node without that flag may run with no
-genesis file at all, using the fallback chain ID and an empty allocation set.
+contains at least one initial validator. A node without that flag may observe validator genesis. Explicit
+`--single-writer` permits an unsigned demo with no genesis file, using the fallback
+chain ID and an empty allocation set.
 
 ## 2. Block lifecycle
 
@@ -118,9 +119,11 @@ unchanged. See [consensus wiring](consensus.md).
 
 ### 2.6 Accept a peer block
 
-`RpcState::commit_qc` requires a certificate binding the block hash and linear
-view (equal to height), from `n - f` distinct registered validators. Each BLS
-signature verifies over the QC domain. `accept_block` refuses validator blocks
+`RpcState::commit_qc` requires a final Commit-domain certificate binding genesis
+context, block hash and view, from `n - f` distinct registered validators. View
+advances independently from height and must exceed the verified committed view.
+Prepare certificates lock a block but cannot append it. Leader envelopes and
+timeout reports are separately authenticated. `accept_block` refuses validator blocks
 without a certificate and remains available for demo chains. Both commit paths
 re-validate end to end before touching anything:
 
@@ -293,7 +296,7 @@ What the ledger does not guarantee:
 | `subhost-mempool` | Admission policy, per-sender ordering, replacement, eviction | Execution, persistence |
 | `subhost-storage` | On-disk format, atomic write, load validation, receipt and block commitments | Deciding which block to write |
 | `subhost-rpc` | Block selection, sealing, acceptance, the JSON-RPC surface, submission signature check | Consensus, peer identity, genesis policy |
-| `subhost-consensus` | Validator registry, linear quorum driver, votes, certificates, DAG, slashing | Ledger writes, execution, transport |
+| `subhost-consensus` | Validator registry, prepare/commit driver, authenticated leader/timeouts, prepared locks, votes/certificates, DAG, slashing | Ledger writes, execution, transport |
 | `subhost-node` | Node assembly, genesis loading, consensus/transport orchestration, demo ordering buffer, shutdown | Ledger format, block validity |
 | `subhost-network` | libp2p transport, framing, message size limits | Message meaning |
 | `subhost-cli` | Operator flags, genesis file authoring, wallet and transaction commands | Ledger logic |

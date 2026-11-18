@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `1043268` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5, S5.1a and S5.3a merged · S2.1–S2.2, S2.3 QC API, S2.4a recovery/P2P and S5.3b implemented on the S2 branch · `Q-001`–`Q-011` agreed
+Status: 2026-11-19 · historical baseline `main` = `1043268` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5, S5.1a and S5.3a merged · S2.1–S2.2, S2.3 QC API, S2.4a recovery/P2P and S5.3b implemented on the S2 branch · `Q-001`–`Q-011` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -13,7 +13,7 @@ editing the same files.
 | --- | --- |
 | Chain | Validator deployments admit to the pool and commit with a QC. Demo chains without validators seal synchronously on submission. |
 | Block auth | A node with a configured authority signs each produced block with the validator's BLS key and verifies that signature on accept; a node without one still produces and accepts unsigned blocks. |
-| Consensus | Node owns a linear `n - f` quorum driver restored at the ledger tip. Observers verify without voting. Durable open rounds/latest QC; no timeout, view change or leader rotation yet. |
+| Consensus | Phased `n - f` Prepare/Commit rounds, signed rotating leaders and prepared locks; independent views and authenticated timeout reports. New integration/CI gates remain in progress. |
 | Networking | libp2p relays proposals, verified votes and QC-certified next blocks; demo block gossip remains. Bootstrap retries; no historical block sync, peer scoring, per-peer limits or tx gossip. |
 | Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
@@ -211,16 +211,14 @@ rejected by every other node; the ledger still replays.
 
 ### S2 — Wire the consensus driver into the node (Track A)
 
-**Status:** S2.1–S2.2, the S2.3 QC commit API and S2.4a durable round recovery/
-P2P reconnect are implemented on `s2/consensus-driver-ownership`. The local-testnet
-runner and real four-validator regressions cover late bootstrap, quorum shortfall,
-late next-block delivery and hub restart. The stage remains incomplete: S2.4b
-timeout/view change, the explicit S2.3 `--single-writer` CLI policy and S2.5 timeout
-assertions are pending. The node journal retains open votes and the latest QC,
-but historical QCs are not authenticated on ledger replay until S3.4 supplies that
-format. Concurrent proposals and oversized gossip blocks can stall. Preserve the
-latest voting state when restoring backups. See `docs/consensus.md` and
-`docs/local-testnet.md`; this is not production BFT.
+**Status:** the earlier QC admission/journal/reconnect slice is merged. Phased
+prepare/final-commit rounds, RFC 9380 BLS, authenticated leader rotation and
+explicit node demo policy are implemented on `s2/timeout-quorums`; fresh S2
+integration/liveness and full workspace/CI gates are still in progress. ADR-008
+records the protocol and incompatible suite/journal upgrade. The complete
+cross-track roadmap is authorized; Platform retains S4/S5/S6/S8/S9 and Track A
+continues native S3/S7, then execution/IBC after S3. Actual independent audit and
+30-day soak are external gates, not implementation checkboxes.
 
 **S2.1 Driver ownership** (`subhost-node/src/lib.rs`)
 - `Node` holds a `ConsensusDriver` built from the genesis set and its identity.
@@ -233,13 +231,24 @@ latest voting state when restoring backups. See `docs/consensus.md` and
 - Do not relay votes for a view you have not seen.
 
 **S2.3 Commit path** (`subhost-rpc/src/block.rs`)
+
+Platform CLI consumer (Q-014): `--single-writer` and optional positive
+`--view-timeout-ms` map to the published node configuration contract. CLI startup
+rejects unsigned mode unless explicitly selected and rejects unsigned selection
+for validator genesis before invoking node bootstrap. Demo scripts and the
+Compose command carry the explicit demo flag. Authoritative node policy,
+phased timeout behavior and the standard-BLS public rollout remain S2.4b work.
+The Compose stack still requires the documented authenticated non-loopback RPC
+configuration; container runtime verification is part of the release/deployment
+stage rather than this CLI consumer change.
+
 - Rename the direct path to `commit_qc(block, qc)`; it verifies the QC before
   persisting. Remove the unauthenticated "submit and commit" path from validator
   mode, keep it behind an explicit `--single-writer` flag for demos/bench.
 
 **S2.4 Timeouts and view change** (`subhost-consensus/src/driver.rs`)
 - `tick(now)` returns `Timeout { view }` after `ConsensusConfig.view_timeout`.
-- `enter_next_view` on timeout, leader = validators[view % n], re-propose the locked
+- `enter_next_view` on timeout, leader = sorted validators[(view - 1) % n], require n-f signed timeout reports and re-propose the highest prepared
   block. Test with a validator that never votes.
 
 **S2.5 Tests**
@@ -251,17 +260,30 @@ latest voting state when restoring backups. See `docs/consensus.md` and
 **Exit criteria:** blocks are only committed with a QC; no single node can advance
 the chain alone once a validator set is configured.
 
-### S3 — Fork choice, reorg, and block sync (Track A)
+### S3 — Certified candidate selection, fork accountability and block sync (Track A)
 
-**S3.1 Fork choice**
-- Keep side branches keyed by block hash; choose the tip with the highest committed
-  view/height, tie-break by QC weight then hash.
-- `accept_block` becomes `accept_block_at(parent, block, qc)`; a block whose parent is
-  not known is buffered, not rejected.
+**Contract correction:** Q-013 is agreed. Final Commit QCs establish the
+append-only canonical boundary. Automatically choosing a different finalized
+branch by view/weight and rolling back three finalized blocks would violate that
+boundary. Native S3 uses certified catch-up and bounded unfinalized child
+selection; conflicting final evidence triggers accountable incident handling.
+ADR-007 lands with implementation. A deeper speculative/demo reorg needs a
+separate storage/execution contract and cannot be advertised as finalized reorg.
 
-**S3.2 Reorg**
-- `RpcState::reorg_to(tip)` replays the winning branch from the common ancestor.
-- Receipts and state are rebuilt from that ancestor; the ledger append is atomic.
+**S3.1 Candidate selection**
+- Buffer bounded authenticated H+1 candidates by block hash and unknown-parent
+  certified successors while requesting their missing certified ancestors.
+- Apply only an execution-valid child with a valid final Commit QC. Prepared
+  replacement remains governed by the highest lock in the authenticated timeout
+  certificate.
+
+**S3.2 Finalized fork accountability**
+- Verify both conflicting final certificates before recording a bounded durable
+  incident and stopping signing/readiness. Fake/invalid evidence cannot halt.
+- Identical blocks with different valid QCs are duplicate evidence, not forks;
+  do not alter active vote/view obligations merely on duplicate certification.
+- Certified history remains append-only; balances, nonces and receipts preserve
+  the final canonical prefix.
 
 **S3.3 Sync protocol** (`subhost-network`, `subhost-node`)
 
@@ -278,22 +300,31 @@ public-PoP forgery rejection tests, and fresh genesis proofs; legacy signatures
 are refused. Its linear QC view/height rule is retained until the separately
 tested phased Protocol revision and coordinated archive upgrade are ready.
 
-- `GetBlocks { from, to }` / `Blocks { items }` messages with a hard item cap.
-- On startup and on a height gap, request the missing range; apply in order.
-- Do not serve blocks below the finalized height minus the retention window.
+- Bounded range request/response with item and byte caps, retries and ascending
+  parent-linked certified items.
+- Request on startup/height gaps; authenticate every final QC and execute each
+  transition before append.
+- Serve only retained committed anchors; report unavailable earlier proof.
 
-**S3.4 Storage support** (`subhost-storage`, contract with Track B)
-- Append with explicit parent hash; `truncate_to(height)` for reorg rollback.
-- Ledger v3 with the block's view/QC commitment.
+**S3.4 Node-owned certified archive**
+- Checksummed versioned archive bound to exact genesis/corrected BLS suite.
+- Archive commit intent before ledger append, serve only entries matching the
+  ledger, reconcile crash suffixes with the newest journal, refuse corruption.
+- Retain the latest 4096 actual certificates. Include archive, ledger, genesis,
+  producer identity and newest signing journal in coherent backups.
+- LedgerStore remains append-only under the agreed contract; speculative rollback
+  requires a separate Platform storage contract.
 
 **S3.5 Tests**
-- Two producers, partition then heal: one branch wins, both converge.
-- Node offline for 100 blocks: backfills to the tip.
-- Reorg across 3 blocks: balances, nonces, receipts, and state root match a fresh
-  replay.
+- Partition then heal: authenticated leader selection and certified history
+  converge without replacing finalized blocks.
+- Node offline for 100 blocks: backfills and matches balances, nonces, receipts
+  and roots from a fresh replay.
+- Reject wrong context/phase/parent/order/execution, retention gaps and corrupt
+  archives; reconcile crash boundaries and verify incident evidence.
 
-**Exit criteria:** "two producers fork permanently" disappears from the docs because
-it is no longer true.
+**Exit criteria:** honest replicas catch up to certified canonical history;
+conflicting final evidence is accountable and never silently reorganized.
 
 ### S4 — Segmented storage, snapshots, migration (Track B)
 

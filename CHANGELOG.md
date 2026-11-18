@@ -14,6 +14,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **Legacy BLS validator proofs and signatures are refused.** RFC 9380 G2 hashing
+  replaces a construction that allowed arbitrary signature forgery from a public
+  PoP. Use fresh genesis proofs and signing/history directories; preserve old data
+  and keys. Public/scalar/signature codecs retain their sizes.
+- **Validator consensus has separate Prepare and final Commit phases.** Signed
+  leader envelopes, phase-separated genesis-bound votes, authenticated timeout
+  reports and independent views replace the linear view/height contract. All
+  validator peers upgrade together. Signing journals now use `SUBVOTE2` and
+  reject legacy data. Unsigned node demos require explicit `--single-writer`.
+
 - **Validator submissions return before commitment.** With a genesis validator
   set, a transaction hash precedes its receipt; clients must poll until a QC
   commits the block. Proposal/vote gossip gains view and signer fields, and
@@ -77,6 +87,13 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `node --bootnodes` implied peer connectivity that does not exist.
 
 ### Fixed
+
+- Rejected oversized transaction admission/replacement preserves the existing
+  pool and ledger state. Actual JSON gossip envelopes are checked against the
+  transport budget before publication.
+- Successful consensus signature checks are cached with a bounded complete-byte
+  fingerprint to avoid repeated pairings on proof retransmission. The cache is
+  never serialized and does not bypass semantic or execution validation.
 
 - **Appending to a truncated committed segment could commit an unreadable head.**
   The writer now refuses a segment shorter than the manifest's committed length
@@ -224,6 +241,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   restart tests cover malformed data and interrupted filesystem writes. Node/RPC
   admission and CLI consumers remain S6.1b; the API alone does not make bundled
   node admissions durable. See `docs/operations/mempool-persistence.md`.
+- Authenticated leader rotation with quorum timeout certificates and prepared
+  locks retained through timeout/restart; bounded consensus block, wire and
+  journal budgets; read-only certified-block validation and verified tip-view
+  recovery; controlled node shutdown and cancellation cleanup.
 
 - **Recoverable four-validator local testnet.** A node-local, checksummed voting
   journal saves open proposals, verified votes and the latest QC before votes

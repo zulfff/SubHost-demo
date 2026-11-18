@@ -158,12 +158,31 @@ async fn smoke(client: &reqwest::Client, urls: &[String], chain_id: u64) -> Resu
         };
         tx.signature =
             TransactionSignature::from_ed25519(&key.sign(&tx.signing_payload()).to_bytes());
-        let hash = rpc(client, &urls[0], "eth_sendTransaction", json!([{
+        let params = json!([{
             "from":sender.to_string(), "to":tx.to.unwrap().to_string(), "value":format!("0x{value:x}"),
             "nonce":format!("0x{nonce:x}"), "gas":"0x5208", "gasPrice":"0x1", "chainId":format!("0x{chain_id:x}"),
             "publicKey":format!("0x{}", hex::encode(public_key)),
             "signature":format!("0x{}", hex::encode(tx.signature.to_ed25519())),
-        }])).await?;
+        }]);
+        // Until transaction gossip lands, every rotating leader needs ingress.
+        // Submit identical authenticated bytes concurrently to the local peers.
+        let mut submissions = tokio::task::JoinSet::new();
+        for url in urls {
+            let client = client.clone();
+            let url = url.clone();
+            let params = params.clone();
+            submissions
+                .spawn(async move { rpc(&client, &url, "eth_sendTransaction", params).await });
+        }
+        let mut hash = None;
+        while let Some(result) = submissions.join_next().await {
+            let next = result??;
+            if hash.as_ref().is_some_and(|previous| previous != &next) {
+                return Err("validators returned different transaction hashes".into());
+            }
+            hash = Some(next);
+        }
+        let hash = hash.ok_or("no validators configured")?;
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 let mut complete = true;

@@ -183,6 +183,9 @@ impl RpcState {
     /// unsigned blocks, which is documented as a limitation rather than a
     /// guarantee.
     pub fn with_validators(mut self, validators: ValidatorRegistry) -> Self {
+        if self.block_height() > 0 {
+            self.verified_view.store(false, Ordering::SeqCst);
+        }
         self.validators = Some(Arc::new(validators));
         self
     }
@@ -194,6 +197,9 @@ impl RpcState {
     /// verification, because producing without checking peer blocks is not a
     /// coherent stance.
     pub fn with_authority(mut self, authority: BlockAuthority) -> Self {
+        if self.block_height() > 0 {
+            self.verified_view.store(false, Ordering::SeqCst);
+        }
         self.validators = Some(Arc::new(authority.validators().clone()));
         self.authority = Some(Arc::new(authority));
         self
@@ -201,6 +207,9 @@ impl RpcState {
 
     /// Bind signature verification to a deterministic genesis commitment.
     pub fn with_consensus_context(mut self, context: Hash) -> Self {
+        if self.consensus_context != context && self.block_height() > 0 {
+            self.verified_view.store(false, Ordering::SeqCst);
+        }
         self.consensus_context = context;
         self
     }

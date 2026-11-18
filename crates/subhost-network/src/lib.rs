@@ -29,7 +29,9 @@ use tracing::{debug, info, warn};
 /// Gossip topic carrying application messages.
 pub const TOPIC: &str = "subhost-txs";
 /// Largest gossip payload accepted, matching the RPC request bound.
-pub const MAX_TRANSMIT_BYTES: usize = 256 * 1024;
+pub const MAX_TRANSMIT_BYTES: usize = 4 * 1024 * 1024;
+/// Application envelope limit, leaving room for signed gossipsub framing.
+pub const MAX_WIRE_BYTES: usize = MAX_TRANSMIT_BYTES - 1024;
 /// Capacity of the inbound and outbound channels.
 const CHANNEL_CAPACITY: usize = 1_000;
 
@@ -136,6 +138,16 @@ pub enum NetworkMessage {
     Vote { view: u64, validator: [u8; 20], block_hash: [u8; 32], signature: Vec<u8> },
     /// A committed block and its independently verifiable quorum certificate.
     BlockCommit { view: u64, data: Vec<u8>, signatures: Vec<([u8; 20], Vec<u8>)> },
+    /// Canonical authenticated leader proposal, including timeout evidence.
+    ConsensusProposal { data: Vec<u8> },
+    /// Canonical phase-bound prepare or final-commit vote.
+    ConsensusVote { data: Vec<u8> },
+    /// Canonical prepare certificate and its authenticated block.
+    PreparedBlock { data: Vec<u8> },
+    /// Canonical signed target-view report with prepared-lock evidence.
+    ViewChange { data: Vec<u8> },
+    /// A complete authenticated target-view certificate for lagging peers.
+    TimeoutCertificate { data: Vec<u8> },
 }
 
 impl NetworkMessage {
@@ -149,7 +161,13 @@ impl NetworkMessage {
                 data.len()
             }
             Self::TransactionFluff { data, .. } => data.len(),
-            Self::DagVertex { data } | Self::BlockProposal { data, .. } => data.len(),
+            Self::DagVertex { data }
+            | Self::BlockProposal { data, .. }
+            | Self::ConsensusProposal { data }
+            | Self::ConsensusVote { data }
+            | Self::PreparedBlock { data }
+            | Self::ViewChange { data }
+            | Self::TimeoutCertificate { data } => data.len(),
             Self::BlockCommit { data, signatures, .. } => {
                 if data.is_empty() || signatures.is_empty() {
                     return Err(NetworkError::InvalidMessage("empty block or certificate".into()));
@@ -170,10 +188,18 @@ impl NetworkMessage {
         if payload_len == 0 {
             return Err(NetworkError::InvalidMessage("empty payload".into()));
         }
-        if payload_len > MAX_TRANSMIT_BYTES {
+        if payload_len > MAX_WIRE_BYTES {
             return Err(NetworkError::InvalidMessage(format!(
                 "payload of {payload_len} bytes exceeds the {MAX_TRANSMIT_BYTES} byte limit"
             )));
+        }
+        let wire_len = serde_json::to_vec(self)
+            .map_err(|error| NetworkError::InvalidMessage(error.to_string()))?
+            .len();
+        if wire_len > MAX_WIRE_BYTES {
+            return Err(NetworkError::InvalidMessage(
+                "serialized envelope exceeds wire budget".into(),
+            ));
         }
         Ok(())
     }
@@ -423,6 +449,10 @@ impl NetworkManager {
     /// Previously inbound messages were dropped, so the transport could publish
     /// but never deliver.
     fn handle_gossip(&mut self, data: &[u8]) {
+        if data.len() > MAX_WIRE_BYTES {
+            debug!(bytes = data.len(), "discarding an oversized gossip envelope");
+            return;
+        }
         let message: NetworkMessage = match serde_json::from_slice(data) {
             Ok(message) => message,
             Err(error) => {

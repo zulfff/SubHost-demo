@@ -1,5 +1,9 @@
 //! Node-local voting recovery, separate from the committed block ledger.
 
+#[cfg(test)]
+#[path = "proposal_budget_tests.rs"]
+mod proposal_budget_tests;
+
 use crate::NodeError;
 use bincode::Options;
 use serde::{Deserialize, Serialize};
@@ -15,8 +19,8 @@ use subhost_crypto::PrivateKey;
 use subhost_rpc::RpcState;
 
 pub(crate) const JOURNAL_FILE: &str = "consensus-state.bin";
-const MAGIC: &[u8; 8] = b"SUBVOTE1";
-const MAX_BYTES: u64 = 2 * 1024 * 1024;
+const MAGIC: &[u8; 8] = b"SUBVOTE2";
+const MAX_BYTES: u64 = crate::MAX_CONSENSUS_CHECKPOINT_BYTES as u64;
 
 #[derive(Serialize, Deserialize)]
 struct JournalData {
@@ -68,7 +72,7 @@ impl ConsensusJournal {
         };
         let driver = match journal.read()? {
             None => {
-                if !fresh && identity.is_some() {
+                if !fresh && (identity.is_some() || state.block_height() > 0) {
                     return Err(journal_error(
                         &journal.path,
                         "missing journal for an existing validator ledger",
@@ -83,7 +87,7 @@ impl ConsensusJournal {
                 )?
             }
             Some(data) => {
-                if data.version != 1
+                if data.version != 2
                     || data.chain_id != journal.chain_id
                     || data.genesis != genesis
                     || data.identity != journal.identity
@@ -106,33 +110,29 @@ impl ConsensusJournal {
                         "journal tip does not match the ledger",
                     ));
                 }
-                // An idle old checkpoint has no outstanding voting obligation.
-                // This also supports trusted Rust callers that committed directly.
-                if data.checkpoint.height < height
-                    && data.checkpoint.proposal.is_none()
-                    && data.prepared_commit.is_none()
                 {
-                    if data.checkpoint.height > 0
-                        && state.block_at_height(data.checkpoint.height).map(|block| block.hash())
-                            != Some(data.checkpoint.tip)
-                    {
-                        return Err(journal_error(
-                            &journal.path,
-                            "saved anchor is not in retained ledger history",
-                        ));
-                    }
-                    ConsensusDriver::from_checkpoint(
-                        config.clone(),
-                        registry.clone(),
-                        identity.clone(),
-                        data.checkpoint,
-                    )?;
-                    ConsensusDriver::with_tip(config, registry, identity, height, state.tip_hash())?
-                } else {
                     let saved_height = data.checkpoint.height;
                     if saved_height == height {
+                        if let Some(qc) = &data.checkpoint.high_qc {
+                            state.restore_committed_qc(qc)?;
+                        }
                         if let Some(proposal) = &data.checkpoint.proposal {
                             state.validate_proposal(&proposal.block)?;
+                        }
+                        if let Some(prepared) = &data.checkpoint.prepared {
+                            state.validate_proposal(&prepared.block)?;
+                        }
+                        for report in &data.checkpoint.view_changes {
+                            if let Some(prepared) = &report.prepared {
+                                state.validate_proposal(&prepared.block)?;
+                            }
+                        }
+                        if let Some(certificate) = &data.checkpoint.timeout_certificate {
+                            for report in &certificate.messages {
+                                if let Some(prepared) = &report.prepared {
+                                    state.validate_proposal(&prepared.block)?;
+                                }
+                            }
                         }
                     }
                     let mut restored = ConsensusDriver::from_checkpoint(
@@ -159,6 +159,15 @@ impl ConsensusJournal {
                         return Err(journal_error(
                             &journal.path,
                             "unreconciled voting state behind the ledger",
+                        ));
+                    }
+                    if let Some(qc) = restored.committed_qc() {
+                        state.restore_committed_qc(qc)?;
+                    }
+                    if height > 0 && state.committed_view().is_none() {
+                        return Err(journal_error(
+                            &journal.path,
+                            "restored tip certificate is missing",
                         ));
                     }
                     restored
@@ -215,7 +224,7 @@ impl ConsensusJournal {
         prepared_commit: Option<(Block, QuorumCertificate)>,
     ) -> Result<(), NodeError> {
         let payload = encode_canonical(&JournalData {
-            version: 1,
+            version: 2,
             chain_id: self.chain_id,
             genesis: self.genesis,
             identity: self.identity,
