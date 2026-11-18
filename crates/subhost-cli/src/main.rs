@@ -15,7 +15,7 @@ use subhost_core::{
     ValidatorInfo,
 };
 use subhost_node::{Node, NodeConfig, P2pConfig, GENESIS_FILE_NAME};
-use subhost_storage::{LedgerStore, MigrationOutcome};
+use subhost_storage::{LedgerStore, MigrationOutcome, PruneOutcome};
 use subhost_telemetry::{TelemetryConfig, Verbosity};
 use subhost_wallet::Wallet;
 
@@ -138,6 +138,23 @@ enum DbCommands {
 
         #[arg(long, default_value_t = 1)]
         chain_id: ChainId,
+    },
+
+    /// Drop the oldest ledger segments, keeping the newest `--keep-segments`.
+    ///
+    /// The newest snapshot stays the replay anchor, so the command refuses when
+    /// the retained history would no longer contain the block at its height.
+    /// Pruned blocks and receipts are gone: this node stops serving those heights.
+    Prune {
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        #[arg(long, default_value_t = 1)]
+        chain_id: ChainId,
+
+        /// Number of newest segment files to keep.
+        #[arg(long)]
+        keep_segments: usize,
     },
 }
 
@@ -731,6 +748,33 @@ fn handle_db(cmd: DbCommands) -> Result<()> {
                         "migrated {} to segments at height {height}; backup: {}",
                         data_dir.display(),
                         subhost_storage::LEDGER_BACKUP_FILE_NAME
+                    );
+                }
+            }
+        }
+        DbCommands::Prune { data_dir, chain_id, keep_segments } => {
+            let data_dir = match data_dir {
+                Some(dir) => dir,
+                None => default_data_dir()?,
+            };
+            let store = LedgerStore::open(chain_id, &data_dir)
+                .with_context(|| format!("cannot open the ledger in {}", data_dir.display()))?;
+            let outcome = store
+                .prune(keep_segments)
+                .with_context(|| format!("cannot prune the ledger in {}", data_dir.display()))?;
+            match outcome {
+                PruneOutcome::NothingToPrune { segments } => {
+                    println!(
+                        "{} keeps {segments} segment(s); nothing to prune",
+                        data_dir.display()
+                    );
+                }
+                PruneOutcome::Pruned { dropped_segments, retained_segments, base_height } => {
+                    println!(
+                        "pruned {}: dropped {dropped_segments} segment(s), kept {retained_segments}, \
+                         history now starts at block {}",
+                        data_dir.display(),
+                        base_height + 1
                     );
                 }
             }

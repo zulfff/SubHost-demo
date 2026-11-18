@@ -103,8 +103,11 @@ pub struct RpcState {
     pub(crate) mempool: Arc<RwLock<Mempool>>,
     /// Account world state backing `eth_getBalance`.
     pub(crate) state: Arc<RwLock<State>>,
-    /// Blocks produced by this node, index `n` holding height `n + 1`.
+    /// Blocks produced by this node, index `n` holding height `base_height + n + 1`.
     pub(crate) blocks: Arc<RwLock<Vec<Block>>>,
+    /// Height of the last block that pruning removed, captured when the state is
+    /// built. `0` when history still starts at genesis.
+    pub(crate) base_height: u64,
     /// Confirmed receipts keyed by transaction hash.
     pub(crate) receipts: Arc<RwLock<HashMap<Hash, Receipt>>>,
     pub(crate) store: LedgerStore,
@@ -146,6 +149,7 @@ impl RpcState {
             mempool: Arc::new(RwLock::new(Mempool::default())),
             state: Arc::new(RwLock::new(restored.state)),
             blocks: Arc::new(RwLock::new(restored.blocks)),
+            base_height: restored.base_height,
             receipts: Arc::new(RwLock::new(receipts)),
             store,
             commit_lock: Arc::new(Mutex::new(())),
@@ -209,10 +213,24 @@ impl RpcState {
     }
 
     pub fn block_at_height(&self, height: u64) -> Option<Block> {
-        let index = usize::try_from(height.checked_sub(1)?).ok()?;
+        // A pruned height has no block to serve; the mapping stays a single
+        // offset because the retained history is contiguous.
+        let index = height.checked_sub(self.base_height)?.checked_sub(1)?;
+        let index = usize::try_from(index).ok()?;
         read(&self.blocks).get(index).cloned()
     }
 
+    /// Height of the newest block this node can serve.
+    pub fn head_height(&self) -> u64 {
+        self.base_height.saturating_add(self.block_count() as u64)
+    }
+
+    /// Height of the last block pruning removed; `0` without pruning.
+    pub fn base_height(&self) -> u64 {
+        self.base_height
+    }
+
+    /// Number of retained blocks, which is not the head height after a prune.
     pub fn block_count(&self) -> usize {
         read(&self.blocks).len()
     }
