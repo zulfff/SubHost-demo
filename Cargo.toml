@@ -76,7 +76,7 @@ x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 ed25519-dalek = "3.0"
 zeroize = { version = "1.7", features = ["zeroize_derive"] }
 scrypt = "0.11"
-aes-gcm = "0.10"
+aes-gcm = "0.11"
 
 # Networking / services
 # tokio transport, not async-std: the whole application is tokio-based, and
