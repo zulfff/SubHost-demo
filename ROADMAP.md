@@ -500,6 +500,22 @@ ledger repair, reorg investigation, incident checklist.
 
 ### S9 — Release engineering (Track B)
 
+| Task | Status |
+| --- | --- |
+| S9.1 | RC/RPC-semver and tag consistency policy implemented; workspace remains 0.1.0 until reviewed version activation |
+| S9.2–S9.5 | Implemented on `s9/release-engineering`; local checks/CI review in progress |
+| S9.6 | Separate encrypted-keystore work under Q-018/ADR-011 |
+
+The pipeline prepares Linux x86_64 binaries, SBOMs, checksum/Sigstore artifacts
+and scanned signed OCI images after all seven CI gates. Candidate image scans
+precede registry publication. Test profile optimization retains assertions and
+overflow checks. No release tag or deployment is performed by this stage.
+Limits: independent full binary rebuild equality remains unverified; runtime OS
+updates may change rebuilt image content; configure a protected `release`
+environment before publication. External audit and 30-day soak remain S12 gates,
+and stable v1 publication is refused without their maintainer approval.
+See `docs/release.md` and `docs/operations/upgrade.md` (ADR-014).
+
 **S9.1 Versioning** — move to `1.0.0-rc.N`; document semver for the JSON-RPC surface.
 **S9.2 Release workflow** — tag → build → test → sign (cosign/sigstore) → SBOM
 (`cargo cyclonedx`) → publish binaries + container.
