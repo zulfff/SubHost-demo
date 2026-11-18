@@ -30,10 +30,16 @@ In scope: every package under `crates/` and `explorer/`.
 These are deliberate properties of the current code, not undisclosed
 vulnerabilities. Reporting them as findings is not useful; changing them is.
 
-**No authentication on any network surface.** The JSON-RPC server, the metrics
-exporter, and the faucet all serve any caller that can reach them. Bind them to
-loopback or place an authenticating reverse proxy in front. The node logs a
-warning when it binds a non-loopback address.
+**JSON-RPC authentication is opt-in, and there is no TLS anywhere.** By default
+the JSON-RPC server, the metrics exporter, and the faucet serve any caller that can
+reach them, and all of them bind loopback. `--rpc-auth-token-file` adds a bearer
+token to JSON-RPC and `--rpc-rate-limit` adds a per-connection limit, but both are
+off unless configured, and the metrics endpoint has no authentication at all.
+jsonrpsee 0.24 has no server-side TLS, so the supported deployment is a
+TLS-terminating reverse proxy in front of a loopback bind. `--rpc-allow-public`
+without a token is refused by `subhost-rpc::start`. WebSocket tokens are checked at
+the upgrade handshake, not per message, and the rate limit is per connection
+because the peer address is not exposed to the middleware.
 
 **The explorer signs with a local key.** `POST /api/transfer` decrypts a wallet
 using a password taken from the request body. The explorer refuses to bind to a

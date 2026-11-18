@@ -11,8 +11,9 @@ A node is one process assembled in `subhost-node`:
 - `RpcState` holds the chain ID, the mempool, the account state, the block history,
   the receipt index, the ledger store, and a commit lock. Every field is shared
   behind an `Arc`, so cloning the state is cheap and all clones see one ledger.
-- `RpcServer` serves the JSON-RPC surface over HTTP and WebSocket. There is no
-  authentication on that surface.
+- `RpcServer` serves the JSON-RPC surface over HTTP and WebSocket, optionally
+  behind a bearer-token and per-connection rate-limit HTTP middleware. Both are
+  off unless the operator configures them.
 - The optional metrics exporter, the optional libp2p gossip task, and a five-second
   observer that copies block height and pending count into metrics.
 - `subhost-cli` parses operator flags, writes genesis files, and calls
@@ -149,9 +150,11 @@ enforced only on a node that has a configured authority.
 - A node without an authority does not check block signatures, so an unsigned
   block still passes there. The guarantee becomes network-wide only when every
   node has a registry; S1.4 wires genesis into that decision.
-- The JSON-RPC surface has no authentication, so the only thing that limits block
+- The JSON-RPC surface is unauthenticated unless the operator sets
+  `--rpc-auth-token-file`, so by default the only thing that limits block
   production is who can reach the listening address. The node binds loopback by
-  default.
+  default and refuses a non-loopback bind unless `--rpc-allow-public` and a token
+  are both set.
 
 This is the gap S1 closes. `ADR-001` fixes BLS12-381 as the scheme, a dedicated
 producer key file, and a mandatory proof of possession. S1.2 signs
@@ -242,7 +245,12 @@ What the ledger does not guarantee:
   is no backfill (that returns with block sync in S3/S7);
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
-- no authentication for JSON-RPC or metrics clients. Producer authorization on
+- JSON-RPC authentication is opt-in and the metrics endpoint has none: without
+  `--rpc-auth-token-file` any client that can reach the port can submit
+  transactions, and `--rpc-rate-limit` is per connection rather than per IP
+  because jsonrpsee 0.24 does not expose the peer address to middleware. WebSocket
+  tokens are checked only at the upgrade. There is no in-process TLS, so a public
+  deployment needs a TLS-terminating reverse proxy. Producer authorization on
   gossip is enforced only by nodes with a configured validator registry; a node
   without one still accepts unsigned blocks, so the guarantee is not network-wide.
   The gossip transport encrypts and authenticates peer connections, but any peer
@@ -279,5 +287,6 @@ Decision boundary rule: a crate may validate its own inputs, but only
 | Submission rejected as not executable | `select_transactions` and `State::apply_transaction` |
 | Peer block rejected | `accept_block` in `subhost-rpc/src/block.rs`, then `validate_chain` in `subhost-storage` |
 | Node will not start with a ledger on disk | `LedgerStore::load` validation order |
+| JSON-RPC answers 401 or the node refuses to bind | `subhost-rpc/src/security.rs`: token file, `allow_public`, then the middleware layer |
 | Block height stuck behind a peer | the ordering buffer in `subhost-node` and its 64-block window |
 | State root mismatch after restart | `State::root`, account leaf sorting, and chain-ID binding |

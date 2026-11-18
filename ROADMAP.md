@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `1761e8f` · S0.1–S0.3, S1.1–S1.3 and S4.1–S4.4 merged · S4.3 in review · `Q-001`–`Q-005` agreed
+Status: 2026-11-18 · S0.1–S0.3, S1.1–S1.3 and S4.1–S4.4 merged · S5.1a (RPC auth) in review · `Q-001`–`Q-006` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -17,7 +17,7 @@ editing the same files.
 | Networking | libp2p gossip publishes only locally sealed blocks. Messages for votes, DAG vertices and transactions are already defined but unused by the node. No block sync, peer scoring, per-peer limits, or tx gossip. |
 | Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
-| RPC | 11 methods, no auth, no TLS, no rate limit. RPC counters in the metrics registry are never incremented. |
+| RPC | 11 methods. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. RPC counters in the metrics registry are still never incremented. |
 | Mempool | In memory only; fixed gas price 1. |
 | IBC | State machine + single-key ed25519 light client. No validator-set rotation, no multisig QC, no non-membership proof. |
 | Release | `0.1.0`, no tag, no release workflow, no signed binaries or SBOM. |
@@ -311,11 +311,21 @@ chain larger than 64 MiB needs the retention work in S4.3.
 
 ### S5 — RPC security and method gaps (Track B)
 
-**S5.1 Auth and transport**
-- Bearer token (`--rpc-auth-token-file`), constant-time compare, 401 on mismatch.
-- TLS via rustls (`--rpc-tls-cert/key`), or a documented, tested reverse-proxy mode.
-- Per-IP token bucket (`--rpc-rate-limit`), 429 with `Retry-After`.
-- Bind loopback by default; require `--rpc-allow-public` plus auth for anything else.
+**S5.1 Auth and transport** *(S5.1a shipped; S5.1b TLS posture is a documented
+reverse-proxy mode)*
+- Shipped: bearer token (`--rpc-auth-token-file` / `SUBHOST_RPC_AUTH_TOKEN_FILE`),
+  constant-time compare over a BLAKE3 digest, redacted `Debug`, zeroized on drop;
+  401 with JSON-RPC error `-32000` and `WWW-Authenticate: Bearer` on mismatch.
+- Shipped: bind loopback by default; a non-loopback bind needs `--rpc-allow-public`
+  plus a token, refused in `subhost-rpc::start` with a non-loopback test
+  (`ADR-002`, contract Q-006). `--rpc-rate-limit` answers 429 with `Retry-After`
+  and error `-32005`.
+- Not done, documented instead: the limit is **per connection**, not per IP,
+  because jsonrpsee 0.24 does not expose the peer address to HTTP middleware
+  (re-verify when jsonrpsee 0.26 lands); WebSocket tokens are checked only at the
+  upgrade handshake; and there is no in-process TLS — jsonrpsee 0.24.11 has no
+  server-side TLS feature, so the supported public deployment is a TLS-terminating
+  reverse proxy in front of a loopback bind.
 
 **S5.2 Methods**
 - Add `eth_getBlockByHash`, `eth_syncing`, `eth_feeHistory`, `eth_maxPriorityFeePerGas`.

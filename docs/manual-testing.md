@@ -331,7 +331,71 @@ refused, and so is a prune that would drop the block the snapshot anchors
 (`refusing to prune: the retained history would start at height …`); on refusal the
 directory is untouched.
 
-## 16. Clean up
+## 16. Optional: require a bearer token
+
+Stop the node, then create a token and restart with auth plus a slow rate limit:
+
+```bash
+openssl rand -hex 32 > "$SUBHOST_TEST_HOME/rpc-token"
+chmod 600 "$SUBHOST_TEST_HOME/rpc-token"
+subhost node --listen 127.0.0.1:8545 --data-dir "$SUBHOST_TEST_DATA" \
+  --rpc-auth-token-file "$SUBHOST_TEST_HOME/rpc-token" --rpc-rate-limit 1
+```
+
+Without the header the node answers `401` and JSON-RPC error `-32000`:
+
+```bash
+curl -s -i http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+```
+
+With the token it answers normally, and the CLI does the same when you pass
+`--rpc-auth-token-file` (or export `SUBHOST_RPC_AUTH_TOKEN_FILE`):
+
+```bash
+TOKEN="$(cat "$SUBHOST_TEST_HOME/rpc-token")"
+curl -s http://127.0.0.1:8545 -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
+subhost query chain --rpc-auth-token-file "$SUBHOST_TEST_HOME/rpc-token"
+```
+
+Two requests over **one** connection exceed the limit and the second answers `429`
+with `Retry-After: 1` and error `-32005`. curl reuses the connection when it is
+given both URLs in one invocation:
+
+```bash
+curl -s -o /dev/null -w '%{http_code} ' -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
+  http://127.0.0.1:8545 -o /dev/null http://127.0.0.1:8545
+```
+
+The output is `200 429`. Separate `curl` invocations each open a new connection
+and therefore each get a fresh bucket; that is the per-connection limitation, not
+a broken limit.
+
+A non-loopback bind is refused before the socket opens unless the operator opts in,
+and the CLI will not accept the opt-in without a token:
+
+```bash
+subhost node --listen 0.0.0.0:8545 --data-dir "$SUBHOST_TEST_DATA"
+# refusing to bind JSON-RPC to the non-loopback address 0.0.0.0:8545: pass
+# --rpc-allow-public to expose it deliberately
+subhost node --listen 0.0.0.0:8545 --data-dir "$SUBHOST_TEST_DATA" --rpc-allow-public
+# error: the following required arguments were not provided:
+#   --rpc-auth-token-file <RPC_AUTH_TOKEN_FILE>
+```
+
+The library enforces the same rule below clap: `subhost-rpc::start` refuses a
+public address without a token (`BindPolicyError::AuthRequired`), so an embedder
+that builds `RpcSecurityConfig` directly cannot skip it.
+
+There is no in-process TLS. For a public deployment, keep `--listen
+127.0.0.1:8545` and terminate TLS in a reverse proxy that injects or forwards the
+`Authorization: Bearer` header.
+
+## 17. Clean up
 
 Stop the node with `Ctrl-C` first.
 
