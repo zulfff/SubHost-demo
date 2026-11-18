@@ -201,6 +201,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Automatic certified-history replay.** The optional `sync-relay` Platform
+  example records genesis-bound, checksummed block/QC pairs after quorum and
+  full execution validation, then replays them over existing P2P for fresh or
+  offline nodes. It has exclusive-writer locking, atomic synced records, bounded
+  future buffering and a configurable byte cap. Redundant archives preserve
+  history across relay downtime. Native range requests and history pruning are
+  separate work; see `docs/operations/certified-sync.md` and ADR-006.
+
 - **Recoverable four-validator local testnet.** A node-local, checksummed voting
   journal saves open proposals, verified votes and the latest QC before votes
   are published. Prepared commit intents reconcile interruption before/after
