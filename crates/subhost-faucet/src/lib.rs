@@ -48,6 +48,9 @@ pub struct FaucetConfig {
     pub rpc_url: String,
     /// Encrypted wallet file that funds the drips.
     pub wallet_path: PathBuf,
+    /// File holding the bearer token when the node requires authentication.
+    #[serde(default)]
+    pub rpc_auth_token_file: Option<PathBuf>,
     pub drip_amount: Amount,
     pub cooldown_secs: u64,
 }
@@ -58,6 +61,7 @@ impl Default for FaucetConfig {
             listen_addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
             rpc_url: "http://127.0.0.1:8545".to_string(),
             wallet_path: PathBuf::from("faucet-wallet.json"),
+            rpc_auth_token_file: None,
             drip_amount: 1_000_000_000_000_000_000,
             cooldown_secs: 86_400,
         }
@@ -200,6 +204,7 @@ pub struct ApiError {
 pub struct FaucetState {
     config: Arc<FaucetConfig>,
     signer: FaucetSigner,
+    rpc_token: Option<subhost_rpc::SecretToken>,
     cooldown: CooldownLedger,
     client: reqwest::Client,
     /// Serializes nonce read and submit so two requests cannot reuse a nonce.
@@ -209,10 +214,17 @@ pub struct FaucetState {
 impl FaucetState {
     pub fn new(config: FaucetConfig, signer: FaucetSigner) -> Result<Self, FaucetError> {
         config.validate()?;
+        let rpc_token = config
+            .rpc_auth_token_file
+            .as_deref()
+            .map(subhost_rpc::SecretToken::from_file)
+            .transpose()
+            .map_err(|error| FaucetError::Config(error.to_string()))?;
         let cooldown = CooldownLedger::new(Duration::from_secs(config.cooldown_secs));
         Ok(Self {
             config: Arc::new(config),
             signer,
+            rpc_token,
             cooldown,
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
@@ -347,18 +359,27 @@ impl FaucetState {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, FaucetError> {
-        let response = self
-            .client
-            .post(&self.config.rpc_url)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": params,
-                "id": 1,
-            }))
+        let mut request = self.client.post(&self.config.rpc_url).json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": 1,
+        }));
+        if let Some(token) = &self.rpc_token {
+            request = request.bearer_auth(token.expose());
+        }
+        let response = request
             .send()
             .await
             .map_err(|error| FaucetError::Rpc(format!("{method} request failed: {error}")))?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(FaucetError::Rpc(format!(
+                "{method} rejected the bearer token: set SUBHOST_RPC_AUTH_TOKEN_FILE"
+            )));
+        }
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(FaucetError::Rpc(format!("{method} was rate-limited by the node")));
+        }
         if !response.status().is_success() {
             return Err(FaucetError::Rpc(format!("{method} returned HTTP {}", response.status())));
         }
@@ -659,6 +680,10 @@ mod tests {
             FaucetConfig { drip_amount: 0, ..Default::default() },
             FaucetConfig { cooldown_secs: 0, ..Default::default() },
             FaucetConfig { rpc_url: "ftp://node".into(), ..Default::default() },
+            FaucetConfig {
+                rpc_auth_token_file: Some(PathBuf::from("/nonexistent/subhost-token")),
+                ..Default::default()
+            },
         ] {
             assert!(matches!(
                 FaucetState::new(broken, signer.clone()),
@@ -758,6 +783,79 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         assert!(String::from_utf8_lossy(&response).contains("ok"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn rpc_calls_carry_the_bearer_token() {
+        use axum::http::{header, HeaderMap};
+
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let recorder = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap| {
+                let recorder = recorder.clone();
+                async move {
+                    let value = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *recorder.lock().await = value;
+                    Json(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": "0x1"}))
+                }
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_path = token_dir.path().join("rpc-token");
+        std::fs::write(&token_path, "0123456789abcdef\n").unwrap();
+        let (_dir, path) = wallet_file();
+        let state = state_with(
+            FaucetConfig {
+                rpc_url: format!("http://{addr}"),
+                rpc_auth_token_file: Some(token_path),
+                ..Default::default()
+            },
+            &path,
+        );
+
+        let value = state.rpc_call("eth_chainId", serde_json::json!([])).await.unwrap();
+        assert_eq!(value, "0x1");
+        assert_eq!(seen.lock().await.as_deref(), Some("Bearer 0123456789abcdef"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_names_the_environment_variable() {
+        let app = Router::new().route(
+            "/",
+            post(|| async {
+                (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "unauthorized"})))
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (_dir, path) = wallet_file();
+        let state = state_with(
+            FaucetConfig { rpc_url: format!("http://{addr}"), ..Default::default() },
+            &path,
+        );
+        let error = state.rpc_call("eth_chainId", serde_json::json!([])).await.unwrap_err();
+        assert!(error.to_string().contains("SUBHOST_RPC_AUTH_TOKEN_FILE"));
 
         server.abort();
     }

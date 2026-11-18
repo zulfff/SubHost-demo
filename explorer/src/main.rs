@@ -44,6 +44,9 @@ pub struct ExplorerConfig {
     /// Wallet directory backing the demo signing endpoint. When absent, the
     /// account and transfer endpoints report that they are unavailable.
     pub wallet_dir: Option<PathBuf>,
+    /// File holding the bearer token when the node requires authentication.
+    #[serde(default)]
+    pub rpc_auth_token_file: Option<PathBuf>,
 }
 
 impl Default for ExplorerConfig {
@@ -53,6 +56,7 @@ impl Default for ExplorerConfig {
             rpc_url: "http://127.0.0.1:8545".to_string(),
             chain_name: "SubHost".to_string(),
             wallet_dir: None,
+            rpc_auth_token_file: None,
         }
     }
 }
@@ -61,6 +65,7 @@ impl Default for ExplorerConfig {
 pub struct ExplorerState {
     config: Arc<ExplorerConfig>,
     client: reqwest::Client,
+    rpc_token: Option<subhost_rpc::SecretToken>,
     /// Serializes nonce read and submit so two transfers cannot reuse a nonce.
     transfer_lock: Arc<Mutex<()>>,
 }
@@ -70,8 +75,15 @@ impl ExplorerState {
         if !config.rpc_url.starts_with("http://") && !config.rpc_url.starts_with("https://") {
             return Err(ExplorerError::Config("rpc_url must be an http(s) URL".into()));
         }
+        let rpc_token = config
+            .rpc_auth_token_file
+            .as_deref()
+            .map(subhost_rpc::SecretToken::from_file)
+            .transpose()
+            .map_err(|error| ExplorerError::Config(error.to_string()))?;
         Ok(Self {
             config: Arc::new(config),
+            rpc_token,
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .redirect(reqwest::redirect::Policy::none())
@@ -274,13 +286,25 @@ impl ExplorerState {
     }
 
     async fn rpc_call(&self, method: &str, params: Value) -> Result<Value, ExplorerError> {
-        let mut response = self
+        let mut request = self
             .client
             .post(&self.config.rpc_url)
-            .json(&json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}))
+            .json(&json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}));
+        if let Some(token) = &self.rpc_token {
+            request = request.bearer_auth(token.expose());
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|error| ExplorerError::Rpc(format!("{method} request failed: {error}")))?;
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(ExplorerError::Rpc(format!(
+                "{method} rejected the bearer token: set SUBHOST_RPC_AUTH_TOKEN_FILE"
+            )));
+        }
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ExplorerError::Rpc(format!("{method} was rate-limited by the node")));
+        }
         if !response.status().is_success() {
             return Err(ExplorerError::Rpc(format!(
                 "{method} returned HTTP {}",
@@ -595,6 +619,7 @@ fn main() -> anyhow::Result<()> {
         rpc_url: std::env::var("SUBHOST_RPC_URL").unwrap_or(defaults.rpc_url),
         chain_name: std::env::var("SUBHOST_CHAIN_NAME").unwrap_or(defaults.chain_name),
         wallet_dir: wallet_dir_from_env(),
+        rpc_auth_token_file: std::env::var("SUBHOST_RPC_AUTH_TOKEN_FILE").ok().map(PathBuf::from),
     };
 
     let server = ExplorerServer::new(ExplorerState::new(config)?);
@@ -830,5 +855,69 @@ mod tests {
         std::env::set_var("SUBHOST_TWO_USERS_ENV", "/tmp/subhost-does-not-exist.env");
         assert_eq!(wallet_dir_from_env(), None);
         std::env::remove_var("SUBHOST_TWO_USERS_ENV");
+    }
+
+    #[tokio::test]
+    async fn rpc_calls_carry_the_bearer_token() {
+        use axum::http::{header, HeaderMap};
+
+        let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let recorder = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap| {
+                let recorder = recorder.clone();
+                async move {
+                    let value = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_owned);
+                    *recorder.lock().await = value;
+                    Json(json!({"jsonrpc": "2.0", "id": 1, "result": "0x1"}))
+                }
+            }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let token_dir = tempfile::tempdir().unwrap();
+        let token_path = token_dir.path().join("rpc-token");
+        std::fs::write(&token_path, "0123456789abcdef\n").unwrap();
+        let state = state(ExplorerConfig {
+            rpc_url: format!("http://{addr}"),
+            rpc_auth_token_file: Some(token_path),
+            ..Default::default()
+        });
+
+        let value = state.rpc_call("eth_chainId", json!([])).await.unwrap();
+        assert_eq!(value, "0x1");
+        assert_eq!(seen.lock().await.as_deref(), Some("Bearer 0123456789abcdef"));
+
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_token_names_the_environment_variable() {
+        let app = Router::new().route(
+            "/",
+            post(|| async { (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))) }),
+        );
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state =
+            state(ExplorerConfig { rpc_url: format!("http://{addr}"), ..Default::default() });
+        let error = state.rpc_call("eth_chainId", json!([])).await.unwrap_err();
+        assert!(error.to_string().contains("SUBHOST_RPC_AUTH_TOKEN_FILE"));
+
+        task.abort();
     }
 }

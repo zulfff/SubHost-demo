@@ -205,6 +205,24 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `<data_dir>/producer.key` (or `--producer-key-file`) with mode `0600` and is never
   overwritten; a mismatched key, an invalid proof, and a zero-power validator all
   fail before the genesis file is written.
+- **Optional JSON-RPC authentication and rate limiting (S5.1a).** `subhost-rpc`
+  gains `RpcSecurityConfig` and `crates/subhost-rpc/src/security.rs`: a bearer
+  token read from a file (`--rpc-auth-token-file` or
+  `SUBHOST_RPC_AUTH_TOKEN_FILE`, minimum 16 bytes), compared in constant time as a
+  BLAKE3 digest, with a redacted `Debug` and zeroization on drop; a per-connection
+  token-bucket rate limit (`--rpc-rate-limit`) answering 429 with `Retry-After`
+  and JSON-RPC error `-32005`; and a bind policy that refuses any non-loopback
+  JSON-RPC bind unless `--rpc-allow-public` and a token are both set (error
+  `-32000` with `WWW-Authenticate: Bearer` on a rejected token). `subhost-node`
+  forwards the policy from `NodeConfig.rpc_security` (contract commit, Q-006 /
+  `ADR-002`), and `subhost-cli`, the faucet and the explorer send the token and
+  name the missing setting instead of surfacing a bare 401/429. Everything
+  defaults to off, so an existing node without flags behaves exactly as before.
+  Documented limitations: the rate limit is per connection because jsonrpsee 0.24
+  does not expose the peer address, WebSocket tokens are checked only at the
+  upgrade handshake, and there is no in-process TLS — the public deployment mode
+  is a TLS-terminating reverse proxy. 8 new unit tests plus 4 RPC integration
+  tests, and client tests in the CLI (2), faucet (2), and explorer (2).
 - **Segment pruning and height mapping.** `subhost db prune --keep-segments N`
   drops the oldest `ledger/segments/NNNNNN.log` files and records the new
   `base_height` in `ledger/manifest.json` (manifest version 2; version 1 is still
