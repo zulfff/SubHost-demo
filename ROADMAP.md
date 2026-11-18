@@ -128,7 +128,7 @@ agent always sees the real state.
 | S3 | Fork choice, reorg, and block sync | A | S2 | L | Planned |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented |
-| S6 | Durable mempool and fee market | B | S0 | M | Planned |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a snapshot API in review; node/RPC consumers pending |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
 | S8 | Observability, health, runbooks | B | S0 | M | Planned |
 | S9 | Release engineering | B | S5 | M | Planned |
@@ -393,6 +393,18 @@ the metrics match a request-count test.
 - Atomic `mempool.bin` (same envelope as the ledger), reloaded on start, dropped for
   transactions already on chain.
 - Config: `--mempool-persist`, capacity, per-sender cap.
+- S6.1a in review on `s6/mempool-store-contract`: `MempoolStore` supplies a bounded
+  signed-transfer snapshot with chain/genesis binding, atomic replacement and
+  whole-load validation. Limits are 64 MiB, 10,000 entries and 1 MiB per record.
+- S6.1b remains pending: after journal/ledger reconciliation, filter mined nonces
+  and re-admit under current pool/proposal policy; persist admission candidates
+  before visibility/acknowledgement. Post-commit pending-file cleanup failure
+  must not fail an already durable block commit. CLI opt-in/capacity consumers
+  follow the separate node/state contract. Until then this stage is not complete
+  and the bundled node's accepted pool remains volatile.
+- Relevant doc: `docs/operations/mempool-persistence.md`.
+- S6.1b must also cap runtime bytes with persistence on or off; count/sender
+  limits and snapshot caps alone do not supply that memory budget.
 
 **S6.2 Fee market**
 - Replace the fixed gas price with an EIP-1559-style base fee computed from the
