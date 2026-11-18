@@ -8,6 +8,12 @@ use std::collections::{BTreeMap, HashMap};
 use subhost_core::{Address, Hash, Nonce, Transaction};
 use tracing::debug;
 
+mod persistence;
+pub use persistence::{
+    MempoolPersistenceError, MempoolStore, MAX_MEMPOOL_BYTES, MAX_MEMPOOL_TRANSACTIONS,
+    MAX_MEMPOOL_TRANSACTION_BYTES, MEMPOOL_FILE_NAME,
+};
+
 /// Runtime limits for the transaction pool.
 #[derive(Debug, Clone)]
 pub struct MempoolConfig {

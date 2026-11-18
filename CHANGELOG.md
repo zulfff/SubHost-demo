@@ -217,6 +217,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   history across relay downtime. Native range requests and history pruning are
   separate work; see `docs/operations/certified-sync.md` and ADR-006.
 
+- **Bounded atomic mempool snapshot API.** `subhost_mempool::MempoolStore` loads
+  and persists chain/genesis-bound `mempool.bin` snapshots, validates signed
+  transfers and duplicate nonce slots, and caps file/record/count sizes. Writes
+  replace/sync owner-only snapshots without cloning the whole pool. Failure and
+  restart tests cover malformed data and interrupted filesystem writes. Node/RPC
+  admission and CLI consumers remain S6.1b; the API alone does not make bundled
+  node admissions durable. See `docs/operations/mempool-persistence.md`.
+
 - **Recoverable four-validator local testnet.** A node-local, checksummed voting
   journal saves open proposals, verified votes and the latest QC before votes
   are published. Prepared commit intents reconcile interruption before/after
