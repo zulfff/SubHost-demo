@@ -3882,7 +3882,10 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "ed25519-dalek",
+ "hex",
+ "subhost-consensus",
  "subhost-core",
+ "subhost-crypto",
  "subhost-metrics",
  "subhost-network",
  "subhost-rpc",

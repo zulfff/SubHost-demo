@@ -42,8 +42,8 @@ should be treated as production ready.
 | `subhost-state` | Complete. Balances, nonce ordering, replay rejection, checked arithmetic, Merkle state root bound to the chain ID, per-account inclusion proofs. |
 | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
 | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
-| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, producer-signature verification when a validator registry is configured, full re-validation of peer blocks, persist-before-commit. |
-| `subhost-node` | Complete. Genesis load, ledger restore, RPC and metrics wiring, graceful shutdown, optional peer gossip that publishes locally produced blocks and applies peer blocks in height order. |
+| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit. |
+| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, optional peer gossip that publishes locally produced blocks and applies peer blocks in height order. |
 | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
 | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
 | `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and a `2f + 1` view-by-view agreement driver. No networking, timeouts, view changes, or leader rotation. |
@@ -152,6 +152,20 @@ subhost query chain
 Wallets live in `$SUBHOST_HOME/wallets` (default `~/.subhost/wallets`). The CLI
 queries `--nonce` and `--chain-id` from the node when you omit them. `--verbose`
 and `--quiet` control log level; `RUST_LOG` overrides both.
+
+`node --validator` is a validator node. It requires a genesis whose validator entries
+each carry a proof of possession, and it reads `<data-dir>/producer.key`: one
+hex-encoded canonical 32-byte BLS scalar with mode `0600`. The node derives the public
+key from that file and uses the genesis validator whose `public_key` matches, then
+signs every block it produces with it. A missing file, a wider mode, a scalar that
+does not decode, and a key that belongs to no genesis validator all refuse to start.
+A node without `--validator` still builds the registry from genesis and rejects peer
+blocks that are not signed by one of those validators; only a genesis with no
+validators at all accepts unsigned blocks.
+
+`init --validator` does not generate the key or the proof yet, so a validator genesis
+has to be written with real proofs, as `crates/subhost-node` does in its tests. That
+CLI half is the remaining part of roadmap stage S1.4.
 
 ---
 

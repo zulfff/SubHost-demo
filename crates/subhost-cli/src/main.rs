@@ -421,6 +421,7 @@ async fn run_node(
         max_rpc_connections: max_connections,
         metrics_addr,
         validator,
+        producer_key_file: None,
         fallback_chain_id: 1,
         network,
     })?;

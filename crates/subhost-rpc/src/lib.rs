@@ -13,9 +13,10 @@
 //!   hash to the `from` address, so a caller cannot spend another account.
 //! - Blocks arriving from a peer go through [`RpcState::accept_block`], which
 //!   re-verifies parent, height, every transaction signature, both roots, and the
-//!   resulting state root before any state changes. With a configured
-//!   validator registry it also requires exactly one signature from a registered
-//!   producer over the block signing payload.
+//!   resulting state root before any state changes. With a validator registry it
+//!   also requires exactly one signature from a registered producer over the block
+//!   signing payload. [`RpcState::with_validators`] enables that check without a
+//!   signing key, so a follower verifies peer blocks.
 //! - The whole submit path holds one commit lock, and state is only swapped in
 //!   after the ledger write succeeds, so a failed persist cannot leave the
 //!   in-memory ledger ahead of disk.

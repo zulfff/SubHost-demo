@@ -42,8 +42,15 @@ non-loopback address for that reason. Do not expose it.
 **No consensus in the node.** Block production still comes from whichever node
 receives the transaction, even though `subhost-consensus` contains a tested
 in-process `2f + 1` driver. There is no fork choice, no reorg handling, no block
-sync, and no leader rotation. A `Block` carries an empty `signatures` vector and
-the zero address as its validator.
+sync, and no leader rotation. A produced block is signed by the configured producer
+and is only accepted by a node that has the same genesis validator set.
+
+**The producer key is an unencrypted file.** `<data_dir>/producer.key` holds one
+hex-encoded 32-byte BLS scalar with mode `0600`, and the node refuses to load it if
+group or others can read it. It is not the wallet keystore and it is not encrypted,
+so anyone who copies the file can produce blocks as that validator. That is
+acceptable for a testnet and not for production; `ROADMAP.md` S9.6 replaces it with
+an encrypted keystore. Back the file up as carefully as the identity it represents.
 
 **Block gossip is best-effort and unauthenticated beyond libp2p.** With
 `--p2p-listen`, a node publishes blocks it sealed and applies peer blocks that
@@ -93,10 +100,16 @@ A regression in any of these is a genuine vulnerability and worth reporting.
   address. The key travels with the transaction, so the binding is checked again
   at execution and on every ledger replay. The node holds no user keys.
 - `RpcState::accept_block` re-validates a peer block before any state change:
-  parent, height, chain ID, block gas limit, every signature, transaction
-  uniqueness, transaction and receipt Merkle commitments, the state transition,
-  and the resulting state root. Receipts are derived locally and never trusted
-  from the wire. A rejected block leaves state, receipts, and the pool untouched.
+  parent, height, chain ID, block gas limit, every transaction signature,
+  transaction uniqueness, transaction and receipt Merkle commitments, the state
+  transition, and the resulting state root. Receipts are derived locally and never
+  trusted from the wire. A rejected block leaves state, receipts, and the pool
+  untouched.
+- A node with a genesis validator set also requires exactly one valid BLS signature
+  from that block's registered producer over the block signing payload, and rejects
+  an unknown producer, a missing or extra signature, a signer that differs from
+  `header.validator`, and a payload that no longer matches the header. The check runs
+  before the state transition.
 - A transaction is rejected unless the chain ID matches, the nonce is exactly the
   account's current nonce, and the balance covers `value + gas_price * gas_limit`.
 - Every balance and nonce operation uses checked arithmetic; overflow is an error.

@@ -243,16 +243,16 @@ impl RpcState {
 
     /// Check that a peer block is signed by a registered validator.
     ///
-    /// A node without a configured authority keeps the pre-S1 behaviour and
-    /// accepts unsigned blocks. With one, the block must name a registered
-    /// validator and carry exactly one signature from that validator over
+    /// A node without a validator registry keeps the pre-S1 behaviour and accepts
+    /// unsigned blocks. With one, the block must name a registered validator and
+    /// carry exactly one signature from that validator over
     /// [`Block::signing_payload`]. Anything else is
     /// [`RpcError::UnauthorizedProducer`].
     fn verify_block_authority(&self, block: &Block) -> Result<(), RpcError> {
-        let Some(authority) = &self.authority else {
+        let Some(validators) = &self.validators else {
             return Ok(());
         };
-        let Some(public_key) = authority.validators.public_key(&block.header.validator) else {
+        let Some(public_key) = validators.public_key(&block.header.validator) else {
             return Err(RpcError::UnauthorizedProducer);
         };
         let [signature] = block.signatures.as_slice() else {
@@ -526,6 +526,33 @@ mod tests {
         follower.accept_block(block).unwrap();
         assert_eq!(follower.block_height(), 1);
         assert_eq!(follower.block_count(), 1);
+    }
+
+    #[test]
+    fn verification_needs_only_a_registry_not_a_signing_key() {
+        let tx_key = signing_key(7);
+        let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+        let (alice_secret, _) = BLSScheme::keygen();
+        let alice = Address::new([9; 20]);
+        let registry = registry(&[(alice, &alice_secret)]);
+
+        let producer = funded_state(&tx_key, 1_000_000)
+            .with_authority(BlockAuthority::new(registry.clone(), alice, alice_secret).unwrap());
+        producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+        let block = producer.block_at_height(1).unwrap();
+
+        let follower = RpcState::in_memory(1).unwrap().with_validators(registry.clone());
+        follower.seed_accounts([(sender, 1_000_000)]).unwrap();
+        follower.accept_block(block.clone()).unwrap();
+        assert_eq!(follower.block_height(), 1);
+        assert_eq!(follower.balance(&Address::new([2; 20])), 10);
+
+        // The same registry on a fresh state still rejects an unsigned block.
+        let strict = RpcState::in_memory(1).unwrap().with_validators(registry);
+        strict.seed_accounts([(sender, 1_000_000)]).unwrap();
+        let mut unsigned = block;
+        unsigned.signatures.clear();
+        assert!(matches!(strict.accept_block(unsigned), Err(RpcError::UnauthorizedProducer)));
     }
 
     #[test]

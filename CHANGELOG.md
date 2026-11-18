@@ -185,6 +185,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Validator registry and producer key at bootstrap.** `Node::bootstrap` builds a
+  `ValidatorRegistry` from `genesis.initial_validators` whenever the genesis has a
+  validator set, and `RpcState::with_validators` enables peer-block verification
+  without a signing key, so a follower rejects unsigned blocks. `node --validator`
+  additionally reads `<data_dir>/producer.key` (or `NodeConfig::producer_key_file`),
+  refuses a file that group or others can read, decodes one canonical 32-byte BLS
+  scalar, and resolves the validator by matching the derived public key against
+  genesis: zero or several matches refuse to start. New `NodeError` variants carry
+  the path, and `PRODUCER_KEY_FILE_NAME` names the default. `init --validator` still
+  writes empty proofs, so that half of S1.4 is outstanding.
 - **Producer verification on accept.** With a configured authority,
   `accept_block` requires `header.validator` to be a registered validator and
   exactly one BLS signature from that validator over `Block::signing_payload()`,
