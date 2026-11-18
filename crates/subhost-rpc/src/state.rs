@@ -201,6 +201,22 @@ impl RpcState {
         self.block_height.load(Ordering::SeqCst)
     }
 
+    /// Hash of the newest committed block, or [`Hash::ZERO`] at genesis.
+    ///
+    /// A consensus driver needs this to resume after a restart: the next
+    /// proposal must name this hash as its parent.
+    pub fn tip_hash(&self) -> Hash {
+        read(&self.blocks).last().map_or(Hash::ZERO, Block::hash)
+    }
+
+    /// Whether this node checks blocks against a genesis validator set.
+    ///
+    /// The consensus orchestrator uses this to distinguish validator chains
+    /// from development chains without registered block producers.
+    pub fn has_validator_set(&self) -> bool {
+        self.validators.is_some()
+    }
+
     /// Whether a ledger file already exists on disk.
     pub fn has_persisted_state(&self) -> bool {
         self.store.exists()
