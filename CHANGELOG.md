@@ -193,8 +193,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   refuses a file that group or others can read, decodes one canonical 32-byte BLS
   scalar, and resolves the validator by matching the derived public key against
   genesis: zero or several matches refuse to start. New `NodeError` variants carry
-  the path, and `PRODUCER_KEY_FILE_NAME` names the default. `init --validator` still
-  writes empty proofs, so that half of S1.4 is outstanding.
+  the path, and `PRODUCER_KEY_FILE_NAME` names the default. `read_producer_key` and
+  `write_producer_key` keep the format and permission rules in one place, and
+  `node --producer-key-file` overrides the default path.
+- **Validator genesis from the CLI.** `subhost init --validator` now writes the proof
+  of possession that registration verifies, so a genesis it produces boots a
+  validator instead of being refused. `ADDRESS:POWER` derives the public key from the
+  producer key and signs the proof; `ADDRESS=PUBKEY_HEX:POWER` requires the key to
+  match; `ADDRESS=PUBKEY_HEX:POWER:POP_HEX` stores a proof signed elsewhere so a
+  coordinator can assemble a set. A missing producer key is generated once at
+  `<data_dir>/producer.key` (or `--producer-key-file`) with mode `0600` and is never
+  overwritten; a mismatched key, an invalid proof, and a zero-power validator all
+  fail before the genesis file is written.
 - **Producer verification on accept.** With a configured authority,
   `accept_block` requires `header.validator` to be a registered validator and
   exactly one BLS signature from that validator over `Block::signing_payload()`,

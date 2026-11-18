@@ -127,10 +127,12 @@ the explorer refuses to bind to anything but a loopback address.
 ```bash
 subhost init --chain-id 1 --data-dir ./data \
   --alloc ADDRESS=BALANCE \
-  --validator ADDRESS=PUBKEY_HEX:POWER
+  [--validator ADDRESS[=PUBKEY_HEX]:POWER[:POP_HEX]] \
+  [--producer-key-file PATH]
 
 subhost node --listen 127.0.0.1:8545 --data-dir ./data \
-  [--validator] [--metrics-addr 127.0.0.1:9090] [--max-connections 1000] \
+  [--validator [--producer-key-file PATH]] \
+  [--metrics-addr 127.0.0.1:9090] [--max-connections 1000] \
   [--p2p-listen /ip4/0.0.0.0/tcp/30333 [--bootstrap-peer MULTIADDR] [--no-mdns] [--max-peers 50]]
 
 subhost wallet new --password <password> [--name alice]
@@ -163,9 +165,29 @@ A node without `--validator` still builds the registry from genesis and rejects 
 blocks that are not signed by one of those validators; only a genesis with no
 validators at all accepts unsigned blocks.
 
-`init --validator` does not generate the key or the proof yet, so a validator genesis
-has to be written with real proofs, as `crates/subhost-node` does in its tests. That
-CLI half is the remaining part of roadmap stage S1.4.
+`init --validator` writes the proof of possession that `node --validator` and every
+follower verify at start-up. It offers three forms, and only one needs a local key:
+
+- `ADDRESS:POWER` derives the public key from the producer key and signs the proof
+  with it. This is the single-validator bootstrap form.
+- `ADDRESS=PUBKEY_HEX:POWER` asserts the public key; the producer key must match it,
+  and the proof is still generated locally.
+- `ADDRESS=PUBKEY_HEX:POWER:POP_HEX` stores a proof signed on another machine, which
+  is how a coordinator assembles a genesis from several validators. No local key is
+  read in that case.
+
+The producer key is `<data-dir>/producer.key` unless `--producer-key-file` says
+otherwise. When the file is missing, `init` generates it with mode `0600`, refuses to
+overwrite an existing one, and prints its public key. The file is one hex-encoded
+canonical 32-byte BLS scalar. It is not encrypted: treat a copy as a copy of the
+right to produce blocks. `node --validator` reads the same file, derives the public
+key, and refuses to start if the file is missing, has group/other permission bits,
+does not decode, or matches zero or several genesis validators. The encrypted
+keystore in `ROADMAP.md` S9.6 replaces the plaintext file before production.
+
+`init` without `--validator` writes no key and no validator entries; that genesis
+still runs a single-node chain, because only a genesis with a validator set requires
+signed blocks.
 
 ---
 

@@ -12,6 +12,7 @@
 
 use bincode::Options;
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use subhost_consensus::ValidatorRegistry;
@@ -409,15 +410,16 @@ fn load_genesis(path: &Path) -> Result<Option<GenesisConfig>, NodeError> {
     Ok(Some(GenesisConfig::load(path)?))
 }
 
-/// Read the producer key and resolve which genesis validator it belongs to.
+/// Read and validate a producer key file.
 ///
-/// The file is the only input: the address is looked up by public key instead of
-/// being passed in, so a key file cannot be paired with an address it does not
-/// match. Zero or several matches are both errors.
-fn load_producer(
-    path: &Path,
-    genesis: Option<&GenesisConfig>,
-) -> Result<(Address, PrivateKey), NodeError> {
+/// The format is one lowercase hex-encoded canonical 32-byte BLS scalar, with an
+/// optional `0x` prefix and surrounding whitespace. A file that group or others
+/// can read is refused before it is parsed, and a scalar whose encoding does not
+/// round-trip is refused so that two files cannot name the same key.
+///
+/// This is the only loader for the format. `subhost-cli` uses it for `init`, so
+/// the genesis writer and the node cannot disagree about what a key file means.
+pub fn read_producer_key(path: &Path) -> Result<PrivateKey, NodeError> {
     let metadata = std::fs::metadata(path)
         .map_err(|source| NodeError::ProducerKey { path: path.to_path_buf(), source })?;
     check_producer_permissions(path, &metadata)?;
@@ -435,6 +437,46 @@ fn load_producer(
     if BLSScheme::encode_secret_key(&secret) != bytes {
         return Err(NodeError::InvalidProducerKey(path.to_path_buf()));
     }
+    Ok(secret)
+}
+
+/// Write a producer key file, refusing to overwrite an existing one.
+///
+/// The file is created with mode `0600` before its contents are written, so it is
+/// never readable by another user even for an instant. A partial write is removed
+/// instead of being left behind as a half key.
+pub fn write_producer_key(path: &Path, secret: &PrivateKey) -> Result<(), NodeError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| NodeError::ProducerKey { path: path.to_path_buf(), source })?;
+
+    let mut line = hex::encode(BLSScheme::encode_secret_key(secret));
+    line.push('\n');
+    if let Err(source) = file.write_all(line.as_bytes()).and_then(|()| file.sync_all()) {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(NodeError::ProducerKey { path: path.to_path_buf(), source });
+    }
+    Ok(())
+}
+
+/// Read the producer key and resolve which genesis validator it belongs to.
+///
+/// The file is the only input: the address is looked up by public key instead of
+/// being passed in, so a key file cannot be paired with an address it does not
+/// match. Zero or several matches are both errors.
+fn load_producer(
+    path: &Path,
+    genesis: Option<&GenesisConfig>,
+) -> Result<(Address, PrivateKey), NodeError> {
+    let secret = read_producer_key(path)?;
 
     let genesis =
         genesis.ok_or_else(|| NodeError::NoValidatorSetForProducer(path.to_path_buf()))?;
@@ -586,7 +628,7 @@ mod tests {
     }
 
     /// Write a producer key the way `subhost init --validator` will.
-    fn write_producer_key(dir: &Path, secret: &PrivateKey) -> PathBuf {
+    fn write_test_producer_key(dir: &Path, secret: &PrivateKey) -> PathBuf {
         std::fs::create_dir_all(dir).unwrap();
         let path = dir.join(PRODUCER_KEY_FILE_NAME);
         std::fs::write(&path, hex::encode(BLSScheme::encode_secret_key(secret))).unwrap();
@@ -657,7 +699,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (genesis, address, secret) = genesis_with_validator(1);
         genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
-        let key_path = write_producer_key(dir.path(), &secret);
+        let key_path = write_test_producer_key(dir.path(), &secret);
 
         let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
         assert_eq!(config.producer_key_path(), Some(key_path));
@@ -694,7 +736,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (genesis, _, secret) = genesis_with_validator(1);
         genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
-        let key_path = write_producer_key(dir.path(), &secret);
+        let key_path = write_test_producer_key(dir.path(), &secret);
         std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
         let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
@@ -714,7 +756,7 @@ mod tests {
         let (genesis, _, _) = genesis_with_validator(1);
         genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
         let (stranger, _) = BLSScheme::keygen();
-        write_producer_key(dir.path(), &stranger);
+        write_test_producer_key(dir.path(), &stranger);
 
         let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
         assert!(matches!(Node::bootstrap(config), Err(NodeError::UnknownProducer(_))));
@@ -731,6 +773,30 @@ mod tests {
 
         let config = NodeConfig { validator: true, ..NodeConfig::new(dir.path()) };
         assert!(matches!(Node::bootstrap(config), Err(NodeError::InvalidProducerKey(_))));
+    }
+
+    #[test]
+    fn the_producer_key_writer_round_trips_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRODUCER_KEY_FILE_NAME);
+        let (secret, _) = BLSScheme::keygen();
+        write_producer_key(&path, &secret).unwrap();
+
+        let loaded = read_producer_key(&path).unwrap();
+        assert_eq!(BLSScheme::encode_secret_key(&loaded), BLSScheme::encode_secret_key(&secret));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "a fresh producer key must be owner-only");
+        }
+
+        // `subhost init` calls this on every run: an existing key is the
+        // validator identity, so replacing it must fail instead.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let (other, _) = BLSScheme::keygen();
+        assert!(write_producer_key(&path, &other).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

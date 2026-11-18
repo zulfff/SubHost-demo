@@ -161,11 +161,11 @@ unchanged and unsigned blocks are accepted.
   production is who can reach the listening address. The node binds loopback by
   default.
 
-The remaining gap is `init`: `subhost init --validator` does not write proofs of
-possession yet, so a genesis it produces today is refused at start-up by the registry
-check above. `ADR-001` fixes BLS12-381 as the scheme and a mandatory proof of
-possession; the CLI half of S1.4 supplies it, and until then only a genesis written
-with real proofs, as the node tests do, can boot a validator.
+`subhost init --validator` closes the bootstrap path: it derives the public key from
+the producer key file, signs the proof of possession, and stores it in genesis. A
+genesis assembled on another machine can carry a supplied proof instead. Every
+validator entry therefore boots through the same registry check, whether it was
+written by `init` or by hand.
 
 ## 4. What the ledger guarantees
 
