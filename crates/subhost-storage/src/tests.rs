@@ -577,6 +577,27 @@ fn truncated_committed_segment_is_rejected() {
 }
 
 #[test]
+fn append_refuses_a_truncated_committed_tail_without_changing_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(2).0).unwrap();
+    let segment = segment_path(dir.path(), 0);
+    let original = fs::read(&segment).unwrap();
+    let truncated = &original[..original.len() - 1];
+    fs::write(&segment, truncated).unwrap();
+    let before = fs::read(segmented::manifest_path(dir.path())).unwrap();
+
+    assert!(matches!(store.persist(&ledger(3).0), Err(StorageError::Segment(_))));
+    assert_eq!(fs::read(&segment).unwrap(), truncated, "refusal must not pad or append bytes");
+    assert_eq!(fs::read(segmented::manifest_path(dir.path())).unwrap(), before);
+
+    // Restoring the committed bytes makes the same append safe to retry.
+    fs::write(&segment, original).unwrap();
+    store.persist(&ledger(3).0).unwrap();
+    assert_eq!(store.load().unwrap().height(), 3);
+}
+
+#[test]
 fn stale_manifest_segment_length_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
@@ -627,11 +648,13 @@ fn manifest_snapshot_checksum_must_match_the_file() {
 fn crash_before_the_manifest_commit_keeps_the_previous_head() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
-    store.persist(&ledger(1).0).unwrap();
+    let (first, first_state) = ledger(1);
+    store.persist_with_limits(&first, segmented::SEGMENT_MAX_BYTES, 2).unwrap();
     let old_manifest = fs::read(segmented::manifest_path(dir.path())).unwrap();
 
-    store.persist(&ledger(3).0).unwrap();
+    store.persist_with_limits(&ledger(3).0, segmented::SEGMENT_MAX_BYTES, 2).unwrap();
     assert_eq!(store.load().unwrap().height(), 3);
+    assert!(snapshot_path(dir.path(), 3).is_file(), "the new snapshot must have been renamed");
 
     // Simulate a crash between the snapshot rename and the manifest commit: the
     // previously committed manifest is still on disk and still has its snapshot.
@@ -640,10 +663,116 @@ fn crash_before_the_manifest_commit_keeps_the_previous_head() {
     let recovered = store.load().unwrap();
     assert_eq!(recovered.height(), 1);
     assert_eq!(recovered.blocks.len(), 1);
+    assert_eq!(recovered.state.root(), first_state.root());
+    assert_eq!(recovered.receipts.len(), first.receipts.len());
 
-    // Replaying the lost blocks rebuilds the same head.
-    store.persist(&ledger(3).0).unwrap();
-    assert_eq!(store.load().unwrap().height(), 3);
+    // Uncommitted records and the orphan snapshot may be replaced by a different
+    // valid suffix. Only block 1 is authoritative after the interrupted commit.
+    let (replacement, replacement_state) =
+        build(vec![vec![transfer(0)], vec![transfer(1), transfer(2)], vec![transfer(3)]]);
+    store.persist_with_limits(&replacement, segmented::SEGMENT_MAX_BYTES, 2).unwrap();
+    let restored = open(dir.path()).load().unwrap();
+    assert_eq!(restored.height(), 3);
+    assert_eq!(restored.state.root(), replacement_state.root());
+    assert_eq!(restored.receipts.len(), 4);
+    assert_eq!(restored.blocks.last().unwrap().hash(), replacement.blocks.last().unwrap().hash());
+}
+
+#[test]
+fn interrupted_record_headers_and_payloads_leave_the_committed_state_loadable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let (first, first_state) = ledger(1);
+    store.persist(&first).unwrap();
+    let manifest = fs::read(segmented::manifest_path(dir.path())).unwrap();
+    let committed_bytes = fs::read(segment_path(dir.path(), 0)).unwrap().len();
+    let (next, next_state) = ledger(2);
+    store.persist(&next).unwrap();
+    let complete = fs::read(segment_path(dir.path(), 0)).unwrap();
+    let record_bytes = complete.len() - committed_bytes;
+
+    // magic, version, length, checksum, payload, and a complete but uncommitted
+    // record. Each on-disk image represents a different point of interruption.
+    for tail in [1, 4, 8, 12, 43, 44, record_bytes / 2, record_bytes - 1, record_bytes] {
+        fs::write(segmented::manifest_path(dir.path()), &manifest).unwrap();
+        fs::write(segment_path(dir.path(), 0), &complete[..committed_bytes + tail]).unwrap();
+
+        let reopened = open(dir.path());
+        let recovered = reopened.load().unwrap();
+        assert_eq!(recovered.height(), 1, "uncommitted tail length {tail}");
+        assert_eq!(recovered.state.root(), first_state.root());
+        assert_eq!(recovered.receipts.len(), 1);
+
+        reopened.persist(&next).unwrap();
+        let restored = open(dir.path()).load().unwrap();
+        assert_eq!(restored.height(), 2);
+        assert_eq!(restored.state.root(), next_state.root());
+        assert_eq!(restored.receipts.len(), 2);
+        assert_eq!(fs::read(segment_path(dir.path(), 0)).unwrap(), complete);
+    }
+}
+
+#[test]
+fn snapshot_write_failure_preserves_the_head_and_can_be_retried() {
+    for segment_bytes in [1, segmented::SEGMENT_MAX_BYTES] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        let (first, first_state) = ledger(1);
+        store.persist_with_limits(&first, segment_bytes, 2).unwrap();
+        let before = fs::read(segmented::manifest_path(dir.path())).unwrap();
+        let original_snapshot = fs::read(snapshot_path(dir.path(), 1)).unwrap();
+
+        // Force the snapshot rename to fail after the segment writes completed.
+        let blocked_snapshot = snapshot_path(dir.path(), 3);
+        fs::create_dir(&blocked_snapshot).unwrap();
+        let (next, next_state) = ledger(3);
+        assert!(matches!(
+            store.persist_with_limits(&next, segment_bytes, 2),
+            Err(StorageError::Io { path, .. }) if path == blocked_snapshot
+        ));
+        assert_eq!(fs::read(segmented::manifest_path(dir.path())).unwrap(), before);
+        assert_eq!(fs::read(snapshot_path(dir.path(), 1)).unwrap(), original_snapshot);
+        let recovered = open(dir.path()).load().unwrap();
+        assert_eq!(recovered.height(), 1);
+        assert_eq!(recovered.state.root(), first_state.root());
+        assert_eq!(recovered.receipts.len(), 1);
+
+        fs::remove_dir(&blocked_snapshot).unwrap();
+        store.persist_with_limits(&next, segment_bytes, 2).unwrap();
+        let restored = open(dir.path()).load().unwrap();
+        assert_eq!(restored.height(), 3);
+        assert_eq!(restored.state.root(), next_state.root());
+        assert_eq!(restored.receipts.len(), 3);
+        assert_eq!(segment_names(dir.path()).len(), if segment_bytes == 1 { 3 } else { 1 });
+    }
+}
+
+#[test]
+fn orphan_segments_and_snapshot_are_ignored_and_replaced_after_a_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist_with_limits(&ledger(1).0, 1, 2).unwrap();
+    let before = fs::read(segmented::manifest_path(dir.path())).unwrap();
+    let (next, next_state) = ledger(3);
+    store.persist_with_limits(&next, 1, 2).unwrap();
+    assert_eq!(segment_names(dir.path()).len(), 3);
+    assert!(snapshot_path(dir.path(), 3).is_file());
+
+    // These files were written before the lost manifest replacement. Even
+    // damaged orphan files cannot affect the old committed head.
+    fs::write(segmented::manifest_path(dir.path()), before).unwrap();
+    fs::write(segment_path(dir.path(), 1), b"torn segment").unwrap();
+    fs::write(segment_path(dir.path(), 2), b"torn segment").unwrap();
+    fs::write(snapshot_path(dir.path(), 3), b"torn snapshot").unwrap();
+    let reopened = open(dir.path());
+    assert_eq!(reopened.load().unwrap().height(), 1);
+
+    reopened.persist_with_limits(&next, 1, 2).unwrap();
+    let restored = open(dir.path()).load().unwrap();
+    assert_eq!(restored.height(), 3);
+    assert_eq!(restored.state.root(), next_state.root());
+    assert_eq!(restored.receipts.len(), 3);
+    assert_eq!(segment_names(dir.path()).len(), 3);
 }
 
 #[test]
@@ -735,6 +864,56 @@ fn migrate_is_idempotent() {
 }
 
 #[test]
+fn migrate_refuses_a_corrupt_segmented_ledger_even_with_a_valid_legacy_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let (snapshot, _) = ledger(2);
+    store.persist(&snapshot).unwrap();
+
+    // A crash after manifest commit can leave the legacy file awaiting cleanup.
+    // Its valid contents must not hide damage to the authoritative segments.
+    let legacy_path = dir.path().join(LEDGER_FILE_NAME);
+    let legacy_bytes = legacy::encode(&snapshot);
+    fs::write(&legacy_path, &legacy_bytes).unwrap();
+    let segment = segment_path(dir.path(), 0);
+    let mut bytes = fs::read(&segment).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    fs::write(&segment, &bytes).unwrap();
+    let before = fs::read(segmented::manifest_path(dir.path())).unwrap();
+
+    assert!(matches!(store.migrate(), Err(StorageError::ChecksumMismatch)));
+    assert_eq!(fs::read(&segment).unwrap(), bytes);
+    assert_eq!(fs::read(segmented::manifest_path(dir.path())).unwrap(), before);
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+    assert!(!dir.path().join(LEDGER_BACKUP_FILE_NAME).exists());
+}
+
+#[test]
+fn migrate_validates_the_existing_manifest_and_snapshot_before_reporting_success() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(1).0).unwrap();
+    let original_manifest = fs::read(segmented::manifest_path(dir.path())).unwrap();
+    let original_snapshot = fs::read(snapshot_path(dir.path(), 1)).unwrap();
+
+    fs::write(segmented::manifest_path(dir.path()), b"{\"version\":").unwrap();
+    assert!(matches!(store.migrate(), Err(StorageError::Manifest(_))));
+    fs::write(segmented::manifest_path(dir.path()), &original_manifest).unwrap();
+
+    let mut damaged = original_snapshot.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 0x01;
+    fs::write(snapshot_path(dir.path(), 1), &damaged).unwrap();
+    assert!(matches!(store.migrate(), Err(StorageError::ChecksumMismatch)));
+    assert_eq!(fs::read(snapshot_path(dir.path(), 1)).unwrap(), damaged);
+
+    fs::write(snapshot_path(dir.path(), 1), original_snapshot).unwrap();
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::AlreadySegmented);
+    assert_eq!(fs::read(segmented::manifest_path(dir.path())).unwrap(), original_manifest);
+}
+
+#[test]
 fn migrate_reports_a_fresh_directory_as_nothing_to_migrate() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
@@ -789,6 +968,61 @@ fn migrate_recovers_from_a_partial_previous_attempt() {
     assert_eq!(store.migrate().unwrap(), MigrationOutcome::Migrated { height: 2 });
     assert_eq!(store.load().unwrap().height(), 2);
     assert!(!ledger.join("snapshot-0000000009.bin").exists());
+}
+
+#[test]
+fn migrate_retries_after_snapshot_write_failure_without_losing_the_legacy_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let (snapshot, state) = ledger(3);
+    let legacy_path = dir.path().join(LEDGER_FILE_NAME);
+    let original = legacy::encode(&snapshot);
+    fs::write(&legacy_path, &original).unwrap();
+    let store = open(dir.path());
+
+    let blocked_snapshot = snapshot_path(dir.path(), 3);
+    fs::create_dir_all(&blocked_snapshot).unwrap();
+    assert!(matches!(store.migrate(), Err(StorageError::Io { .. })));
+    assert!(segment_path(dir.path(), 0).is_file(), "segments were written before failure");
+    assert!(!segmented::manifest_path(dir.path()).exists());
+    assert_eq!(fs::read(&legacy_path).unwrap(), original);
+    assert!(!dir.path().join(LEDGER_BACKUP_FILE_NAME).exists());
+    assert_eq!(open(dir.path()).load().unwrap().state.root(), state.root());
+
+    fs::remove_dir(blocked_snapshot).unwrap();
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::Migrated { height: 3 });
+    let restored = open(dir.path()).load().unwrap();
+    assert_eq!(restored.height(), 3);
+    assert_eq!(restored.state.root(), state.root());
+    assert_eq!(restored.receipts.len(), 3);
+    assert_eq!(fs::read(dir.path().join(LEDGER_BACKUP_FILE_NAME)).unwrap(), original);
+    assert_eq!(store.migrate().unwrap(), MigrationOutcome::AlreadySegmented);
+}
+
+#[test]
+fn migrate_after_manifest_commit_preserves_a_leftover_legacy_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let (snapshot, state) = ledger(2);
+    store.persist(&snapshot).unwrap();
+    let before = fs::read(segmented::manifest_path(dir.path())).unwrap();
+    let segment_before = fs::read(segment_path(dir.path(), 0)).unwrap();
+
+    // Simulate interruption after the manifest commit but before legacy cleanup.
+    let legacy_path = dir.path().join(LEDGER_FILE_NAME);
+    let legacy_bytes = legacy::encode(&snapshot);
+    fs::write(&legacy_path, &legacy_bytes).unwrap();
+    let reopened = open(dir.path());
+    assert_eq!(reopened.migrate().unwrap(), MigrationOutcome::AlreadySegmented);
+    assert_eq!(reopened.load().unwrap().state.root(), state.root());
+    assert_eq!(fs::read(segmented::manifest_path(dir.path())).unwrap(), before);
+    assert_eq!(fs::read(segment_path(dir.path(), 0)).unwrap(), segment_before);
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy_bytes);
+
+    // The next successful persist finishes ordinary legacy cleanup.
+    reopened.persist(&ledger(3).0).unwrap();
+    assert!(!legacy_path.exists());
+    assert_eq!(fs::read(dir.path().join(LEDGER_BACKUP_FILE_NAME)).unwrap(), legacy_bytes);
+    assert_eq!(open(dir.path()).load().unwrap().height(), 3);
 }
 
 #[test]

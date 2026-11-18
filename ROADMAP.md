@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-18 · baseline `main` = `1af182f` · S0.1–S0.3, S1.1–S1.4 and S4.1–S4.4 merged · S5.1a (RPC auth) in review · `Q-001`–`Q-006` agreed
+Status: 2026-11-18 · baseline `main` = `96f0cd2` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.4 and S5.1a merged · S4.5 in review · `Q-001`–`Q-009` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -272,6 +272,11 @@ it is no longer true.
 
 ### S4 — Segmented storage, snapshots, migration (Track B)
 
+| Task | Status |
+| --- | --- |
+| S4.1–S4.4 | Merged |
+| S4.5 | In review on `s4/storage-failure-tests` |
+
 **S4.1 Segmented log**
 - `node-state.bin` becomes `ledger/manifest.json` + `segments/000001.log`…
 - Each segment: magic, version, length, BLAKE3 checksum, records; fsync per append.
@@ -307,12 +312,21 @@ it is no longer true.
 
 **S4.5 Failure tests**
 - Truncated segment, corrupt checksum, missing segment, stale manifest.
-- Crash between snapshot rename and manifest update.
-- Migration interrupted, then re-run.
+- Interrupted record headers/payloads and crash between a new snapshot rename
+  and manifest update; a retry may replace the uncommitted suffix.
+- Failed snapshot writes after segment appends, including segment rollover.
+- Migration interrupted before and after manifest commit, then re-run;
+  repeated migration validates committed data before reporting success.
+- A shortened committed tail is refused before append can pad it with zeroes.
+- Runbook: `docs/operations/backup-restore.md`.
 
-**Exit criteria:** state is no longer rewritten at every commit, and a corrupt tail
-never prevents start-up from the last good snapshot. Bounded start-up time for a
-chain larger than 64 MiB needs the retention work in S4.3.
+**Exit criteria:** state is no longer rewritten at every commit, and an uncommitted
+torn tail never prevents start-up from the last committed head. Missing or corrupt
+committed data is refused without silently rolling back history; recovery needs a
+coherent backup. Tests model interrupted on-disk writes and a real snapshot rename
+failure; power-loss testing on physical hardware remains outside this stage.
+Loading still reads every retained segment and has no snapshot receipt index, so
+start-up time remains proportional to retained history even after pruning (S4.3).
 
 ### S5 — RPC security and method gaps (Track B)
 

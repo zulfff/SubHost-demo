@@ -70,6 +70,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **Appending to a truncated committed segment could commit an unreadable head.**
+  The writer now refuses a segment shorter than the manifest's committed length
+  before resizing or appending it, preserving the damaged bytes and manifest for
+  recovery. Uncommitted tails are still ignored on load and replaced on retry.
+- **`subhost db migrate` reported success for corrupt segmented ledgers.**
+  A repeated migration now validates the authoritative manifest, snapshot and
+  retained segments before returning `AlreadySegmented`, including when a valid
+  legacy file remains after an interrupted upgrade.
 - **`accept_block` accepted peer blocks over the block gas limit
   (SUBHOST-2026-001).** The producer capped a block at `BLOCK_GAS_LIMIT` while
   selecting transactions, but the peer path added the same gas figures without
@@ -185,6 +193,13 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Storage crash recovery coverage and an offline backup/restore runbook.**
+  Eight new failure-path tests cover interrupted record headers and payloads,
+  failed snapshot writes, damaged orphan segments/snapshots, migration before and
+  after manifest commit, and the two false-success regressions. The existing
+  crash test now writes a new snapshot and checks state and receipts after retry.
+  `docs/operations/backup-restore.md` explains coherent backups, offline
+  validation, and recovery limits for committed corruption.
 - **Validator registry and producer key at bootstrap.** `Node::bootstrap` builds a
   `ValidatorRegistry` from `genesis.initial_validators` whenever the genesis has a
   validator set, and `RpcState::with_validators` enables peer-block verification
