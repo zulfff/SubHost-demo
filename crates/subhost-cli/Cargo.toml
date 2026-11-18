@@ -15,15 +15,23 @@ workspace = true
 name = "subhost"
 path = "src/main.rs"
 
+[[example]]
+name = "sync-relay"
+path = "examples/sync-relay.rs"
+test = true
+
 [dependencies]
 subhost-core = { workspace = true }
+subhost-consensus = { workspace = true }
 subhost-crypto = { workspace = true }
+subhost-network = { workspace = true }
 subhost-node = { workspace = true }
 subhost-rpc = { workspace = true }
 subhost-storage = { workspace = true }
 subhost-telemetry = { workspace = true }
 subhost-wallet = { workspace = true }
 anyhow = { workspace = true }
+bincode = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
@@ -34,5 +42,8 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+ark-bls12-381 = { workspace = true }
+ark-ff = { workspace = true }
+sha3 = { workspace = true }
 subhost-wallet = { workspace = true }
 tempfile = { workspace = true }

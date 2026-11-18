@@ -201,6 +201,22 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Corrected BLS authentication for the testnet.** RFC 9380 G2 hashing replaces
+  the scalar-hash construction that allowed arbitrary signatures to be rescaled
+  from public possession proofs. Official curve vectors and direct forgery
+  regressions cover the suite; the relay also rejects manufactured historical
+  quorum evidence. Upgrade with fresh genesis proofs, preserve legacy data and
+  do not enable a legacy verifier. Phased timeout/leader consensus remains
+  separate from this corrected stable-API prototype.
+
+- **Automatic certified-history replay.** The optional `sync-relay` Platform
+  example records genesis-bound, checksummed block/QC pairs after quorum and
+  full execution validation, then replays them over existing P2P for fresh or
+  offline nodes. It has exclusive-writer locking, atomic synced records, bounded
+  future buffering and a configurable byte cap. Redundant archives preserve
+  history across relay downtime. Native range requests and history pruning are
+  separate work; see `docs/operations/certified-sync.md` and ADR-006.
+
 - **Bounded atomic mempool snapshot API.** `subhost_mempool::MempoolStore` loads
   and persists chain/genesis-bound `mempool.bin` snapshots, validates signed
   transfers and duplicate nonce slots, and caps file/record/count sizes. Writes
@@ -208,6 +224,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   restart tests cover malformed data and interrupted filesystem writes. Node/RPC
   admission and CLI consumers remain S6.1b; the API alone does not make bundled
   node admissions durable. See `docs/operations/mempool-persistence.md`.
+
 - **Recoverable four-validator local testnet.** A node-local, checksummed voting
   journal saves open proposals, verified votes and the latest QC before votes
   are published. Prepared commit intents reconcile interruption before/after

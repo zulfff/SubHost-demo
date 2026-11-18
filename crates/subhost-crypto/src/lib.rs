@@ -3,11 +3,14 @@
 //!
 //! # Security scope
 //!
-//! - `hash_to_g2` is a domain-separated hash-and-multiply, **not** a standards
-//!   compliant hash-to-curve suite (RFC 9380). It is deterministic, domain
-//!   separated, and lands in the prime-order subgroup, which is enough for the
-//!   protocol's internal use. Interoperating with another BLS implementation
-//!   requires replacing it.
+//! - BLS signatures use RFC 9380's `BLS12381G2_XMD:SHA-256_SSWU_RO_`
+//!   random-oracle mapping with the proof-of-possession signature suite's DST.
+//!   The previous hash-and-multiply construction allowed signatures to be
+//!   rescaled across messages and is deliberately not accepted. Existing genesis
+//!   proofs and signed consensus data must be regenerated for this suite.
+//! - Compressed G1/G2 points use the BLS/Zcash encoding; producer secrets retain
+//!   this repository's canonical little-endian scalar format. Arkworks scalar
+//!   arithmetic is not claimed to be a constant-time signing implementation.
 //! - Aggregate verification over a *shared* message is only safe when every
 //!   participant's key carries a verified proof of possession; see
 //!   [`BLSScheme::proof_of_possession`]. Proofs of possession are hashed under
@@ -17,20 +20,27 @@
 //!   key cannot force a predictable secret.
 
 use ark_bls12_381::{Fr as Scalar, G1Projective, G2Projective};
-use ark_ec::{pairing::Pairing, PrimeGroup};
+use ark_ec::{
+    hashing::{curve_maps::wb::WBMap, map_to_curve_hasher::MapToCurveBasedHasher, HashToCurve},
+    pairing::Pairing,
+    AffineRepr, CurveGroup, PrimeGroup,
+};
+use ark_ff::field_hashers::DefaultFieldHasher;
 use ark_ff::{Field, PrimeField, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use sha2::Sha256;
+use std::collections::HashSet;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Domain separation tag for protocol BLS signatures.
-const BLS_DOMAIN: &[u8] = b"subhost-bls-01";
+const BLS_DOMAIN: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 /// Domain separation tag for proofs of possession.
 ///
 /// A proof must not double as a protocol signature over the encoded public key,
 /// so it is hashed under its own tag rather than [`BLS_DOMAIN`].
-const BLS_POP_DOMAIN: &[u8] = b"subhost-bls-pop-01";
+const BLS_POP_DOMAIN: &[u8] = b"BLS_POP_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 /// ChaCha20-Poly1305 nonce length.
 const AEAD_NONCE_BYTES: usize = 12;
 
@@ -78,7 +88,7 @@ impl BLSScheme {
 
     /// Verify one signature, rejecting identity keys and identity signatures.
     pub fn verify(public: &PublicKey, message: &[u8], signature: &Signature) -> bool {
-        if public.is_zero() || signature.is_zero() {
+        if !Self::valid_public_key(public) || !Self::valid_signature(signature) {
             return false;
         }
         let message_point = Self::hash_to_g2(message);
@@ -100,9 +110,15 @@ impl BLSScheme {
     pub fn verify_aggregate(keys: &[PublicKey], messages: &[&[u8]], aggregate: &Signature) -> bool {
         if keys.is_empty()
             || keys.len() != messages.len()
-            || aggregate.is_zero()
-            || keys.iter().any(PublicKey::is_zero)
+            || !Self::valid_signature(aggregate)
+            || keys.iter().any(|key| !Self::valid_public_key(key))
         {
+            return false;
+        }
+        let mut distinct = HashSet::with_capacity(messages.len());
+        if messages.iter().any(|message| !distinct.insert(*message)) {
+            // Without possession-verified keys, duplicate messages would reduce
+            // this operation to the shared-message rogue-key attack.
             return false;
         }
 
@@ -124,7 +140,10 @@ impl BLSScheme {
         message: &[u8],
         aggregate: &Signature,
     ) -> bool {
-        if keys.is_empty() || aggregate.is_zero() || keys.iter().any(PublicKey::is_zero) {
+        if keys.is_empty()
+            || !Self::valid_signature(aggregate)
+            || keys.iter().any(|key| !Self::valid_public_key(key))
+        {
             return false;
         }
         Self::verify(&Self::aggregate_public_keys(keys), message, aggregate)
@@ -143,7 +162,7 @@ impl BLSScheme {
 
     /// Verify a proof of possession against the key it claims to bind.
     pub fn verify_possession(public: &PublicKey, proof: &Signature) -> bool {
-        if public.is_zero() || proof.is_zero() {
+        if !Self::valid_public_key(public) || !Self::valid_signature(proof) {
             return false;
         }
         let message_point =
@@ -221,24 +240,43 @@ impl BLSScheme {
         Some(PrivateKey(scalar))
     }
 
-    /// Domain-separated hash onto the prime-order G2 subgroup.
-    ///
-    /// See the module docs: this is hash-and-multiply, not RFC 9380 hash-to-curve.
+    fn valid_public_key(public: &PublicKey) -> bool {
+        let affine = public.into_affine();
+        !affine.is_zero()
+            && affine.is_on_curve()
+            && affine.is_in_correct_subgroup_assuming_on_curve()
+    }
+
+    fn valid_signature(signature: &Signature) -> bool {
+        let affine = signature.into_affine();
+        !affine.is_zero()
+            && affine.is_on_curve()
+            && affine.is_in_correct_subgroup_assuming_on_curve()
+    }
+
+    /// RFC 9380 random-oracle hash onto the prime-order G2 subgroup.
     fn hash_to_g2(message: &[u8]) -> G2Projective {
         Self::hash_to_g2_in_domain(BLS_DOMAIN, message)
     }
 
-    /// Hash under an explicit domain tag.
+    /// Expand with SHA-256/XMD, map two Fq2 elements with SSWU/isogeny, add
+    /// them and clear the cofactor. Both protocol and PoP DSTs are fixed.
     fn hash_to_g2_in_domain(domain: &[u8], message: &[u8]) -> G2Projective {
-        use sha3::{Digest, Sha3_384};
-        let mut hasher = Sha3_384::new();
-        hasher.update(domain);
-        // Length-prefix the message so no two distinct inputs share a digest.
-        hasher.update((message.len() as u64).to_be_bytes());
-        hasher.update(message);
-        G2Projective::generator() * Scalar::from_le_bytes_mod_order(&hasher.finalize())
+        type G2Hasher = MapToCurveBasedHasher<
+            G2Projective,
+            DefaultFieldHasher<Sha256, 128>,
+            WBMap<ark_bls12_381::g2::Config>,
+        >;
+        G2Hasher::new(domain)
+            .expect("fixed BLS12-381 hash-to-curve parameters are valid")
+            .hash(message)
+            .expect("the RFC 9380 BLS12-381 map accepts every message")
+            .into_group()
     }
 }
+
+#[cfg(test)]
+mod hash_to_curve_tests;
 
 /// ChaCha20-Poly1305 authenticated encryption.
 ///
@@ -403,6 +441,45 @@ mod tests {
     }
 
     #[test]
+    fn a_public_proof_cannot_be_rescaled_into_a_protocol_signature() {
+        use sha3::{Digest, Sha3_384};
+
+        fn legacy_scalar(domain: &[u8], message: &[u8]) -> Scalar {
+            let mut hash = Sha3_384::new();
+            hash.update(domain);
+            hash.update((message.len() as u64).to_be_bytes());
+            hash.update(message);
+            Scalar::from_le_bytes_mod_order(&hash.finalize())
+        }
+
+        let (secret, public) = BLSScheme::keygen();
+        let encoded = BLSScheme::encode_public_key(&public);
+        let proof = BLSScheme::proof_of_possession(&secret);
+        let message = b"forge a quorum vote using only public genesis data";
+        let proof_scalar = legacy_scalar(b"subhost-bls-pop-01", &encoded);
+        let message_scalar = legacy_scalar(b"subhost-bls-01", message);
+        let legacy_proof = G2Projective::generator() * (secret.0 * proof_scalar);
+        let legacy_signature = G2Projective::generator() * (secret.0 * message_scalar);
+        // Both scalars and the proof are public. Under hash-and-multiply,
+        // cancelling the proof scalar exposes secret*G2 and signs any message.
+        let ratio = message_scalar * proof_scalar.inverse().unwrap();
+        let legacy_forged = legacy_proof * ratio;
+        assert_eq!(
+            ark_bls12_381::Bls12_381::pairing(public, G2Projective::generator() * message_scalar),
+            ark_bls12_381::Bls12_381::pairing(G1Projective::generator(), legacy_forged),
+            "public proof rescaling satisfied the previous verifier"
+        );
+        assert!(!BLSScheme::verify_possession(&public, &legacy_proof));
+        assert!(!BLSScheme::verify(&public, message, &legacy_signature));
+        assert!(!BLSScheme::verify(&public, message, &legacy_forged));
+        let forged = proof * ratio;
+        assert!(
+            !BLSScheme::verify(&public, message, &forged),
+            "a public possession proof must not authorize an arbitrary vote"
+        );
+    }
+
+    #[test]
     fn possession_proofs_use_their_own_domain() {
         let (secret, public) = BLSScheme::keygen();
         let mut encoded = Vec::new();
@@ -492,6 +569,15 @@ mod tests {
         // Mismatched lengths and empty input are refused.
         assert!(!BLSScheme::verify_aggregate(&[public_one], &[first, second], &aggregate));
         assert!(!BLSScheme::verify_aggregate(&[], &[], &Signature::zero()));
+        let repeated = BLSScheme::aggregate_signatures(&[
+            BLSScheme::sign(&secret_one, first),
+            BLSScheme::sign(&secret_two, first),
+        ]);
+        assert!(!BLSScheme::verify_aggregate(
+            &[public_one, public_two],
+            &[first, first],
+            &repeated
+        ));
     }
 
     #[test]
@@ -532,8 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_to_g2_is_domain_separated_and_length_prefixed() {
-        // Concatenation ambiguity must not collide: ("ab", "c") vs ("a", "bc").
+    fn hash_to_g2_binds_the_exact_message() {
         let (secret, public) = BLSScheme::keygen();
         let first = BLSScheme::sign(&secret, b"abc");
         assert!(BLSScheme::verify(&public, b"abc", &first));

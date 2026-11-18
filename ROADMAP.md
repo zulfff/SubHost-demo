@@ -125,7 +125,7 @@ agent always sees the real state.
 | S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
 | S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
 | S2 | Wire the consensus driver into the node | A | S1 | L | Partial: QC API, durable rounds, local testnet/P2P; timeout/CLI pending |
-| S3 | Fork choice, reorg, and block sync | A | S2 | L | Planned |
+| S3 | Fork choice, reorg, and block sync | A | S2 | L | Platform certified-history relay available; native protocol/fork choice/reorg pending |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented |
 | S6 | Durable mempool and fee market | B | S0 | M | S6.1a snapshot API in review; node/RPC consumers pending |
@@ -264,6 +264,20 @@ the chain alone once a validator set is configured.
 - Receipts and state are rebuilt from that ancestor; the ledger append is atomic.
 
 **S3.3 Sync protocol** (`subhost-network`, `subhost-node`)
+
+Platform consumer slice (Track B, ADR-006): the optional CLI `sync-relay`
+records and revalidates full block/QC history from genesis and automatically
+rebroadcasts it in bounded ascending messages. Fresh and offline nodes apply
+the history through the existing QC/journal path; real P2P backfill covers 100
+blocks. This does not complete native range request/response sync, QC-aware
+ledger pruning, fork choice, reorg, timeout/view change or leader rotation.
+Redundant archives must retain QCs from the first block; reaching the configured
+archive byte cap stops ingestion. See `docs/operations/certified-sync.md`.
+The stable prototype requires corrected RFC 9380 BLS, official-vector and
+public-PoP forgery rejection tests, and fresh genesis proofs; legacy signatures
+are refused. Its linear QC view/height rule is retained until the separately
+tested phased Protocol revision and coordinated archive upgrade are ready.
+
 - `GetBlocks { from, to }` / `Blocks { items }` messages with a hard item cap.
 - On startup and on a height gap, request the missing range; apply in order.
 - Do not serve blocks below the finalized height minus the retention window.
