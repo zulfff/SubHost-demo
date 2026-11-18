@@ -1,5 +1,8 @@
 //! JSON-RPC surface: parameter parsing, response shaping, and method routing.
 
+use crate::security::{
+    check_bind_policy, BindPolicyError, RpcGuardLayer, RpcSecurityConfig, SecurityError,
+};
 use crate::state::{RpcError, RpcState};
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use jsonrpsee::server::{BatchRequestConfig, RpcModule, Server, ServerHandle};
@@ -8,7 +11,7 @@ use subhost_core::{
     Address, Amount, Block, ChainId, Gas, Hash, Receipt, Transaction, TransactionSignature,
     TransactionType,
 };
-use tracing::{info, warn};
+use tracing::info;
 
 /// Largest JSON-RPC request body accepted.
 const MAX_REQUEST_BODY_BYTES: u32 = 256 * 1024;
@@ -237,18 +240,25 @@ fn transaction_from_params(
 pub struct RpcServerConfig {
     pub listen_addr: SocketAddr,
     pub max_connections: u32,
+    /// Authentication, rate limit and public-bind policy.
+    pub security: RpcSecurityConfig,
 }
 
 impl Default for RpcServerConfig {
     fn default() -> Self {
-        Self { listen_addr: SocketAddr::from(([127, 0, 0, 1], 8545)), max_connections: 1_000 }
+        Self {
+            listen_addr: SocketAddr::from(([127, 0, 0, 1], 8545)),
+            max_connections: 1_000,
+            security: RpcSecurityConfig::default(),
+        }
     }
 }
 
 /// The JSON-RPC server.
 ///
-/// The server has no authentication or TLS of its own: expose it on loopback, or
-/// behind a reverse proxy that terminates both.
+/// There is no TLS in the server itself: terminate TLS in a reverse proxy (see
+/// `docs/deployment.md`). Authentication and the rate limit are HTTP middleware
+/// and are configured through [`RpcServerConfig::security`].
 #[derive(Clone)]
 pub struct RpcServer {
     state: RpcState,
@@ -275,11 +285,17 @@ impl RpcServer {
         self,
         config: RpcServerConfig,
     ) -> Result<(SocketAddr, ServerHandle), RpcServeError> {
+        config.security.validate()?;
+        check_bind_policy(config.listen_addr, &config.security)?;
+
         let server = Server::builder()
             .max_connections(config.max_connections.max(1))
             .max_request_body_size(MAX_REQUEST_BODY_BYTES)
             .max_response_body_size(MAX_RESPONSE_BODY_BYTES)
             .set_batch_request_config(BatchRequestConfig::Limit(MAX_BATCH_REQUESTS))
+            .set_http_middleware(
+                tower::ServiceBuilder::new().layer(RpcGuardLayer::new(&config.security)),
+            )
             .build(config.listen_addr)
             .await
             .map_err(|source| RpcServeError::Bind { addr: config.listen_addr, source })?;
@@ -289,14 +305,13 @@ impl RpcServer {
             .map_err(|source| RpcServeError::Bind { addr: config.listen_addr, source })?;
         let handle = server.start(self.build_module()?);
 
-        if !addr.ip().is_loopback() {
-            warn!(
-                %addr,
-                "JSON-RPC is bound to a non-loopback address without authentication; \
-                 restrict access at the network layer"
-            );
-        }
-        info!(%addr, chain_id = self.state.chain_id(), "JSON-RPC server started");
+        info!(
+            %addr,
+            chain_id = self.state.chain_id(),
+            auth = config.security.auth_token.is_some(),
+            rate_limit_per_sec = config.security.rate_limit_per_sec,
+            "JSON-RPC server started"
+        );
         Ok((addr, handle))
     }
 
@@ -427,6 +442,12 @@ pub enum RpcServeError {
         source: std::io::Error,
     },
 
+    #[error(transparent)]
+    Security(#[from] SecurityError),
+
+    #[error(transparent)]
+    BindPolicy(#[from] BindPolicyError),
+
     #[error("cannot register JSON-RPC method: {0}")]
     Registration(#[from] jsonrpsee::core::RegisterMethodError),
 }
@@ -434,6 +455,7 @@ pub enum RpcServeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::SecretToken;
     use crate::test_support::{funded_state, signed_transfer, signing_key};
     use ed25519_dalek::Signer;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -459,6 +481,7 @@ mod tests {
             .start(RpcServerConfig {
                 listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                 max_connections: 16,
+                security: RpcSecurityConfig::default(),
             })
             .await
             .unwrap()
@@ -889,5 +912,221 @@ mod tests {
 
         handle.stop().unwrap();
         handle.stopped().await;
+    }
+
+    fn post_request(
+        addr: SocketAddr,
+        body: &serde_json::Value,
+        authorization: Option<&str>,
+        connection: &str,
+    ) -> String {
+        let payload = body.to_string();
+        let auth = authorization
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n{auth}\
+             Content-Length: {}\r\nConnection: {connection}\r\n\r\n{payload}",
+            payload.len()
+        )
+    }
+
+    async fn raw_rpc(
+        addr: SocketAddr,
+        body: &serde_json::Value,
+        authorization: Option<&str>,
+    ) -> String {
+        let request = post_request(addr, body, authorization, "close");
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
+    }
+
+    /// Read one HTTP response with a `content-length` body, leaving the stream
+    /// usable for the next request.
+    async fn read_one_response(stream: &mut tokio::net::TcpStream) -> String {
+        let mut buffer = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "the server closed before a complete response");
+            buffer.extend_from_slice(&chunk[..read]);
+            let Some(head_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&buffer[..head_end]);
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buffer.len() >= head_end + 4 + length {
+                return String::from_utf8(buffer).unwrap();
+            }
+        }
+    }
+
+    fn status_of(response: &str) -> u16 {
+        response
+            .split_whitespace()
+            .nth(1)
+            .and_then(|status| status.parse().ok())
+            .unwrap_or_default()
+    }
+
+    fn body_of(response: &str) -> serde_json::Value {
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
+        serde_json::from_str(body).unwrap_or(serde_json::Value::Null)
+    }
+
+    fn send_params(key: &ed25519_dalek::SigningKey, nonce: u64) -> serde_json::Value {
+        let public_key = key.verifying_key().to_bytes();
+        let tx = signed_transfer(key, nonce, 10);
+        serde_json::json!({
+            "from": Address::from_public_key(&public_key).to_string(),
+            "to": Address::new([2; 20]).to_string(),
+            "value": "0xa",
+            "nonce": format!("0x{nonce:x}"),
+            "gasPrice": "0x1",
+            "gas": "0x5208",
+            "chainId": "0x1",
+            "data": "0x",
+            "publicKey": format!("0x{}", hex::encode(public_key)),
+            "signature": format!("0x{}", hex::encode(tx.signature.to_ed25519())),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_configured_token_is_required_on_every_request() {
+        let token = SecretToken::new("0123456789abcdef").unwrap();
+        let (addr, handle) = RpcServer::new(funded_state(&signing_key(3), 1_000))
+            .start(RpcServerConfig {
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                max_connections: 16,
+                security: RpcSecurityConfig { auth_token: Some(token), ..Default::default() },
+            })
+            .await
+            .unwrap();
+        let chain_id = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": [],
+        });
+
+        let missing = raw_rpc(addr, &chain_id, None).await;
+        assert_eq!(status_of(&missing), 401);
+        assert!(missing.to_ascii_lowercase().contains("www-authenticate: bearer"));
+        assert_eq!(body_of(&missing)["error"]["code"], -32000);
+
+        let wrong = raw_rpc(addr, &chain_id, Some("fedcba9876543210")).await;
+        assert_eq!(status_of(&wrong), 401);
+        assert_eq!(body_of(&wrong)["error"]["code"], -32000);
+
+        let accepted = raw_rpc(addr, &chain_id, Some("0123456789abcdef")).await;
+        assert_eq!(status_of(&accepted), 200);
+        assert_eq!(body_of(&accepted)["result"], "0x1");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_caller_cannot_send_a_transaction() {
+        let key = signing_key(5);
+        let state = funded_state(&key, 100_000);
+        let probe = state.clone();
+        let (addr, handle) = RpcServer::new(state)
+            .start(RpcServerConfig {
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                max_connections: 16,
+                security: RpcSecurityConfig {
+                    auth_token: Some(SecretToken::new("0123456789abcdef").unwrap()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        let send = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_sendTransaction",
+            "params": [send_params(&key, 0)],
+        });
+
+        let refused = raw_rpc(addr, &send, None).await;
+        assert_eq!(status_of(&refused), 401);
+        assert_eq!(probe.pending_count(), 0, "nothing may reach the pool");
+        assert_eq!(probe.block_height(), 0, "nothing may be sealed");
+
+        let accepted = raw_rpc(addr, &send, Some("0123456789abcdef")).await;
+        assert_eq!(status_of(&accepted), 200);
+        assert!(body_of(&accepted)["result"].is_string());
+        assert_eq!(probe.block_height(), 1, "the authenticated call is accepted");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn the_rate_limit_is_per_connection_and_returns_retry_after() {
+        let (addr, handle) = RpcServer::new(funded_state(&signing_key(9), 1_000))
+            .start(RpcServerConfig {
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                max_connections: 16,
+                security: RpcSecurityConfig { rate_limit_per_sec: Some(1), ..Default::default() },
+            })
+            .await
+            .unwrap();
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "eth_chainId", "params": [],
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(post_request(addr, &request, None, "keep-alive").as_bytes())
+            .await
+            .unwrap();
+        let first = read_one_response(&mut stream).await;
+        assert_eq!(status_of(&first), 200);
+
+        stream.write_all(post_request(addr, &request, None, "close").as_bytes()).await.unwrap();
+        let second = read_one_response(&mut stream).await;
+        assert_eq!(status_of(&second), 429);
+        assert!(second.to_ascii_lowercase().contains("retry-after: 1"));
+        assert_eq!(body_of(&second)["error"]["code"], -32005);
+
+        // A fresh connection has its own bucket; it is not a global lockout.
+        let other = raw_rpc(addr, &request, None).await;
+        assert_eq!(status_of(&other), 200);
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn an_exposed_bind_needs_opt_in_and_a_token() {
+        let public =
+            RpcServerConfig { listen_addr: "0.0.0.0:0".parse().unwrap(), ..Default::default() };
+        let error =
+            RpcServer::new(funded_state(&signing_key(1), 1)).start(public).await.unwrap_err();
+        assert!(matches!(error, RpcServeError::BindPolicy(BindPolicyError::OptInRequired { .. })));
+
+        let opt_in_only = RpcServerConfig {
+            listen_addr: "0.0.0.0:0".parse().unwrap(),
+            security: RpcSecurityConfig { allow_public: true, ..Default::default() },
+            ..Default::default()
+        };
+        let error =
+            RpcServer::new(funded_state(&signing_key(1), 1)).start(opt_in_only).await.unwrap_err();
+        assert!(matches!(error, RpcServeError::BindPolicy(BindPolicyError::AuthRequired { .. })));
+
+        let zero_rate = RpcServerConfig {
+            security: RpcSecurityConfig { rate_limit_per_sec: Some(0), ..Default::default() },
+            ..Default::default()
+        };
+        let error =
+            RpcServer::new(funded_state(&signing_key(1), 1)).start(zero_rate).await.unwrap_err();
+        assert!(matches!(error, RpcServeError::Security(SecurityError::ZeroRateLimit)));
     }
 }

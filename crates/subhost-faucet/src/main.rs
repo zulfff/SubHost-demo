@@ -2,7 +2,8 @@
 //!
 //! Configuration comes from the environment so the same image works in a
 //! container and on a workstation. The wallet password is read from
-//! `SUBHOST_FAUCET_PASSWORD` and never appears in a log line or a response.
+//! `SUBHOST_FAUCET_PASSWORD` and never appears in a log line or a response. An
+//! authenticated node is configured through `SUBHOST_RPC_AUTH_TOKEN_FILE`.
 
 use std::path::PathBuf;
 use subhost_faucet::{FaucetConfig, FaucetSigner, FaucetState};
@@ -29,6 +30,7 @@ fn config_from_env() -> anyhow::Result<FaucetConfig> {
         wallet_path: std::env::var("FAUCET_WALLET_PATH")
             .map(PathBuf::from)
             .unwrap_or(defaults.wallet_path),
+        rpc_auth_token_file: std::env::var("SUBHOST_RPC_AUTH_TOKEN_FILE").ok().map(PathBuf::from),
         drip_amount: parse_env("FAUCET_DRIP_AMOUNT", defaults.drip_amount)?,
         cooldown_secs: parse_env("FAUCET_COOLDOWN_SECS", defaults.cooldown_secs)?,
     })

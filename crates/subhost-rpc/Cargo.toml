@@ -20,6 +20,11 @@ subhost-state = { workspace = true }
 subhost-storage = { workspace = true }
 ed25519-dalek = { workspace = true }
 jsonrpsee = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
+blake3 = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }

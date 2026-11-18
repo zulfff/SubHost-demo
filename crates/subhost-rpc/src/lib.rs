@@ -19,11 +19,15 @@
 //! - The whole submit path holds one commit lock, and state is only swapped in
 //!   after the ledger write succeeds, so a failed persist cannot leave the
 //!   in-memory ledger ahead of disk.
-//! - The server binds without authentication; it is intended for a loopback or
-//!   otherwise access-controlled interface, never a public one.
+//! - The loopback bind is the default and a non-loopback bind is refused unless
+//!   `--rpc-allow-public` and a bearer token are both configured. With a token,
+//!   every HTTP request must carry `Authorization: Bearer <token>` (constant-time
+//!   check); a configured rate limit is a token bucket per connection. TLS is not
+//!   served in process - see `docs/deployment.md` for the reverse-proxy mode.
 
 mod block;
 mod methods;
+mod security;
 mod state;
 
 #[cfg(test)]
@@ -31,4 +35,7 @@ mod test_support;
 
 pub use block::BlockAuthority;
 pub use methods::{RpcServeError, RpcServer, RpcServerConfig};
+pub use security::{
+    BindPolicyError, RpcSecurityConfig, SecretToken, SecurityError, TokenError, MIN_TOKEN_BYTES,
+};
 pub use state::{BlockEvent, RpcError, RpcState};

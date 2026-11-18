@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use subhost_core::{encode_canonical, Block, BlockHeight, ChainId, GenesisConfig};
 use subhost_metrics::{Metrics, MetricsConfig};
 use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessage};
-use subhost_rpc::{BlockEvent, RpcServer, RpcServerConfig, RpcState};
+use subhost_rpc::{BlockEvent, RpcSecurityConfig, RpcServer, RpcServerConfig, RpcState};
 use subhost_storage::LedgerStore;
 use tracing::{debug, info, warn};
 
@@ -37,6 +37,8 @@ pub struct NodeConfig {
     pub rpc_addr: SocketAddr,
     /// Maximum concurrent JSON-RPC connections.
     pub max_rpc_connections: u32,
+    /// Authentication, rate limit and public-bind policy for JSON-RPC.
+    pub rpc_security: RpcSecurityConfig,
     /// Optional Prometheus exporter address.
     pub metrics_addr: Option<SocketAddr>,
     /// Whether this node intends to validate, which requires a validator set.
@@ -54,6 +56,7 @@ impl NodeConfig {
             data_dir: data_dir.into(),
             rpc_addr: SocketAddr::from(([127, 0, 0, 1], 8545)),
             max_rpc_connections: 1_000,
+            rpc_security: RpcSecurityConfig::default(),
             metrics_addr: None,
             validator: false,
             fallback_chain_id: 1,
@@ -157,6 +160,7 @@ impl Node {
         let rpc_config = RpcServerConfig {
             listen_addr: self.config.rpc_addr,
             max_connections: self.config.max_rpc_connections,
+            security: self.config.rpc_security.clone(),
         };
         info!(
             chain_id = self.chain_id(),

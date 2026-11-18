@@ -3860,6 +3860,7 @@ dependencies = [
  "serde_json",
  "subhost-core",
  "subhost-node",
+ "subhost-rpc",
  "subhost-storage",
  "subhost-telemetry",
  "subhost-wallet",
@@ -3924,6 +3925,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subhost-core",
+ "subhost-rpc",
  "subhost-telemetry",
  "subhost-wallet",
  "tempfile",
@@ -3946,6 +3948,7 @@ dependencies = [
  "serde",
  "serde_json",
  "subhost-core",
+ "subhost-rpc",
  "subhost-telemetry",
  "subhost-wallet",
  "tempfile",
@@ -4021,8 +4024,10 @@ dependencies = [
 name = "subhost-rpc"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "ed25519-dalek",
  "hex",
+ "http",
  "jsonrpsee",
  "serde",
  "serde_json",
@@ -4032,10 +4037,13 @@ dependencies = [
  "subhost-mempool",
  "subhost-state",
  "subhost-storage",
+ "subtle",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tower 0.4.13",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
