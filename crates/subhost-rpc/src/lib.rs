@@ -28,6 +28,7 @@
 
 mod block;
 mod methods;
+mod observability;
 mod security;
 mod state;
 

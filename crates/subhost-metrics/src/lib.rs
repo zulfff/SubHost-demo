@@ -8,7 +8,9 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use prometheus::{Counter, Encoder, Gauge, Histogram, HistogramOpts, Registry, TextEncoder};
+use prometheus::{
+    CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -32,9 +34,9 @@ impl Default for MetricsConfig {
 #[derive(Clone)]
 pub struct Metrics {
     registry: Arc<Registry>,
-    rpc_requests: Counter,
-    rpc_errors: Counter,
-    rpc_latency: Histogram,
+    rpc_requests: CounterVec,
+    rpc_errors: CounterVec,
+    rpc_latency: HistogramVec,
     connected_peers: Gauge,
     block_height: Gauge,
     pending_transactions: Gauge,
@@ -45,20 +47,31 @@ impl Metrics {
     pub fn new() -> Result<Self, MetricsError> {
         let registry = Registry::new();
 
-        let rpc_requests =
-            Counter::new("subhost_rpc_requests_total", "Total number of JSON-RPC requests served")?;
-        let rpc_errors = Counter::new(
-            "subhost_rpc_errors_total",
-            "Total number of JSON-RPC requests that returned an error",
+        let rpc_requests = CounterVec::new(
+            Opts::new("subhost_rpc_requests_total", "Total number of completed JSON-RPC calls"),
+            &["method"],
         )?;
-        let rpc_latency = Histogram::with_opts(
+        let rpc_errors = CounterVec::new(
+            Opts::new(
+                "subhost_rpc_errors_total",
+                "Total number of JSON-RPC calls that returned an error",
+            ),
+            &["method"],
+        )?;
+        let rpc_latency = HistogramVec::new(
             HistogramOpts::new(
                 "subhost_rpc_request_duration_seconds",
                 "JSON-RPC request duration in seconds",
             )
             // 1ms to ~16s, which spans a healthy call and a pathological one.
             .buckets(prometheus::exponential_buckets(0.001, 2.0, 15)?),
+            &["method"],
         )?;
+        // Keep a zero-valued series for legacy recording without a method, and
+        // keep these metric families visible before the first call completes.
+        rpc_requests.with_label_values(&["unattributed"]);
+        rpc_errors.with_label_values(&["unattributed"]);
+        rpc_latency.with_label_values(&["unattributed"]);
         let connected_peers =
             Gauge::new("subhost_connected_peers", "Number of currently connected libp2p peers")?;
         let block_height =
@@ -90,18 +103,32 @@ impl Metrics {
         &self.registry
     }
 
-    /// Record a served request and its duration.
+    /// Record a served request without a method, using `unattributed`.
     pub fn record_request(&self, duration_secs: f64) {
-        self.rpc_requests.inc();
+        self.record_rpc_result("unattributed", duration_secs, false);
+    }
+
+    /// Record one completed RPC call using a bounded method name.
+    ///
+    /// Callers must use registered method names or a fixed fallback such as
+    /// `unknown`. Never create labels from caller input. The static lifetime
+    /// allows middleware to use names supplied by the server's method registry.
+    pub fn record_rpc_result(&self, method: &'static str, duration_secs: f64, is_error: bool) {
+        self.rpc_requests.with_label_values(&[method]).inc();
+        let errors = self.rpc_errors.with_label_values(&[method]);
         // A negative or non-finite duration would corrupt the histogram.
         if duration_secs.is_finite() && duration_secs >= 0.0 {
-            self.rpc_latency.observe(duration_secs);
+            self.rpc_latency.with_label_values(&[method]).observe(duration_secs);
+        }
+        if is_error {
+            errors.inc();
         }
     }
 
-    /// Record a request that failed. Errors are also counted as requests.
+    /// Record an unattributed error. Also call [`Self::record_request`] to count
+    /// its request and duration, or use [`Self::record_rpc_result`] for both.
     pub fn record_error(&self) {
-        self.rpc_errors.inc();
+        self.rpc_errors.with_label_values(&["unattributed"]).inc();
     }
 
     pub fn set_connected_peers(&self, count: usize) {
@@ -222,12 +249,13 @@ mod tests {
         metrics.set_pending_transactions(7);
 
         let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
-        assert!(rendered.contains("subhost_rpc_requests_total 2"));
-        assert!(rendered.contains("subhost_rpc_errors_total 1"));
+        assert!(rendered.contains("subhost_rpc_requests_total{method=\"unattributed\"} 2"));
+        assert!(rendered.contains("subhost_rpc_errors_total{method=\"unattributed\"} 1"));
         assert!(rendered.contains("subhost_block_height 42"));
         assert!(rendered.contains("subhost_connected_peers 3"));
         assert!(rendered.contains("subhost_pending_transactions 7"));
-        assert!(rendered.contains("subhost_rpc_request_duration_seconds_count 2"));
+        assert!(rendered
+            .contains("subhost_rpc_request_duration_seconds_count{method=\"unattributed\"} 2"));
     }
 
     #[test]
@@ -239,9 +267,45 @@ mod tests {
 
         let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
         // All three still count as requests, none pollutes the histogram.
-        assert!(rendered.contains("subhost_rpc_requests_total 3"));
-        assert!(rendered.contains("subhost_rpc_request_duration_seconds_count 0"));
-        assert!(rendered.contains("subhost_rpc_request_duration_seconds_sum 0"));
+        assert!(rendered.contains("subhost_rpc_requests_total{method=\"unattributed\"} 3"));
+        assert!(rendered
+            .contains("subhost_rpc_request_duration_seconds_count{method=\"unattributed\"} 0"));
+        assert!(rendered
+            .contains("subhost_rpc_request_duration_seconds_sum{method=\"unattributed\"} 0"));
+    }
+
+    #[test]
+    fn method_results_count_errors_once_and_share_the_registry() {
+        let metrics = Metrics::new().unwrap();
+        let recorder = metrics.clone();
+        recorder.record_rpc_result("eth_chainId", 0.25, false);
+        recorder.record_rpc_result("eth_getBalance", 0.5, true);
+        recorder.record_rpc_result("eth_getBalance", 0.75, false);
+
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_rpc_requests_total{method=\"eth_chainId\"} 1"));
+        assert!(rendered.contains("subhost_rpc_errors_total{method=\"eth_chainId\"} 0"));
+        assert!(rendered.contains("subhost_rpc_requests_total{method=\"eth_getBalance\"} 2"));
+        assert!(rendered.contains("subhost_rpc_errors_total{method=\"eth_getBalance\"} 1"));
+        assert!(rendered
+            .contains("subhost_rpc_request_duration_seconds_count{method=\"eth_getBalance\"} 2"));
+        assert!(rendered
+            .contains("subhost_rpc_request_duration_seconds_sum{method=\"eth_getBalance\"} 1.25"));
+    }
+
+    #[test]
+    fn invalid_method_durations_still_count_requests_and_errors() {
+        let metrics = Metrics::new().unwrap();
+        for duration in [f64::NAN, -1.0, f64::INFINITY] {
+            metrics.record_rpc_result("unknown", duration, true);
+        }
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_rpc_requests_total{method=\"unknown\"} 3"));
+        assert!(rendered.contains("subhost_rpc_errors_total{method=\"unknown\"} 3"));
+        // No latency sample is created for invalid durations.
+        assert!(
+            !rendered.contains("subhost_rpc_request_duration_seconds_count{method=\"unknown\"}")
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ subhost-core = { workspace = true }
 subhost-consensus = { workspace = true }
 subhost-crypto = { workspace = true }
 subhost-mempool = { workspace = true }
+subhost-metrics = { workspace = true }
 subhost-state = { workspace = true }
 subhost-storage = { workspace = true }
 ed25519-dalek = { workspace = true }
