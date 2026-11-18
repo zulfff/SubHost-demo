@@ -169,7 +169,7 @@ Served on the address given to `node --listen`.
 | `eth_getTransactionCount` | Next expected nonce. |
 | `eth_sendTransaction` | Signed transfers only. See below. |
 | `eth_getTransactionReceipt` | Real receipt, or `null`. |
-| `eth_getBlockByNumber` | Accepts `latest`, `earliest`, `pending`, or a hex height. |
+| `eth_getBlockByNumber` | Accepts `latest`, `earliest`, `pending`, or a hex height. `earliest` is the oldest retained block, and a pruned height is `null`. |
 | `eth_getTransactionByHash` | Committed transactions only. |
 | `eth_getProof` | Account inclusion proof against the latest state root. `storageProof` is always empty; absence cannot be proven. |
 

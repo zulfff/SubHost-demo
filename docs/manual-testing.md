@@ -303,7 +303,35 @@ prints `is already segmented; nothing to do`; a fresh directory prints `nothing 
 do` as well. If the legacy file is corrupt or an unknown version, the command
 fails and leaves the directory untouched.
 
-## 15. Clean up
+## 15. Optional: prune old segments
+
+Pruning drops the oldest `ledger/segments/` files and is only safe with the node
+stopped. It keeps the newest snapshot as the replay anchor:
+
+```bash
+subhost db prune --data-dir "$SUBHOST_TEST_DATA" --chain-id 1 --keep-segments 1
+```
+
+The command prints the new base height and how many segments it removed. After
+restarting the node:
+
+```bash
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":2,"method":"eth_getBlockByNumber","params":["earliest",false]}'
+curl -s http://127.0.0.1:8545 -H 'content-type: application/json' \
+  -d '{"jsonrpc":"2.0","id":3,"method":"eth_getBlockByNumber","params":["0x1",false]}'
+```
+
+`eth_blockNumber` is unchanged, `earliest` is the oldest retained block, and a
+pruned height answers `null`. A pruned transaction also answers `null`; there is no
+backfill, so do not prune a node you rely on as an archive. `--keep-segments 0` is
+refused, and so is a prune that would drop the block the snapshot anchors
+(`refusing to prune: the retained history would start at height …`); on refusal the
+directory is untouched.
+
+## 16. Clean up
 
 Stop the node with `Ctrl-C` first.
 

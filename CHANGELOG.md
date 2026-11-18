@@ -185,6 +185,19 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Segment pruning and height mapping.** `subhost db prune --keep-segments N`
+  drops the oldest `ledger/segments/NNNNNN.log` files and records the new
+  `base_height` in `ledger/manifest.json` (manifest version 2; version 1 is still
+  read as an unpruned ledger). The newest snapshot stays the replay anchor, so a
+  prune that would drop the block at the snapshot's own height is refused before
+  anything is written, and segment files are deleted only after the manifest no
+  longer names them. `RestoredLedger` now reports `base_height`, load validates
+  and replays the retained suffix instead of assuming heights start at 1, and the
+  RPC layer maps `blocks[n]` to `base_height + n + 1`: a pruned height is JSON
+  `null`, `earliest` is the oldest retained block, and `block_count()` still means
+  the retained count while `head_height()` is the tip. Covered by 12 new storage
+  tests and 2 RPC tests (prune, refusal, no-op, restart, persistence after prune,
+  v1 manifests, out-of-order segments, corruption after prune).
 - **Producer verification on accept.** With a configured authority,
   `accept_block` requires `header.validator` to be a registered validator and
   exactly one BLS signature from that validator over `Block::signing_payload()`,
@@ -200,7 +213,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   only the blocks after it with `State::apply_transaction`, so start-up executes
   at most one interval of transactions. Still outstanding and recorded in
   `ROADMAP.md`: segments are still read in full on start-up, the snapshot holds no
-  receipt index, and history is not pruned.
+  receipt index, and history is not pruned yet (`subhost db prune` lands in S4.3).
 - **Block signing on produce.** `RpcState::with_authority` attaches a
   `BlockAuthority`: the validator registry, the producer address, and its BLS
   secret. When one is configured, `seal_block` sets `header.validator` and attaches

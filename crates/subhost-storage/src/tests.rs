@@ -796,3 +796,240 @@ fn ephemeral_store_cannot_be_migrated() {
     let store = LedgerStore::ephemeral(1).unwrap();
     assert!(matches!(store.migrate(), Err(StorageError::Invalid(_))));
 }
+
+/// Persist one block at a time so the segment limit controls the file count.
+fn persist_each_block(store: &LedgerStore, height: u64, segment_bytes: u64, interval: u64) {
+    for prefix in 1..=height {
+        let (snapshot, _) = ledger(prefix);
+        store.persist_with_limits(&snapshot, segment_bytes, interval).unwrap();
+    }
+}
+
+fn segment_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir.join(LEDGER_DIR_NAME).join("segments"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".log"))
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn prune_drops_the_oldest_segments_and_loads_the_retained_suffix() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    // One segment per block, and a snapshot at every height.
+    persist_each_block(&store, 6, 1, 1);
+    assert_eq!(segment_names(dir.path()).len(), 6);
+
+    let outcome = store.prune(2).unwrap();
+    assert_eq!(
+        outcome,
+        PruneOutcome::Pruned { dropped_segments: 4, retained_segments: 2, base_height: 4 }
+    );
+    let names = segment_names(dir.path());
+    assert_eq!(names, vec!["000004.log", "000005.log"]);
+    assert!(snapshot_path(dir.path(), 6).is_file(), "the anchor snapshot must survive");
+
+    let value = manifest_value(dir.path());
+    assert_eq!(value["version"], 2);
+    assert_eq!(value["base_height"], 4);
+    assert_eq!(value["head_height"], 6);
+
+    let restored = store.load().unwrap();
+    assert_eq!(restored.base_height, 4);
+    assert_eq!(restored.height(), 6);
+    assert_eq!(restored.block_count(), 2);
+    assert_eq!(restored.blocks[0].header.height, 5);
+    assert_eq!(restored.receipts.len(), 2);
+    assert!(restored.receipts.iter().all(|receipt| receipt.block_height >= 5));
+}
+
+#[test]
+fn prune_replays_the_trailing_blocks_on_top_of_a_lagging_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    // Snapshots land at height 1 and then 5; the head is 6.
+    persist_each_block(&store, 6, 1, 4);
+    let value = manifest_value(dir.path());
+    assert_eq!(value["snapshot"]["height"], 5);
+
+    let outcome = store.prune(2).unwrap();
+    assert_eq!(
+        outcome,
+        PruneOutcome::Pruned { dropped_segments: 4, retained_segments: 2, base_height: 4 }
+    );
+
+    let restored = store.load().unwrap();
+    assert_eq!(restored.base_height, 4);
+    assert_eq!(restored.height(), 6);
+    assert_eq!(restored.blocks.iter().map(|b| b.header.height).collect::<Vec<_>>(), vec![5, 6]);
+}
+
+#[test]
+fn prune_refuses_to_drop_the_block_the_snapshot_anchors() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    // A large interval keeps the only snapshot at height 1.
+    persist_each_block(&store, 5, 1, 100);
+    let before = manifest_value(dir.path());
+
+    let error = store.prune(1).unwrap_err();
+    assert!(matches!(
+        error,
+        StorageError::PruneWouldDropSnapshot { first_retained_height: 5, snapshot_height: 1 }
+    ));
+    assert_eq!(manifest_value(dir.path()), before, "a refused prune must not write");
+    assert_eq!(segment_names(dir.path()).len(), 5, "no segment is deleted on refusal");
+}
+
+#[test]
+fn prune_is_a_no_op_when_the_ledger_already_keeps_that_many_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 3, 1, 1);
+    let before = manifest_value(dir.path());
+
+    assert_eq!(store.prune(3).unwrap(), PruneOutcome::NothingToPrune { segments: 3 });
+    assert_eq!(store.prune(10).unwrap(), PruneOutcome::NothingToPrune { segments: 3 });
+    assert_eq!(manifest_value(dir.path()), before);
+}
+
+#[test]
+fn prune_requires_at_least_one_segment() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 2, 1, 1);
+    assert!(matches!(store.prune(0), Err(StorageError::Invalid(_))));
+    assert_eq!(segment_names(dir.path()).len(), 2);
+
+    let ephemeral = LedgerStore::ephemeral(1).unwrap();
+    assert!(matches!(ephemeral.prune(1), Err(StorageError::Invalid(_))));
+
+    let empty_dir = tempfile::tempdir().unwrap();
+    let empty = open(empty_dir.path());
+    assert!(matches!(empty.prune(2), Err(StorageError::Invalid(_))));
+}
+
+#[test]
+fn persist_continues_from_the_retained_base_after_a_prune() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 4, 1, 1);
+    store.prune(2).unwrap();
+    let restored = store.load().unwrap();
+    assert_eq!(restored.base_height, 2);
+
+    // The node now holds blocks 3 and 4 only; it produces block 5.
+    let (full, _) = ledger(5);
+    let suffix = LedgerSnapshot {
+        chain_id: 1,
+        state: full.state,
+        blocks: full.blocks[2..].to_vec(),
+        receipts: full.receipts.into_iter().filter(|r| r.block_height >= 3).collect(),
+    };
+    store.persist(&suffix).unwrap();
+
+    let after = store.load().unwrap();
+    assert_eq!(after.base_height, 2);
+    assert_eq!(after.height(), 5);
+    assert_eq!(after.blocks[0].header.height, 3);
+    assert_eq!(after.blocks.len(), 3);
+    let value = manifest_value(dir.path());
+    assert_eq!(value["base_height"], 2);
+    assert_eq!(
+        value["segments"].as_array().unwrap().len(),
+        2,
+        "block 5 appends to the last segment"
+    );
+}
+
+#[test]
+fn a_pruned_store_rejects_a_full_history_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 4, 1, 1);
+    store.prune(2).unwrap();
+
+    // A caller that kept every block in memory must reload the suffix first.
+    let (full, _) = ledger(5);
+    assert!(matches!(store.persist(&full), Err(StorageError::Invalid(_))));
+    assert_eq!(store.load().unwrap().height(), 4);
+}
+
+#[test]
+fn a_version_one_manifest_still_loads_as_an_unpruned_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(2).0).unwrap();
+
+    let mut value = manifest_value(dir.path());
+    value["version"] = serde_json::json!(1);
+    value.as_object_mut().unwrap().remove("base_height");
+    write_manifest_value(dir.path(), &value);
+
+    let restored = store.load().unwrap();
+    assert_eq!(restored.base_height, 0);
+    assert_eq!(restored.height(), 2);
+}
+
+#[test]
+fn a_version_one_manifest_cannot_claim_pruned_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(2).0).unwrap();
+
+    let mut value = manifest_value(dir.path());
+    value["version"] = serde_json::json!(1);
+    value["base_height"] = serde_json::json!(1);
+    write_manifest_value(dir.path(), &value);
+    assert!(matches!(store.load(), Err(StorageError::Manifest(_))));
+}
+
+#[test]
+fn prune_keeps_the_snapshot_root_check_for_the_retained_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 5, 1, 1);
+    store.prune(2).unwrap();
+    assert_eq!(store.load().unwrap().base_height, 3);
+
+    // Replace the snapshot with one from a different state, and keep the
+    // manifest checksum consistent with it: the root must still match block 5.
+    let (other, _) = build(vec![vec![transfer(0)]]);
+    let checksum = segmented::overwrite_snapshot(dir.path(), 5, &other.state).unwrap();
+    let mut value = manifest_value(dir.path());
+    value["snapshot"]["checksum"] = serde_json::json!(checksum.to_string());
+    write_manifest_value(dir.path(), &value);
+
+    assert!(matches!(store.load(), Err(StorageError::Snapshot(_))));
+}
+
+#[test]
+fn a_manifest_with_out_of_order_segments_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 3, 1, 1);
+
+    let mut value = manifest_value(dir.path());
+    let segments = value["segments"].as_array_mut().unwrap();
+    segments.swap(1, 2);
+    write_manifest_value(dir.path(), &value);
+    assert!(matches!(store.load(), Err(StorageError::Manifest(_))));
+}
+
+#[test]
+fn a_pruned_segment_corruption_is_still_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 5, 1, 1);
+    store.prune(2).unwrap();
+
+    let path = segment_path(dir.path(), 4);
+    let mut bytes = fs::read(&path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    fs::write(&path, bytes).unwrap();
+    assert!(matches!(store.load(), Err(StorageError::ChecksumMismatch)));
+}
