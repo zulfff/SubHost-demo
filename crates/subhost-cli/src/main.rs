@@ -83,6 +83,14 @@ enum Commands {
         #[arg(long)]
         validator: bool,
 
+        /// Explicit unsigned single-writer demo mode; requires no genesis validators.
+        #[arg(long, conflicts_with = "validator")]
+        single_writer: bool,
+
+        /// Base consensus view timeout in milliseconds.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        view_timeout_ms: Option<u64>,
+
         /// Producer key file used to sign blocks. Defaults to
         /// `<data-dir>/producer.key`.
         #[arg(long, requires = "validator")]
@@ -354,6 +362,8 @@ fn main() -> Result<()> {
             }
             Commands::Node {
                 validator,
+                single_writer,
+                view_timeout_ms,
                 producer_key_file,
                 listen,
                 data_dir,
@@ -369,6 +379,8 @@ fn main() -> Result<()> {
             } => {
                 run_node(
                     validator,
+                    single_writer,
+                    view_timeout_ms,
                     producer_key_file,
                     listen,
                     data_dir,
@@ -640,6 +652,8 @@ fn load_or_create_producer_key(path: &Path) -> Result<PrivateKey> {
 #[allow(clippy::too_many_arguments)]
 async fn run_node(
     validator: bool,
+    single_writer: bool,
+    view_timeout_ms: Option<u64>,
     producer_key_file: Option<PathBuf>,
     listen: String,
     data_dir: Option<PathBuf>,
@@ -685,10 +699,38 @@ async fn run_node(
     config.rpc_security = rpc_security;
     config.metrics_addr = metrics_addr;
     config.validator = validator;
+    config.single_writer = single_writer;
+    if let Some(timeout) = view_timeout_ms {
+        config.view_timeout_ms = timeout;
+    }
     config.producer_key_file = producer_key_file;
     config.network = network;
+    validate_node_policy(&config)?;
     let node = Node::bootstrap(config)?;
     node.run().await?;
+    Ok(())
+}
+
+/// Reject ambiguous CLI modes before the node touches its ledger or journal.
+fn validate_node_policy(config: &NodeConfig) -> Result<()> {
+    if config.view_timeout_ms == 0 {
+        bail!("--view-timeout-ms must be positive");
+    }
+    let path = config.genesis_path();
+    let has_validators = if path.is_file() {
+        !GenesisConfig::load(&path)?.initial_validators.is_empty()
+    } else {
+        false
+    };
+    if config.single_writer && (config.validator || has_validators) {
+        bail!("--single-writer is incompatible with validator mode or a genesis validator set");
+    }
+    if config.validator && !has_validators {
+        bail!("--validator requires a genesis validator set");
+    }
+    if !config.single_writer && !has_validators {
+        bail!("an unsigned demo chain requires explicit --single-writer");
+    }
     Ok(())
 }
 
@@ -1148,6 +1190,64 @@ mod tests {
     }
 
     #[test]
+    fn node_policy_flags_reject_conflicts_and_nonpositive_timeouts() {
+        assert!(Cli::try_parse_from(["subhost", "node", "--validator", "--single-writer"]).is_err());
+        for timeout in ["0", "-1"] {
+            assert!(Cli::try_parse_from(["subhost", "node", "--view-timeout-ms", timeout]).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "subhost",
+            "node",
+            "--single-writer",
+            "--view-timeout-ms",
+            "5000",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Node { single_writer: true, view_timeout_ms: Some(5000), .. }
+        ));
+    }
+
+    #[test]
+    fn unsigned_mode_requires_explicit_selection_before_directory_creation() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("not-created");
+        let mut config = NodeConfig::new(&path);
+        assert!(validate_node_policy(&config).is_err());
+        assert!(!path.exists());
+        config.single_writer = true;
+        assert!(validate_node_policy(&config).is_ok());
+        assert!(!path.exists());
+        config.validator = true;
+        assert!(validate_node_policy(&config).is_err());
+        config.validator = false;
+        config.view_timeout_ms = 0;
+        assert!(validate_node_policy(&config).is_err());
+    }
+
+    #[test]
+    fn validator_genesis_cannot_select_unsigned_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let (secret, public) = BLSScheme::keygen();
+        let mut genesis = GenesisConfig::default();
+        genesis.initial_validators.push(ValidatorInfo {
+            address: Address::new([1; 20]),
+            public_key: BLSScheme::encode_public_key(&public),
+            power: 1,
+            proof_of_possession: BLSScheme::encode_signature(&BLSScheme::proof_of_possession(
+                &secret,
+            )),
+        });
+        genesis.save(&root.path().join("genesis.json")).unwrap();
+        let mut config = NodeConfig::new(root.path());
+        assert!(validate_node_policy(&config).is_ok());
+        config.single_writer = true;
+        assert!(validate_node_policy(&config).is_err());
+        assert!(!root.path().join("ledger").exists());
+    }
+
+    #[test]
     fn documented_commands_parse() {
         let invocations: &[&[&str]] = &[
             &[
@@ -1164,7 +1264,15 @@ mod tests {
                 "--producer-key-file",
                 "./data/producer.key",
             ],
-            &["subhost", "node", "--listen", "127.0.0.1:8545", "--data-dir", "./data"],
+            &[
+                "subhost",
+                "node",
+                "--single-writer",
+                "--listen",
+                "127.0.0.1:8545",
+                "--data-dir",
+                "./data",
+            ],
             &["subhost", "node", "--validator", "--metrics-addr", "127.0.0.1:9090"],
             &["subhost", "node", "--validator", "--producer-key-file", "./data/validator.key"],
             &[

@@ -17,6 +17,7 @@ services:
     command:
       - subhost
       - node
+      - --single-writer
       - --listen
       - 0.0.0.0:8545
       - --metrics-addr
