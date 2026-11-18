@@ -9,8 +9,8 @@
 //! ledger/segments/000000.log        framed `block + receipts` records
 //! ```
 //!
-//! A persist appends only the blocks that are new, fsyncs the segment, rewrites
-//! the (bounded) state snapshot, and finally replaces the manifest atomically.
+//! A persist appends only the blocks that are new, fsyncs the segment, writes
+//! a state snapshot when due, and finally replaces the manifest atomically.
 //! Bytes past the manifest's committed length are an interrupted append: they are
 //! ignored on load and truncated before the next append, so a torn tail can never
 //! prevent start-up from the last committed head.
@@ -843,7 +843,19 @@ impl<'a> Appender<'a> {
                     .write(true)
                     .open(&path)
                     .map_err(|source| StorageError::Io { path: path.clone(), source })?;
+                let actual_bytes = file
+                    .metadata()
+                    .map_err(|source| StorageError::Io { path: path.clone(), source })?
+                    .len();
+                if actual_bytes < last.bytes {
+                    return Err(StorageError::Segment(format!(
+                        "{} is {actual_bytes} bytes but the manifest commits {}",
+                        last.file, last.bytes
+                    )));
+                }
                 // Drop a torn append that the manifest never committed.
+                // Never extend a shortened committed file: set_len would pad
+                // missing data with zeroes and let an unreadable head commit.
                 file.set_len(last.bytes)
                     .map_err(|source| StorageError::Io { path: path.clone(), source })?;
                 file.seek(SeekFrom::End(0))

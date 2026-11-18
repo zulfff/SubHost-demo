@@ -300,8 +300,11 @@ It validates the whole version 2 file before writing anything, converts it to
 `ledger/manifest.json` plus `ledger/segments/`, re-reads the result and compares
 the head, and keeps the original as `node-state.bin.v2-backup`. Running it again
 prints `is already segmented; nothing to do`; a fresh directory prints `nothing to
-do` as well. If the legacy file is corrupt or an unknown version, the command
-fails and leaves the directory untouched.
+do` as well. An already-segmented ledger is validated before that success message;
+a corrupt manifest, snapshot or committed segment still fails. If the legacy file
+is corrupt or an unknown version, the command fails and leaves the directory
+untouched. For interrupted migrations and coherent backups, see the
+[backup/restore runbook](operations/backup-restore.md).
 
 ## 15. Optional: prune old segments
 

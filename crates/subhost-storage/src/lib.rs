@@ -250,9 +250,9 @@ impl LedgerStore {
     ///
     /// The legacy file is fully validated before anything is written, the
     /// migrated ledger is loaded back and compared with the legacy head, and the
-    /// original file is kept as `node-state.bin.v2-backup`. A second call is a
-    /// no-op once the manifest exists, so an interrupted run can simply be
-    /// repeated.
+    /// original file is kept as `node-state.bin.v2-backup`. A second call
+    /// validates the segmented ledger without rewriting it, so an interrupted
+    /// run can simply be repeated and committed damage is still reported.
     pub fn migrate(&self) -> Result<MigrationOutcome, StorageError> {
         let Some(path) = &self.path else {
             return Err(StorageError::Invalid(
@@ -261,6 +261,7 @@ impl LedgerStore {
         };
         let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
         if segmented::manifest_path(data_dir).is_file() {
+            self.load()?;
             return Ok(MigrationOutcome::AlreadySegmented);
         }
         if !path.is_file() {
