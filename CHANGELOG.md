@@ -245,6 +245,15 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **View-change safety regressions (S2.4b, Q-031).** Direct tests now cover the
+  phased view-change safety contract: same-view report equivocation is refused
+  and a lower report from the same signer is ignored; a peer report whose
+  prepared proof conflicts with the local lock at the same view is refused
+  without state change; timeout-certificate support bounds hold at 1 and 64
+  validators (n-f = 43, and more reports than registered validators is refused).
+  79 consensus tests, no protocol or wire change. ROADMAP S2.4/S2.4b wording is
+  corrected to the landed API.
+
 - **Fee-market core/state API and version-2 header codec (S6.2 step 1, ADR-010,
   contracts Q-017/Q-030).** Additive only: `subhost_core::fee` supplies
   `FeePolicy`/`FeeContext` with exact-floor base-fee updates (elasticity 2,

@@ -213,8 +213,8 @@ rejected by every other node; the ledger still replays.
 
 **Status:** the earlier QC admission/journal/reconnect slice is merged. Phased
 prepare/final-commit rounds, RFC 9380 BLS, authenticated leader rotation and
-explicit node demo policy are implemented on `s2/timeout-quorums`; fresh S2
-integration/liveness and full workspace/CI gates are still in progress. ADR-008
+explicit node demo policy are merged into `main` (ADR-008); the remaining
+assurance work is external (independent review, audit, 30-day soak). ADR-008
 records the protocol and incompatible suite/journal upgrade. The complete
 cross-track roadmap is authorized; Platform retains S4/S5/S6/S8/S9 and Track A
 continues native S3/S7, then execution/IBC after S3. Actual independent audit and
@@ -236,20 +236,31 @@ Platform CLI consumer (Q-014): `--single-writer` and optional positive
 `--view-timeout-ms` map to the published node configuration contract. CLI startup
 rejects unsigned mode unless explicitly selected and rejects unsigned selection
 for validator genesis before invoking node bootstrap. Demo scripts and the
-Compose command carry the explicit demo flag. Authoritative node policy,
-phased timeout behavior and the standard-BLS public rollout remain S2.4b work.
-The Compose stack still requires the documented authenticated non-loopback RPC
-configuration; container runtime verification is part of the release/deployment
-stage rather than this CLI consumer change.
+Compose command carry the explicit demo flag. Authoritative node policy, phased
+timeout behavior and the standard-BLS suite are landed (ADR-008); what remains is
+external assurance (independent protocol review, audit and the 30-day soak) and
+the public four-validator activation tracked in Q-012, not further S2.4b driver
+work. The Compose stack still requires the documented authenticated non-loopback
+RPC configuration; container runtime verification is part of the
+release/deployment stage rather than this CLI consumer change.
 
 - Rename the direct path to `commit_qc(block, qc)`; it verifies the QC before
   persisting. Remove the unauthenticated "submit and commit" path from validator
   mode, keep it behind an explicit `--single-writer` flag for demos/bench.
 
-**S2.4 Timeouts and view change** (`subhost-consensus/src/driver.rs`)
-- `tick(now)` returns `Timeout { view }` after `ConsensusConfig.view_timeout`.
-- `enter_next_view` on timeout, leader = sorted validators[(view - 1) % n], require n-f signed timeout reports and re-propose the highest prepared
-  block. Test with a validator that never votes.
+**S2.4 Timeouts and view change** (`subhost-consensus/src/driver.rs`) — landed
+- `tick(now)` returns `Some(ViewChange)` after the capped `view_timeout_ms`
+  deadline; a lone replica cannot run ahead of its peers (f+1 distinct
+  authenticated targets release it).
+- `enter_view` on timeout, leader = sorted validators[(view - 1) % n], require
+  n-f exact-target signed view-change reports and re-propose the highest prepared
+  block. A timeout never erases a prepared lock. Test with a validator that never
+  votes.
+- Safety regressions (Q-031): same-view report equivocation is refused and lower
+  reports from the same signer are ignored; a peer report carrying a prepared
+  proof that conflicts with the local lock at the same view is refused without
+  state change; timeout-certificate support bounds hold at 1 and 64 validators
+  (n-f = 43, and more reports than registered validators is refused).
 
 **S2.5 Tests**
 - 4-validator in-process happy path.

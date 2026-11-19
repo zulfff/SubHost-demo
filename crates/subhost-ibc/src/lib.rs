@@ -867,7 +867,7 @@ mod tests {
         assert_eq!(module.expected_recv_sequence("channel-1"), 2);
     }
 
-    // --- Commitment proof verification -------------------------------------
+    // Commitment proof verification helpers.
 
     fn counterparty_key(seed: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed; 32])
