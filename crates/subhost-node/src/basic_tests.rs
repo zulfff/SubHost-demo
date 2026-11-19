@@ -1502,3 +1502,20 @@ fn node_config_defaults_to_no_automatic_retention() {
     let configured = NodeConfig { retention_blocks: Some(50_000), ..test_config(dir.path()) };
     assert_eq!(configured.retention_blocks, Some(50_000));
 }
+
+#[test]
+fn bootstrap_ignores_a_stray_pending_file_without_an_attached_store() {
+    // `subhost-node` does not depend on the mempool crate; this mirrors
+    // `subhost_mempool::MEMPOOL_FILE_NAME`. No store is attached in production
+    // yet (Q-016 lands that consumer), so the bootstrap restore must be inert:
+    // it may not decode, rewrite or fail on a file it does not own.
+    const PENDING_FILE: &str = "mempool.bin";
+    let dir = tempfile::tempdir().unwrap();
+    let pending = dir.path().join(PENDING_FILE);
+    std::fs::write(&pending, b"not a snapshot").unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+
+    assert_eq!(node.state().pending_count(), 0);
+    assert_eq!(std::fs::read(&pending).unwrap(), b"not a snapshot");
+}
