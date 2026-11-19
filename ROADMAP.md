@@ -558,7 +558,7 @@ ledger repair, reorg investigation, incident checklist.
 | --- | --- |
 | S9.1 | RC/RPC-semver and tag consistency policy implemented; workspace remains 0.1.0 until reviewed version activation |
 | S9.2–S9.5 | Implemented on `s9/release-engineering`; local checks/CI review in progress |
-| S9.6 | Separate encrypted-keystore work under Q-018/ADR-011 |
+| S9.6 | Track B landed: `subhost-keystore` crate, `producer` CLI, init unlock consumer (Q-018/ADR-011); Track A bootstrap API + loader fixes pending after S6.2 |
 
 The pipeline prepares Linux x86_64 binaries, SBOMs, checksum/Sigstore artifacts
 and scanned signed OCI images after all seven CI gates. Candidate image scans
@@ -579,9 +579,15 @@ checksum manifest.
 **S9.5 Image hygiene** — non-root (already), read-only rootfs, image scan in CI.
 **S9.6 Encrypted producer keystore** — replace the plaintext 32-byte
 `producer.key` scalar from S1.4 with a password- or credential-store-wrapped
-keystore, and migrate an existing key file at start-up. Until then the file is
-`0600` and must be treated as the validator's identity: a copy is a copy of the
-right to produce blocks.
+keystore. Scope decision (ADR-011, Q-018): migration is an explicit CLI command
+(`subhost producer migrate`), not automatic at start-up — automatic
+passwordless migration is impossible; a startup migration option would need
+its own agreed decision. Track B landed the `subhost-keystore` crate, the
+`producer` CLI group and the init unlock consumer; Track A lands
+`Node::bootstrap_with_producer_key` plus the legacy loader symlink/non-Unix
+fixes under the same ADR, after which encrypted node start-up replaces the
+plaintext path. Until then the file is `0600` and must be treated as the
+validator's identity: a copy is a copy of the right to produce blocks.
 
 ### S10 — Execution layer (Track C, XL)
 

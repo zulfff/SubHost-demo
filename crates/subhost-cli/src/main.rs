@@ -15,6 +15,11 @@ use subhost_core::{
     ValidatorInfo,
 };
 use subhost_crypto::{BLSScheme, PrivateKey};
+use subhost_keystore::{
+    check_creation_password, is_keystore_contents, load_credential_file, read_bounded_owner_only,
+    read_encrypted_producer_key, read_public_key, write_encrypted_producer_key_new, DEFAULT_LOG_N,
+    KEYSTORE_FILE_NAME, MAX_KEYSTORE_FILE_BYTES,
+};
 use subhost_node::{
     read_producer_key, write_producer_key, Node, NodeConfig, P2pConfig, GENESIS_FILE_NAME,
     PRODUCER_KEY_FILE_NAME,
@@ -22,6 +27,7 @@ use subhost_node::{
 use subhost_storage::{LedgerStore, MigrationOutcome, PruneOutcome};
 use subhost_telemetry::{TelemetryConfig, Verbosity};
 use subhost_wallet::Wallet;
+use zeroize::Zeroizing;
 
 /// Largest wallet file the CLI will parse while scanning a directory.
 const MAX_WALLET_SCAN_BYTES: u64 = 1024 * 1024;
@@ -69,8 +75,17 @@ enum Commands {
 
         /// Producer key file used for validator proofs.
         /// Defaults to `<data-dir>/producer.key`, generated when missing.
+        /// An encrypted `producer.keystore.json` is unlocked instead when
+        /// `--producer-credential-file` is supplied.
         #[arg(long)]
         producer_key_file: Option<PathBuf>,
+
+        /// Owner-only credential file unlocking an encrypted producer keystore.
+        /// Required when the producer key file is a keystore; never a password
+        /// argument. With no key file present, init refuses rather than
+        /// generating one: create it first with `subhost producer create`.
+        #[arg(long)]
+        producer_credential_file: Option<PathBuf>,
 
         /// Overwrite an existing genesis file.
         #[arg(long)]
@@ -142,6 +157,12 @@ enum Commands {
     Wallet {
         #[command(subcommand)]
         cmd: WalletCommands,
+    },
+
+    /// Manage the encrypted BLS producer keystore (validator identity).
+    Producer {
+        #[command(subcommand)]
+        cmd: ProducerCommands,
     },
 
     /// Build, sign, and submit transactions.
@@ -230,6 +251,70 @@ enum WalletCommands {
 
         #[arg(short, long)]
         name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProducerCommands {
+    /// Generate a new producer key into an encrypted keystore.
+    ///
+    /// Refuses to replace an existing file. To encrypt an existing plaintext
+    /// `producer.key`, use `producer migrate` instead. The password is read
+    /// twice without echo, or taken from an owner-only `--credential-file`;
+    /// there is no password argument.
+    Create {
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Keystore destination. Defaults to `<data-dir>/producer.keystore.json`.
+        #[arg(long)]
+        keystore_file: Option<PathBuf>,
+
+        /// Owner-only file holding the password (one trailing LF/CRLF stripped).
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
+    },
+
+    /// Print a keystore's public key without unlocking it.
+    ///
+    /// Reads the authenticated header only; the tag is not verified until an
+    /// unlock, so this cannot distinguish a valid keystore from a corrupt one.
+    Inspect {
+        /// Keystore file to inspect.
+        path: PathBuf,
+    },
+
+    /// Verify a password unlocks the keystore; prints the public key only.
+    Unlock {
+        /// Keystore file to unlock.
+        path: PathBuf,
+
+        /// Owner-only file holding the password (one trailing LF/CRLF stripped).
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
+    },
+
+    /// Encrypt an existing plaintext `producer.key` into a new keystore.
+    ///
+    /// The source file is preserved on success and on every failure; removing
+    /// it later is an explicit operator action. The new file is decrypted and
+    /// compared against the source before success is reported. When a genesis
+    /// exists, the key must be one of its validators.
+    Migrate {
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Legacy plaintext key file. Defaults to `<data-dir>/producer.key`.
+        #[arg(long)]
+        producer_key_file: Option<PathBuf>,
+
+        /// Keystore destination. Defaults to `<data-dir>/producer.keystore.json`.
+        #[arg(long)]
+        keystore_file: Option<PathBuf>,
+
+        /// Owner-only file holding the new password (one trailing LF/CRLF stripped).
+        #[arg(long)]
+        credential_file: Option<PathBuf>,
     },
 }
 
@@ -356,10 +441,17 @@ fn main() -> Result<()> {
                 allocations,
                 validators,
                 producer_key_file,
+                producer_credential_file,
                 force,
-            } => {
-                init_genesis(chain_id, data_dir, allocations, validators, producer_key_file, force)
-            }
+            } => init_genesis(
+                chain_id,
+                data_dir,
+                allocations,
+                validators,
+                producer_key_file,
+                producer_credential_file,
+                force,
+            ),
             Commands::Node {
                 validator,
                 single_writer,
@@ -397,6 +489,7 @@ fn main() -> Result<()> {
                 .await
             }
             Commands::Wallet { cmd } => handle_wallet(cmd),
+            Commands::Producer { cmd } => handle_producer(cmd),
             Commands::Tx { cmd } => handle_transaction(cmd).await,
             Commands::Query { cmd } => handle_query(cmd).await,
             Commands::Db { cmd } => handle_db(cmd),
@@ -430,6 +523,7 @@ fn init_genesis(
     allocations: Vec<String>,
     validators: Vec<String>,
     producer_key_file: Option<PathBuf>,
+    producer_credential_file: Option<PathBuf>,
     force: bool,
 ) -> Result<()> {
     let data_dir = match data_dir {
@@ -454,7 +548,12 @@ fn init_genesis(
     }
     let specs =
         validators.iter().map(|value| parse_validator(value)).collect::<Result<Vec<_>>>()?;
-    genesis.initial_validators = resolve_validators(specs, &data_dir, producer_key_file)?;
+    genesis.initial_validators = resolve_validators(
+        specs,
+        &data_dir,
+        producer_key_file,
+        producer_credential_file.as_deref(),
+    )?;
 
     genesis
         .save(&genesis_path)
@@ -552,14 +651,31 @@ fn resolve_validators(
     specs: Vec<ValidatorSpec>,
     data_dir: &Path,
     producer_key_file: Option<PathBuf>,
+    producer_credential_file: Option<&Path>,
 ) -> Result<Vec<ValidatorInfo>> {
     if specs.is_empty() {
         return Ok(Vec::new());
     }
-    let key_path = producer_key_file.unwrap_or_else(|| data_dir.join(PRODUCER_KEY_FILE_NAME));
+    // Resolve the producer key path fail-closed. With a credential, the
+    // default target is the keystore, never the legacy file. Without one, a
+    // present keystore must not be shadowed by generating a new plaintext key.
+    let key_path = match producer_key_file {
+        Some(path) => path,
+        None if producer_credential_file.is_some() => data_dir.join(KEYSTORE_FILE_NAME),
+        None => {
+            let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+            if keystore.exists() {
+                bail!(
+                    "{} is an encrypted producer keystore; pass --producer-credential-file to unlock it",
+                    keystore.display()
+                );
+            }
+            data_dir.join(PRODUCER_KEY_FILE_NAME)
+        }
+    };
     let mut secret = None;
     if specs.iter().any(|spec| spec.proof_of_possession.is_none()) {
-        secret = Some(load_or_create_producer_key(&key_path)?);
+        secret = Some(load_or_create_producer_key(&key_path, producer_credential_file)?);
     }
     let derived =
         secret.as_ref().map(|secret| BLSScheme::encode_public_key(&BLSScheme::public_key(secret)));
@@ -635,10 +751,40 @@ fn resolve_validators(
 /// Generation is only for the first `init` on a data directory: an existing file
 /// is never replaced, because replacing it would orphan every block signed with
 /// the old key.
-fn load_or_create_producer_key(path: &Path) -> Result<PrivateKey> {
+///
+/// An existing file is routed by content: a keystore is unlocked with the
+/// supplied credential file and never falls back to plaintext; a legacy hex
+/// file keeps the original loader. With a credential file but no key file,
+/// init refuses instead of generating: encrypted keys are created explicitly
+/// with `subhost producer create`.
+fn load_or_create_producer_key(path: &Path, credential_file: Option<&Path>) -> Result<PrivateKey> {
     if path.exists() {
+        let bytes = read_bounded_owner_only(path, MAX_KEYSTORE_FILE_BYTES)
+            .with_context(|| format!("cannot read the producer key file {}", path.display()))?;
+        if is_keystore_contents(&bytes) {
+            let Some(credential_path) = credential_file else {
+                bail!(
+                    "{} is an encrypted producer keystore; pass --producer-credential-file to unlock it",
+                    path.display()
+                );
+            };
+            let password = load_credential_file(credential_path).with_context(|| {
+                format!("cannot read the producer credential file {}", credential_path.display())
+            })?;
+            return read_encrypted_producer_key(path, password.as_slice()).with_context(|| {
+                format!("cannot unlock the producer keystore {}", path.display())
+            });
+        }
         return read_producer_key(path)
             .with_context(|| format!("cannot use the producer key in {}", path.display()));
+    }
+    if let Some(credential_path) = credential_file {
+        bail!(
+            "{} does not exist; create it first with `subhost producer create` \
+             (a credential file was supplied: {})",
+            path.display(),
+            credential_path.display()
+        );
     }
     let (secret, public_key) = BLSScheme::keygen();
     write_producer_key(path, &secret)
@@ -647,6 +793,189 @@ fn load_or_create_producer_key(path: &Path) -> Result<PrivateKey> {
     println!("  public key: 0x{}", hex::encode(BLSScheme::encode_public_key(&public_key)));
     println!("  mode 0600. Keep it: it is this validator's identity.");
     Ok(secret)
+}
+
+fn handle_producer(cmd: ProducerCommands) -> Result<()> {
+    match cmd {
+        ProducerCommands::Create { data_dir, keystore_file, credential_file } => {
+            producer_create(data_dir, keystore_file, credential_file.as_deref())
+        }
+        ProducerCommands::Inspect { path } => producer_inspect(&path),
+        ProducerCommands::Unlock { path, credential_file } => {
+            producer_unlock(&path, credential_file.as_deref())
+        }
+        ProducerCommands::Migrate {
+            data_dir,
+            producer_key_file,
+            keystore_file,
+            credential_file,
+        } => {
+            producer_migrate(data_dir, producer_key_file, keystore_file, credential_file.as_deref())
+        }
+    }
+}
+
+/// Generate a new identity into an encrypted keystore; never replace a file.
+fn producer_create(
+    data_dir: Option<PathBuf>,
+    keystore_file: Option<PathBuf>,
+    credential_file: Option<&Path>,
+) -> Result<()> {
+    let data_dir = match data_dir {
+        Some(dir) => dir,
+        None => default_data_dir()?,
+    };
+    let dest = match keystore_file {
+        Some(path) => path,
+        None => {
+            // Creating a second identity next to a live plaintext key is almost
+            // always a mistake: the operator meant to encrypt the existing one.
+            let legacy = data_dir.join(PRODUCER_KEY_FILE_NAME);
+            if legacy.exists() {
+                bail!(
+                    "{} already holds a plaintext producer key; encrypt it with \
+                     `subhost producer migrate` instead of creating a new identity",
+                    legacy.display()
+                );
+            }
+            data_dir.join(KEYSTORE_FILE_NAME)
+        }
+    };
+    if dest.exists() {
+        bail!("{} already exists; producer keystores are never replaced", dest.display());
+    }
+    let password = obtain_creation_password(credential_file)?;
+    let parent = dest.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("cannot create {}", parent.display()))?;
+    let (secret, public_key) = BLSScheme::keygen();
+    write_encrypted_producer_key_new(&dest, &secret, password.as_slice())
+        .with_context(|| format!("cannot write the encrypted keystore {}", dest.display()))?;
+    println!("Encrypted producer keystore written to {}", dest.display());
+    println!("  public key: 0x{}", hex::encode(BLSScheme::encode_public_key(&public_key)));
+    println!("  scrypt log_n={DEFAULT_LOG_N}, r=8, p=1; AES-256-GCM.");
+    println!("  Keep the password: losing it loses this validator's identity.");
+    Ok(())
+}
+
+fn producer_inspect(path: &Path) -> Result<()> {
+    let public_key = read_public_key(path)
+        .with_context(|| format!("cannot inspect the keystore {}", path.display()))?;
+    println!("public key: 0x{}", hex::encode(&public_key));
+    println!("(header only; the tag is verified by `subhost producer unlock`)");
+    Ok(())
+}
+
+fn producer_unlock(path: &Path, credential_file: Option<&Path>) -> Result<()> {
+    let password = obtain_unlock_password(credential_file)?;
+    let secret = read_encrypted_producer_key(path, password.as_slice())
+        .with_context(|| format!("cannot unlock the keystore {}", path.display()))?;
+    println!("Unlocked {}", path.display());
+    println!(
+        "  public key: 0x{}",
+        hex::encode(BLSScheme::encode_public_key(&BLSScheme::public_key(&secret)))
+    );
+    Ok(())
+}
+
+/// Encrypt the legacy plaintext key into a separate keystore, preserving the
+/// source on success and on every failure.
+fn producer_migrate(
+    data_dir: Option<PathBuf>,
+    producer_key_file: Option<PathBuf>,
+    keystore_file: Option<PathBuf>,
+    credential_file: Option<&Path>,
+) -> Result<()> {
+    let data_dir = match data_dir {
+        Some(dir) => dir,
+        None => default_data_dir()?,
+    };
+    let source = producer_key_file.unwrap_or_else(|| data_dir.join(PRODUCER_KEY_FILE_NAME));
+    if !source.exists() {
+        bail!("no legacy producer key at {}; nothing to migrate", source.display());
+    }
+    let dest = keystore_file.unwrap_or_else(|| data_dir.join(KEYSTORE_FILE_NAME));
+    if dest.exists() {
+        bail!("{} already exists; migration never replaces a keystore", dest.display());
+    }
+    let secret = read_producer_key(&source)
+        .with_context(|| format!("cannot read the legacy producer key {}", source.display()))?;
+    let public_key = BLSScheme::encode_public_key(&BLSScheme::public_key(&secret));
+
+    // When a genesis is present, the migrated identity must be one of its
+    // validators. Refuse before writing anything, so a wrong data directory
+    // cannot produce a keystore for an unrelated chain.
+    let genesis_path = data_dir.join(GENESIS_FILE_NAME);
+    if genesis_path.exists() {
+        let genesis = GenesisConfig::load(&genesis_path)
+            .with_context(|| format!("cannot read {}", genesis_path.display()))?;
+        if !genesis.initial_validators.is_empty()
+            && !genesis
+                .initial_validators
+                .iter()
+                .any(|validator| validator.public_key == public_key)
+        {
+            bail!(
+                "the key in {} is not a validator in {}; refusing to migrate the wrong identity",
+                source.display(),
+                genesis_path.display()
+            );
+        }
+    }
+
+    let password = obtain_creation_password(credential_file)?;
+    // The writer publishes with no-clobber semantics and verifies the new file
+    // by decrypting it back to the same secret before returning.
+    write_encrypted_producer_key_new(&dest, &secret, password.as_slice())
+        .with_context(|| format!("cannot write the encrypted keystore {}", dest.display()))?;
+    println!("Migrated {} -> {}", source.display(), dest.display());
+    println!("  public key: 0x{}", hex::encode(&public_key));
+    println!("  The legacy file is preserved. Remove it explicitly when ready;");
+    println!("  deletion cannot promise physical erasure on SSD/COW/backup systems.");
+    Ok(())
+}
+
+/// Creation credentials: an owner-only file, or two matching non-echo prompts.
+fn obtain_creation_password(credential_file: Option<&Path>) -> Result<Zeroizing<Vec<u8>>> {
+    if let Some(path) = credential_file {
+        let password = load_credential_file(path)
+            .with_context(|| format!("cannot read the credential file {}", path.display()))?;
+        check_creation_password(password.as_slice())
+            .with_context(|| format!("credential file {} rejected", path.display()))?;
+        return Ok(password);
+    }
+    let first = prompt_password_bytes("New producer keystore password: ")?;
+    let second = prompt_password_bytes("Confirm password: ")?;
+    creation_password_from_pair(first.as_slice(), second.as_slice())
+}
+
+/// Unlock credentials: an owner-only file, or one non-echo prompt. No creation
+/// policy applies here: an existing valid file must stay decryptable.
+fn obtain_unlock_password(credential_file: Option<&Path>) -> Result<Zeroizing<Vec<u8>>> {
+    if let Some(path) = credential_file {
+        return load_credential_file(path)
+            .with_context(|| format!("cannot read the credential file {}", path.display()));
+    }
+    prompt_password_bytes("Producer keystore password: ")
+}
+
+/// Interactive input is UTF-8 exactly as the terminal reader returns it: no
+/// trimming and no Unicode normalization. The credential-file path is the
+/// exact-byte-string path for scripts and services.
+fn prompt_password_bytes(prompt: &str) -> Result<Zeroizing<Vec<u8>>> {
+    let password = rpassword::prompt_password(prompt).context(
+        "cannot read a password from the terminal; pass --credential-file for non-interactive use",
+    )?;
+    Ok(Zeroizing::new(password.into_bytes()))
+}
+
+/// The two creation entries must match exactly and pass the creation policy.
+fn creation_password_from_pair(first: &[u8], second: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    if first != second {
+        bail!("the two password entries do not match");
+    }
+    check_creation_password(first)?;
+    Ok(Zeroizing::new(first.to_vec()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1489,6 +1818,7 @@ mod tests {
             vec!["0x1111111111111111111111111111111111111111=1000".to_string()],
             vec!["0x2222222222222222222222222222222222222222:10".to_string()],
             None,
+            None,
             false,
         )
         .unwrap();
@@ -1522,14 +1852,14 @@ mod tests {
 
         // A second run must not silently replace the genesis file, and --force
         // must keep the key that already signs this validator.
-        assert!(
-            init_genesis(7, Some(data_dir.clone()), Vec::new(), Vec::new(), None, false).is_err()
-        );
+        assert!(init_genesis(7, Some(data_dir.clone()), Vec::new(), Vec::new(), None, None, false)
+            .is_err());
         init_genesis(
             9,
             Some(data_dir.clone()),
             Vec::new(),
             vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
             None,
             true,
         )
@@ -1550,6 +1880,7 @@ mod tests {
             Some(data_dir.clone()),
             Vec::new(),
             vec![format!("0x2222222222222222222222222222222222222222=0x{other}:10")],
+            None,
             None,
             false,
         );
@@ -1576,6 +1907,7 @@ mod tests {
             Vec::new(),
             vec![format!("0x2222222222222222222222222222222222222222=0x{public}:10:0x{proof}")],
             None,
+            None,
             false,
         )
         .unwrap();
@@ -1600,6 +1932,7 @@ mod tests {
             Vec::new(),
             vec![format!("0x2222222222222222222222222222222222222222=0x{other}:10:0x{proof}")],
             None,
+            None,
             false,
         )
         .is_err());
@@ -1616,6 +1949,7 @@ mod tests {
                 "0x1111111111111111111111111111111111111111=2".to_string(),
             ],
             Vec::new(),
+            None,
             None,
             false,
         )
@@ -1677,5 +2011,318 @@ mod tests {
         assert!(error.to_string().contains("--rpc-auth-token-file"));
 
         server.await.unwrap();
+    }
+
+    /// Owner-only credential file with the shared trailing-newline convention.
+    fn write_credential(dir: &Path, name: &str, password: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, password).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    const KEYSTORE_PASSWORD: &[u8] = b"correct horse battery staple\n";
+
+    #[test]
+    fn producer_create_and_init_share_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+
+        let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+        assert!(keystore.exists());
+        assert!(
+            !data_dir.join(PRODUCER_KEY_FILE_NAME).exists(),
+            "create must not leave a plaintext key behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&keystore).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(credential.clone()),
+            false,
+        )
+        .unwrap();
+
+        // The genesis identity, the keystore header and the unlocked secret
+        // must all be the same key, and the stored proof must verify.
+        let genesis = GenesisConfig::load(&data_dir.join(GENESIS_FILE_NAME)).unwrap();
+        let validator = &genesis.initial_validators[0];
+        assert_eq!(validator.public_key, read_public_key(&keystore).unwrap());
+        let password = load_credential_file(&credential).unwrap();
+        let secret = read_encrypted_producer_key(&keystore, password.as_slice()).unwrap();
+        assert_eq!(
+            validator.public_key,
+            BLSScheme::encode_public_key(&BLSScheme::public_key(&secret))
+        );
+        let public = BLSScheme::decode_public_key(&validator.public_key).unwrap();
+        let proof = BLSScheme::decode_signature(&validator.proof_of_possession).unwrap();
+        assert!(BLSScheme::verify_possession(&public, &proof));
+    }
+
+    #[test]
+    fn init_refuses_a_keystore_without_a_credential_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            false,
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("--producer-credential-file"), "error was: {error}");
+        assert!(
+            !data_dir.join(GENESIS_FILE_NAME).exists(),
+            "a refused init must not write a genesis"
+        );
+    }
+
+    #[test]
+    fn init_refuses_a_wrong_credential_and_a_loose_credential_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+
+        let wrong = write_credential(dir.path(), "wrong", b"another password entirely\n");
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(wrong),
+            false,
+        );
+        assert!(result.is_err());
+        assert!(!data_dir.join(GENESIS_FILE_NAME).exists());
+
+        // A group-readable credential file is refused before any KDF work.
+        let loose = dir.path().join("loose");
+        std::fs::write(&loose, KEYSTORE_PASSWORD).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(loose),
+            false,
+        );
+        assert!(result.is_err());
+        assert!(!data_dir.join(GENESIS_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn init_with_a_credential_but_no_key_refuses_to_generate() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(credential),
+            false,
+        );
+        assert!(result.is_err());
+        assert!(!data_dir.join(PRODUCER_KEY_FILE_NAME).exists());
+        assert!(!data_dir.join(KEYSTORE_FILE_NAME).exists());
+        assert!(!data_dir.join(GENESIS_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn migrate_preserves_the_source_and_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let source = data_dir.join(PRODUCER_KEY_FILE_NAME);
+        let source_bytes = std::fs::read(&source).unwrap();
+        let genesis_bytes = std::fs::read(data_dir.join(GENESIS_FILE_NAME)).unwrap();
+
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_migrate(Some(data_dir.clone()), None, None, Some(&credential)).unwrap();
+
+        let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes, "the source must survive");
+        assert_eq!(
+            std::fs::read(data_dir.join(GENESIS_FILE_NAME)).unwrap(),
+            genesis_bytes,
+            "migration must not touch the genesis"
+        );
+        let password = load_credential_file(&credential).unwrap();
+        let migrated = read_encrypted_producer_key(&keystore, password.as_slice()).unwrap();
+        assert_eq!(
+            BLSScheme::encode_secret_key(&migrated),
+            BLSScheme::encode_secret_key(&read_producer_key(&source).unwrap())
+        );
+
+        // A second migration must not replace the keystore or the source.
+        let keystore_bytes = std::fs::read(&keystore).unwrap();
+        assert!(producer_migrate(Some(data_dir.clone()), None, None, Some(&credential)).is_err());
+        assert_eq!(std::fs::read(&keystore).unwrap(), keystore_bytes);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+
+        // With both files present, init without a credential must refuse
+        // rather than silently keep using the legacy identity.
+        assert!(init_genesis(
+            9,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            true,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(data_dir.join(GENESIS_FILE_NAME)).unwrap(),
+            genesis_bytes,
+            "the refused init must not rewrite the genesis"
+        );
+    }
+
+    #[test]
+    fn migrate_refuses_a_key_that_is_not_in_the_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let (genesis_secret, genesis_public) = BLSScheme::keygen();
+        let public_hex = hex::encode(BLSScheme::encode_public_key(&genesis_public));
+        let proof_hex = hex::encode(BLSScheme::encode_signature(&BLSScheme::proof_of_possession(
+            &genesis_secret,
+        )));
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec![format!(
+                "0x2222222222222222222222222222222222222222=0x{public_hex}:10:0x{proof_hex}"
+            )],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // A different local key: migrating it would encrypt the wrong identity.
+        let (other_secret, _) = BLSScheme::keygen();
+        let source = data_dir.join(PRODUCER_KEY_FILE_NAME);
+        write_producer_key(&source, &other_secret).unwrap();
+        let source_bytes = std::fs::read(&source).unwrap();
+
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        assert!(producer_migrate(Some(data_dir.clone()), None, None, Some(&credential)).is_err());
+        assert!(!data_dir.join(KEYSTORE_FILE_NAME).exists());
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    }
+
+    #[test]
+    fn migrate_without_a_source_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        assert!(producer_migrate(Some(dir.path().to_path_buf()), None, None, Some(&credential))
+            .is_err());
+        assert!(!dir.path().join(KEYSTORE_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn unlock_and_inspect_follow_the_credential_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+        let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+
+        producer_inspect(&keystore).unwrap();
+        producer_unlock(&keystore, Some(&credential)).unwrap();
+
+        let wrong = write_credential(dir.path(), "wrong", b"another password entirely\n");
+        assert!(producer_unlock(&keystore, Some(&wrong)).is_err());
+
+        // A legacy hex file is not a keystore: inspect refuses it.
+        let legacy = dir.path().join("legacy.key");
+        let (secret, _) = BLSScheme::keygen();
+        write_producer_key(&legacy, &secret).unwrap();
+        assert!(producer_inspect(&legacy).is_err());
+    }
+
+    #[test]
+    fn create_refuses_a_second_identity_next_to_a_live_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+
+        // Default destination: the legacy key must be migrated, not shadowed.
+        let error = producer_create(Some(data_dir.clone()), None, Some(&credential))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("migrate"), "error was: {error}");
+        assert!(!data_dir.join(KEYSTORE_FILE_NAME).exists());
+
+        // An explicit destination is allowed, but never replaced.
+        let explicit = dir.path().join("other.keystore.json");
+        producer_create(Some(data_dir.clone()), Some(explicit.clone()), Some(&credential)).unwrap();
+        let bytes = std::fs::read(&explicit).unwrap();
+        assert!(producer_create(Some(data_dir.clone()), Some(explicit.clone()), Some(&credential))
+            .is_err());
+        assert_eq!(std::fs::read(&explicit).unwrap(), bytes);
+    }
+
+    #[test]
+    fn creation_password_pair_must_match_and_meet_the_policy() {
+        assert!(creation_password_from_pair(b"twelve bytes", b"twelve bytez").is_err());
+        assert!(creation_password_from_pair(b"eleven byte", b"eleven byte").is_err());
+        let over_cap = vec![b'x'; subhost_keystore::MAX_PASSWORD_BYTES + 1];
+        assert!(creation_password_from_pair(&over_cap, &over_cap).is_err());
+        let password = creation_password_from_pair(b"  spaced pass  ", b"  spaced pass  ").unwrap();
+        assert_eq!(password.as_slice(), b"  spaced pass  ");
     }
 }

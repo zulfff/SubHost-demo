@@ -14,6 +14,7 @@ members = [
     "crates/subhost-telemetry",
     "crates/subhost-cli",
     "crates/subhost-wallet",
+    "crates/subhost-keystore",
     "crates/subhost-faucet",
     "crates/subhost-bench",
     "explorer",
@@ -47,6 +48,7 @@ subhost-mempool = { path = "crates/subhost-mempool", version = "0.1.0" }
 subhost-metrics = { path = "crates/subhost-metrics", version = "0.1.0" }
 subhost-telemetry = { path = "crates/subhost-telemetry", version = "0.1.0" }
 subhost-wallet = { path = "crates/subhost-wallet", version = "0.1.0" }
+subhost-keystore = { path = "crates/subhost-keystore", version = "0.1.0" }
 
 # Runtime / async
 tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
@@ -99,6 +101,9 @@ hex = "0.4"
 time = { version = "0.3", features = ["formatting"] }
 hdrhistogram = "7.5"
 tempfile = "3.9"
+libc = "0.2"
+rpassword = "7"
+rustix = { version = "1", features = ["process"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
