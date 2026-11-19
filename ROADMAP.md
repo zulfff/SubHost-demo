@@ -483,7 +483,9 @@ the metrics match a request-count test.
 **S6.1 Pool persistence**
 - Atomic `mempool.bin` (same envelope as the ledger), reloaded on start, dropped for
   transactions already on chain.
-- Config: `--mempool-persist`, capacity, per-sender cap.
+- Config: `--mempool-persist` node opt-in (`NodeConfig.mempool_persist`,
+  default off). Explicit capacity and per-sender flags are a follow-up, not part
+  of the opt-in slice.
 - S6.1a in review on `s6/mempool-store-contract`: `MempoolStore` supplies a bounded
   signed-transfer snapshot with chain/genesis binding, atomic replacement and
   whole-load validation. Limits are 64 MiB, 10,000 entries and 1 MiB per record.

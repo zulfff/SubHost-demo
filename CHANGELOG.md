@@ -314,6 +314,20 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   to commit them. The activation runbook §2 now points to it and marks the
   `local-testnet` example as a chain-1337 plaintext demo only.
 
+- **Opt-in node mempool persistence (S6.1b consumer, Q-016/Q-038).**
+  `NodeConfig.mempool_persist` (default `false`) attaches an `MempoolStore` at
+  `<data_dir>/mempool.bin` during bootstrap and restores the pending pool after
+  ledger, journal, archive and fork-log reconciliation and before the node
+  serves traffic. The snapshot is bound to
+  `GenesisConfig::consensus_context()`, so a copy from another chain or from
+  before a fee-policy/calldata-schedule change is foreign. A corrupt, foreign,
+  oversized or unauthenticated snapshot refuses boot with the file path in the
+  error rather than silently starting with an empty pool; deleting
+  `mempool.bin` is the documented recovery and loses only accepted-but-unmined
+  transactions. With the opt-in off nothing is read or written. The CLI
+  `--mempool-persist` flag stacks on the field; capacity and per-sender flags
+  remain an explicit follow-up.
+
 - **Public testnet activation prep runbook (Q-012, gated by Q-037).** Added
   `docs/operations/public-testnet-activation.md`: the activation gate (Q-037
   calldata-pricing ladder step **L4** merged+verified AND the S9.6 encrypted
