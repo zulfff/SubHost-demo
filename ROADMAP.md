@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-22 · `main` = `b8aaecc` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S6.2 complete (#60/#65/#71, ADR-010); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038, yoga flag); S6.3 TTL/eviction pending · S8 slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74), node hooks (#78) merged; block/consensus spans in review (sari, Q-035); peer count gated on network accessor · S9.1–S9.5 (#48) + S9.6 Track B (#59) merged; Track A bootstrap in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) · S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep (#77) merged; R-57-01 fixed (#67/#73); activation gated on Q-037 calldata ladder (L0–L5 agreed, in progress) + S9.6 completion; 30-day soak time-gated · `Q-001`–`Q-038` agreed except Q-012/Q-037 (open, in progress)
+Status: 2026-11-20 · `main` = `936f3d1` · S0–S5 merged · S6.2 complete (#60/#65/#71, ADR-010); S6.1b complete: hooks (#75), wiring (#80), opt-in consumer (#84) + `--mempool-persist` flag (#96, Q-038, R-84-01 closed); S6.3 TTL/eviction in review (#103, dewi, Q-039 agreed, head `f04c055`) · Q-036 retention: mechanism (#87) + height self-check (#89) + `--retention-blocks` flag (#91) + prune metrics (#92) merged; node trigger implemented on branch `s12.3/retention-node-trigger` (raka, Q-041 agreed), PR pending · Q-037 calldata ladder: L0 (#95) / L1 (#80) / L2 (#94, ADR-015) merged; L3 replay dispatch (#101) merged, L4 wiring (bima) building, L5 CLI/docs (yoga) staged · S8 slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP provider (#74) + binary wiring (#88) + block/consensus spans (#98) + sync-relay export (#100) merged; peer count gated on network accessor (raka) · S9 complete incl. S9.6 encrypted bootstrap (#59/#79/#85, security records #86) · S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep (#77/#83) merged; R-57-01 fixed (#67/#73); R-96-01 closed (#97); activation gated ONLY on Q-037 L4 merged+verified + nara SUBHOST-2026-003 re-verification; external audit + 30-day soak human/time-gated · `Q-001`–`Q-041` agreed (Q-012 execution stays gated on L4 + 003 re-probe)
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -17,7 +17,7 @@ editing the same files.
 | Networking | libp2p relays proposals, verified votes and QC-certified next blocks; demo block gossip remains. Bootstrap retries; no historical block sync, peer scoring, per-peer limits or tx gossip. |
 | Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
-| RPC | 15 methods plus explicit unsupported log/subscription responses; block lookup by hash and bounded legacy fee history. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. Completed decoded RPC calls and returned errors now reach the node metrics registry. |
+| RPC | 15 methods plus explicit unsupported log/subscription responses; block lookup by hash and bounded legacy fee history. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS: the documented public deployment is a reverse proxy. Completed decoded RPC calls and returned errors now reach the node metrics registry. |
 | Mempool | In memory only; fixed gas price 1. |
 | IBC | State machine + single-key ed25519 light client. No validator-set rotation, no multisig QC, no non-membership proof. |
 | Release | `0.1.0`, no tag, no release workflow, no signed binaries or SBOM. |
@@ -56,8 +56,8 @@ fixed or written down as an explicit, reviewed limitation.
 
 | Track | Owns | Stages |
 | --- | --- | --- |
-| **A — Protocol** | `subhost-core`, `subhost-consensus`, `subhost-network` messages, node block/consensus path, RPC block path | S0, S1, S2, S3, S7 |
-| **B — Platform** | `subhost-storage`, RPC surface/auth/methods, `subhost-mempool`, `subhost-cli`, `subhost-metrics`, `subhost-telemetry`, `explorer`, `subhost-faucet`, CI/Docker/release | S4, S5, S6, S8, S9 |
+| **A - Protocol** | `subhost-core`, `subhost-consensus`, `subhost-network` messages, node block/consensus path, RPC block path | S0, S1, S2, S3, S7 |
+| **B - Platform** | `subhost-storage`, RPC surface/auth/methods, `subhost-mempool`, `subhost-cli`, `subhost-metrics`, `subhost-telemetry`, `explorer`, `subhost-faucet`, CI/Docker/release | S4, S5, S6, S8, S9 |
 
 Track C (execution, IBC) is deliberately deferred to S10/S11 and goes to whichever
 track is free. Do not start it before S3 lands.
@@ -122,19 +122,19 @@ agent always sees the real state.
 
 | Stage | Goal | Track | Depends on | Size | Status |
 | --- | --- | --- | --- | --- | --- |
-| S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
+| S0 | Prepare `rpc` for parallel work | A | - | S | Merged |
 | S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
 | S2 | Wire the consensus driver into the node | A | S1 | L | Merged: phased rounds, RFC 9380 BLS, authenticated view change, node policy (ADR-008, #46); safety regressions #62. Remaining assurance is external (S12) |
 | S3 | Fork choice, reorg, and block sync | A | S2 | L | Merged: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57), R-57-01 fix + coherent archive restore (#67). Per Q-013: append-only finality, no finalized reorg |
-| S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
+| S4 | Segmented storage, snapshots, migration | B | - | L | Merged through S4.5 |
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | Merged: S5.1a auth/bind policy, S5.2 methods (#54), S5.3a middleware + S5.3b node wiring. TLS = documented reverse-proxy mode; rate limit per connection |
-| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038 + yoga flag); S6.2 steps 1-3 merged (#60/#65/#71); S6.3 counters merged (#51), TTL/eviction pending; Q-036 retention slice in progress (dewi); Q-037 calldata ladder L2 in review (bima, ADR-015), L3 next (dewi), L4 after L3 (bima) |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b complete: hooks (#75), wiring (#80), opt-in consumer (#84, rebased under ADR-016) + CLI flag (#96, Q-038); S6.2 steps 1-3 merged (#60/#65/#71); S6.3 counters merged (#51), TTL/eviction in review (#103, dewi, Q-039); Q-036 retention mechanism (#87) + R-RET-01 fix (#89) + flag (#91) + prune metrics (#92) merged, node trigger implemented on branch s12.3/retention-node-trigger (raka, Q-041 agreed), PR pending; Q-037 L0 (#95) / L2 (#94) / L3 (#101) merged, L4 (bima) building, L5 (yoga) staged |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
-| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74), node runtime hooks (#78) merged; block/consensus spans in review (sari, Q-035); peer count gated on network accessor (raka) |
-| S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap API + hardened legacy loader in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) |
+| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP provider (#74) + CLI binary wiring (#88, Q-035) + block/consensus spans (#98, Q-035) + sync-relay export (#100) merged; node runtime hooks (#78) merged; peer count gated on network accessor (raka); auth-header secrets slice next (tania, Q-040 agreed) |
+| S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 COMPLETE: keystore (#59), bootstrap API + hardened loader (#79), node credential flag (#85); security records + posture sync (#86). Encrypted bootstrap is the recommended production path; legacy plaintext loader remains the default without the flag (hardened, unencrypted at rest) |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
-| S11 | IBC production light client + relayer | C | — | L | Planned |
-| S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep runbook (#77) merged; R-57-01 fixed (#67/#73); S9.6 complete (#79/#85); activation gated on Q-037 calldata ladder L2–L4 (L0/L1 merged, L2 in review, L3 dewi, L4 bima) + nara re-verification of SUBHOST-2026-003; external audit + 30-day soak + go/no-go remain human/time-gated |
+| S11 | IBC production light client + relayer | C | - | L | Planned |
+| S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep runbook (#77) + genesis script (#83) merged; R-57-01 fixed (#67/#73); S9.6 gate item SATISFIED; activation gated ONLY on Q-037 L4 merged+verified (L0 #95 / L1 #80 / L2 #94 / L3 #101 merged; L4 wiring bima building, L5 yoga staged) + nara SUBHOST-2026-003 re-verification as Fixed; external audit + 30-day soak + go/no-go remain human/time-gated |
 
 Size is relative effort, not calendar time. S10 alone is larger than S0–S9 combined.
 
@@ -142,7 +142,7 @@ Size is relative effort, not calendar time. S10 alone is larger than S0–S9 com
 
 ## 5. Stage details
 
-### S0 — Prepare `subhost-rpc` for parallel work (Track A)
+### S0: Prepare `subhost-rpc` for parallel work (Track A)
 
 **S0.1 Split the crate.**
 - `src/lib.rs` keeps re-exports and crate docs.
@@ -162,7 +162,7 @@ Size is relative effort, not calendar time. S10 alone is larger than S0–S9 com
 **S0.3 Document the invariants** in `docs/architecture.md`: block lifecycle,
 who may produce, what the ledger guarantees, which component owns which decision.
 
-### S1 — Signed blocks and validator identity (Track A)
+### S1: Signed blocks and validator identity (Track A)
 
 `Q-001` is agreed (see `docs/agents/decisions/ADR-001-block-signature.md`):
 BLS12-381, a dedicated producer key file, and a mandatory proof of possession on its
@@ -209,7 +209,7 @@ cannot load quietly.
 **Exit criteria:** a block produced without a valid signature from the genesis set is
 rejected by every other node; the ledger still replays.
 
-### S2 — Wire the consensus driver into the node (Track A)
+### S2: Wire the consensus driver into the node (Track A)
 
 **Status:** the earlier QC admission/journal/reconnect slice is merged. Phased
 prepare/final-commit rounds, RFC 9380 BLS, authenticated leader rotation and
@@ -248,7 +248,7 @@ release/deployment stage rather than this CLI consumer change.
   persisting. Remove the unauthenticated "submit and commit" path from validator
   mode, keep it behind an explicit `--single-writer` flag for demos/bench.
 
-**S2.4 Timeouts and view change** (`subhost-consensus/src/driver.rs`) — landed
+**S2.4 Timeouts and view change** (`subhost-consensus/src/driver.rs`): landed
 - `tick(now)` returns `Some(ViewChange)` after the capped `view_timeout_ms`
   deadline; a lone replica cannot run ahead of its peers (f+1 distinct
   authenticated targets release it).
@@ -271,7 +271,7 @@ release/deployment stage rather than this CLI consumer change.
 **Exit criteria:** blocks are only committed with a QC; no single node can advance
 the chain alone once a validator set is configured.
 
-### S3 — Certified candidate selection, fork accountability and block sync (Track A)
+### S3: Certified candidate selection, fork accountability and block sync (Track A)
 
 **Contract correction:** Q-013 is agreed. Final Commit QCs establish the
 append-only canonical boundary. Automatically choosing a different finalized
@@ -362,7 +362,7 @@ archive byte cap stops ingestion. See `docs/operations/certified-sync.md`.
 **Exit criteria:** honest replicas catch up to certified canonical history;
 conflicting final evidence is accountable and never silently reorganized.
 
-### S4 — Segmented storage, snapshots, migration (Track B)
+### S4: Segmented storage, snapshots, migration (Track B)
 
 | Task | Status |
 | --- | --- |
@@ -420,7 +420,7 @@ failure; power-loss testing on physical hardware remains outside this stage.
 Loading still reads every retained segment and has no snapshot receipt index, so
 start-up time remains proportional to retained history even after pruning (S4.3).
 
-### S5 — RPC security and method gaps (Track B)
+### S5: RPC security and method gaps (Track B)
 
 | Task | Status |
 | --- | --- |
@@ -441,7 +441,7 @@ reverse-proxy mode)*
 - Not done, documented instead: the limit is **per connection**, not per IP,
   because jsonrpsee 0.24 does not expose the peer address to HTTP middleware
   (re-verify when jsonrpsee 0.26 lands); WebSocket tokens are checked only at the
-  upgrade handshake; and there is no in-process TLS — jsonrpsee 0.24.11 has no
+  upgrade handshake; and there is no in-process TLS: jsonrpsee 0.24.11 has no
   server-side TLS feature, so the supported public deployment is a TLS-terminating
   reverse proxy in front of a loopback bind.
 
@@ -478,7 +478,7 @@ reverse-proxy mode)*
 **Exit criteria:** an unauthenticated caller cannot reach a state-changing method;
 the metrics match a request-count test.
 
-### S6 — Durable mempool and fee market (Track B)
+### S6: Durable mempool and fee market (Track B)
 
 **S6.1 Pool persistence**
 - Atomic `mempool.bin` (same envelope as the ledger), reloaded on start, dropped for
@@ -486,7 +486,7 @@ the metrics match a request-count test.
 - Config: `--mempool-persist` node opt-in (`NodeConfig.mempool_persist`,
   default off). Explicit capacity and per-sender flags are a follow-up, not part
   of the opt-in slice.
-- S6.1a in review on `s6/mempool-store-contract`: `MempoolStore` supplies a bounded
+- S6.1a merged (#44) on `s6/mempool-store-contract`: `MempoolStore` supplies a bounded
   signed-transfer snapshot with chain/genesis binding, atomic replacement and
   whole-load validation. Limits are 64 MiB, 10,000 entries and 1 MiB per record.
 - S6.1b consumer hooks landed on `s6/mempool-reconciliation` (Q-034, additive
@@ -497,8 +497,12 @@ the metrics match a request-count test.
   order, parked underpriced entries preserved per Q-017). The `block.rs`
   call-site swaps and the bootstrap restore line landed (#80); the node opt-in
   `NodeConfig.mempool_persist` landed (#84) and the CLI flag
-  `subhost node --mempool-persist` stacks on it (Q-038). Remaining: explicit
-  capacity and per-sender flags (follow-up slice, tech-lead-confirmed split).
+  `subhost node --mempool-persist` merged (#96, Q-038, R-84-01 closed).
+  Boot policy A (tech-lead approved): with the opt-in set, a corrupt or foreign
+  snapshot refuses boot with the file path in the error; recovery is move-aside
+  + restart by explicit operator choice, never automatic deletion. Remaining:
+  explicit capacity and per-sender flags (pending follow-up slice,
+  tech-lead-confirmed split; they need their own NodeConfig fields).
 - Relevant doc: `docs/operations/mempool-persistence.md`.
 - Runtime byte budget landed with the hooks: `MempoolConfig::max_pending_bytes`
   (default 32 MiB) binds with persistence on or off, evicting in the existing
@@ -511,13 +515,13 @@ the metrics match a request-count test.
 - Keep `eth_gasPrice` and `eth_maxPriorityFeePerGas` consistent with it.
 - Ledger records the base fee per block; replay recomputes it.
 - Landing in three steps (ADR-010, Q-017/Q-030) so `main` never holds a
-  fee-enabled chain its storage cannot verify: (1) `s6/fee-market-api` —
+  fee-enabled chain its storage cannot verify: (1) `s6/fee-market-api`:
   additive core/state API + version-2 header codec, **merged** (#60);
-  (2) Track B storage, implemented on `s6/storage-fee-replay` (PR #65) —
+  (2) Track B storage, implemented on `s6/storage-fee-replay` (PR #65):
   manifest `fee_policy`, `LedgerStore::with_fee_policy`, fail-closed binding
   rules, re-execution + settlement in both replay paths, ephemeral head
   anchoring;
-  (3) `s6/fee-market-v2` — genesis/node/RPC wiring, empty v2 blocks, admission
+  (3) `s6/fee-market-v2`: genesis/node/RPC wiring, empty v2 blocks, admission
   policy, durable non-empty v2 tests.
 - Track A follow-up recorded here, not widened into the fee contract: the
   demo seal-then-Err pool/commit inconsistency in `subhost-rpc/src/block.rs`
@@ -528,7 +532,7 @@ the metrics match a request-count test.
   entries, and refusal of a legacy data directory. It also makes the genesis
   seeding persist unconditional when a policy is configured, so a fee-enabled
   ledger always has the height-0 anchor storage requires (Q-030), and it honours
-  the genesis `gas_limit` end to end — previously `GenesisConfig::validate`
+  the genesis `gas_limit` end to end, previously `GenesisConfig::validate`
   checked the policy against `genesis.gas_limit` while the node never read it
   and the block path hardcoded `BLOCK_GAS_LIMIT`. A restored ledger refuses a
   genesis limit that differs from its recorded headers.
@@ -538,7 +542,8 @@ the metrics match a request-count test.
 
 **S6.3 Eviction and metrics**
 - Count admitted, replaced, evicted, expired; expose a pool-depth gauge per sender
-  bucket.
+  bucket. Event counters merged (#51); TTL/expiry path and sender-bucket depth
+  gauge design agreed (Q-039), implementation in review (#103, dewi).
 
 **Q-037 Calldata pricing ladder (SUBHOST-2026-003, ADR-015)**
 - Intrinsic calldata gas as a validity floor on the signed `gas_limit`
@@ -546,36 +551,39 @@ the metrics match a request-count test.
   stay `gas_limit`. Pure `CalldataPolicy::check_floor` in core so admission,
   selection and replay enforce independently; distinct
   `FeeError::UnderIntrinsic`, invalid-never-clamped.
-- Landing order: L0 interim byte-cap refusal + L1 Q-034 commit-path wiring
-  (raka, #80) **merged**; L2 core policy/genesis
-  binding/v3 accept-only codec (`s6/calldata-floor-api`, bima) in review;
-  L3 manifest binding + replay validity dispatch (dewi); L4 activation
-  wiring and first v3 production (bima); L5 CLI flag + docs (yoga).
+- Landing order: L0 interim byte-cap refusal + fee-density ranking + selection
+  budget (dewi, #95) **merged** (`0627d39`); L1 Q-034 commit-path wiring
+  (raka, #80) **merged**; L2 core policy/genesis binding/v3 accept-only codec
+  (bima, #94) **merged** (`6acc9bb`, ADR-015); L3 manifest binding + replay
+  validity dispatch (dewi, #101) **merged** (`4dcd6d3`); L4 activation wiring
+  and first v3 production (bima) building; L5 CLI flag + docs (yoga) staged.
 - Version-3 headers keep the v2 13-field layout; the version word names the
   validity rule inside the hash/signatures/QCs. Genesis context keeps legacy
   and fee-only tuples byte-identical; priced chains append the Option-encoded
   fee policy + schedule. Fee continuity: v3 successor from a v2 parent.
-- Activation gate (nara): L2–L4 merged, regressions green, S9.6 merged
-  (done), and her re-verification of SUBHOST-2026-003 as Fixed.
+- Activation gate (nara): L4 merged+verified (L0/L1/L2/L3 already merged),
+  regressions green, S9.6 merged (done), and her joint pricing/amplification
+  re-verification of SUBHOST-2026-003 as Fixed on the merged tip: the PoC must
+  be refused at BOTH `submit_transaction` and `validate_candidate`.
 
 **Exit criteria:** restarting a node does not lose accepted-but-unmined
 transactions; the base fee moves under load and returns to the floor when idle.
 
-### S7 — Network hardening (Track A)
+### S7: Network hardening (Track A)
 
-**S7.1 Transaction gossip** — wire the existing `TransactionStem`/`TransactionFluff`
+**S7.1 Transaction gossip**: wire the existing `TransactionStem`/`TransactionFluff`
 messages: stem with TTL, fluff after `--fluff-after`, dedupe by tx hash.
-**S7.2 Peer scoring** — per-peer counters for invalid messages, duplicate floods, and
+**S7.2 Peer scoring**: per-peer counters for invalid messages, duplicate floods, and
 dropped connections; ban above a threshold with exponential decay.
-**S7.3 Limits** — per-peer message rate, max message size already exists, max peers
+**S7.3 Limits**: per-peer message rate, max message size already exists, max peers
 enforced at the swarm level, inbound/outbound caps.
-**S7.4 Relay policy** — relay any valid block/QC, not only locally sealed ones.
-**S7.5 Tests** — flood test, invalid-signature flood, reconnect after ban expiry.
+**S7.4 Relay policy**: relay any valid block/QC, not only locally sealed ones.
+**S7.5 Tests**: flood test, invalid-signature flood, reconnect after ban expiry.
 
 **Exit criteria:** one peer cannot saturate another node's CPU or memory with valid-
 looking traffic.
 
-### S8 — Observability, health, runbooks (Track B)
+### S8: Observability, health, runbooks (Track B)
 
 | Task | Status |
 | --- | --- |
@@ -583,22 +591,22 @@ looking traffic.
 | S8.2/S8.3 node runtime hooks | Merged (#78, Q-032): truthful health predicates (`ledger_loaded` after recovery, `pipeline_alive` task liveness, `syncing` = catch-up, halt clears readiness), finalized height + QC latency at the verified commit path, periodic disk stats/snapshot age under the commit lock. Peer count still pending a network handle accessor (see `docs/operations/alerts.md`) |
 | S8.2 mempool event wiring | Merged (#51, Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
 | S8.1 RPC spans | Landed (Q-033, #69): per-call spans in the RPC metrics middleware, privacy-boundary tested |
-| S8.1 block/consensus spans | In review (sari, Q-035): one span per driver step (`seal_block`/`accept_block`/`commit_qc`, `consensus_propose`/`prepare`/`commit`/`view_change`), bounded fields + structural `error_kind`, per-step volume and privacy-boundary tested; driver tally accessors added |
-| S8.1 OTLP export | Provider published (tania, Q-035, #74, `subhost-telemetry` `otlp` feature); binary wiring pending |
+| S8.1 block/consensus spans | Merged (#98, `c5ce60c`, sari, Q-035): one span per driver step (`seal_block`/`accept_block`/`commit_qc`, `consensus_propose`/`prepare`/`commit`/`view_change`), bounded fields + structural `error_kind`, per-step volume and privacy-boundary tested; driver tally accessors added. nara security spot-check PASS |
+| S8.1 OTLP export | Provider (#74) + CLI binary wiring (#88, `--otlp-endpoint`, `otlp` feature, Q-035) + block/consensus spans (#98) merged: export path complete end-to-end, opt-in default byte-identical, non-fatal fallback. Sync-relay export (#100) MERGED (`936f3d1`; nara APPROVE + gates 702/0 carried, tania bonus re-gate 774/0): Q-035 complete end-to-end incl. the relay example. Auth-header slice GO per the agreed Q-040 secrets contract (tania) |
 | S8.4 Runbooks | Complete: start/stop, key rotation, ledger repair, incident investigation + checklist (this PR); backup/restore, upgrade, certified-sync, mempool-persistence already present |
 | S8.5 Alerts | Canonical sample rules in `docs/operations/alerts.md` (height stall, no-quorum proxy, disk growth + live/gated metric table); `observability.md` keeps a summary |
 
-**S8.1 Tracing** — OpenTelemetry OTLP export behind a feature flag; spans for
+**S8.1 Tracing**: OpenTelemetry OTLP export behind a feature flag; spans for
 `accept_block`, `seal_block`, consensus steps, and RPC methods.
-**S8.2 Metrics** — height, finalized height, peer count, QC latency, reorg count,
+**S8.2 Metrics**: height, finalized height, peer count, QC latency, reorg count,
 ledger bytes, snapshot age, mempool depth, RPC latency/errors.
-**S8.3 Health** — `/health/live` and `/health/ready` (ready = ledger loaded, not
+**S8.3 Health**: `/health/live` and `/health/ready` (ready = ledger loaded, not
 syncing, consensus alive).
-**S8.4 Runbooks** — `docs/operations/`: start/stop, key rotation, backup/restore,
+**S8.4 Runbooks**: `docs/operations/`: start/stop, key rotation, backup/restore,
 ledger repair, reorg investigation, incident checklist.
-**S8.5 Alerts** — sample Prometheus rules for height stall, no-quorum, disk growth.
+**S8.5 Alerts**: sample Prometheus rules for height stall, no-quorum, disk growth.
 
-### S9 — Release engineering (Track B)
+### S9: Release engineering (Track B)
 
 | Task | Status |
 | --- | --- |
@@ -616,17 +624,17 @@ environment before publication. External audit and 30-day soak remain S12 gates,
 and stable v1 publication is refused without their maintainer approval.
 See `docs/release.md` and `docs/operations/upgrade.md` (ADR-014).
 
-**S9.1 Versioning** — move to `1.0.0-rc.N`; document semver for the JSON-RPC surface.
-**S9.2 Release workflow** — tag → build → test → sign (cosign/sigstore) → SBOM
+**S9.1 Versioning**: move to `1.0.0-rc.N`; document semver for the JSON-RPC surface.
+**S9.2 Release workflow**: tag → build → test → sign (cosign/sigstore) → SBOM
 (`cargo cyclonedx`) → publish binaries + container.
-**S9.3 Reproducibility** — `--locked`, pinned toolchain, documented build image,
+**S9.3 Reproducibility**: `--locked`, pinned toolchain, documented build image,
 checksum manifest.
-**S9.4 Upgrade docs** — supported versions, ledger migration, rollback.
-**S9.5 Image hygiene** — non-root (already), read-only rootfs, image scan in CI.
-**S9.6 Encrypted producer keystore** — replace the plaintext 32-byte
+**S9.4 Upgrade docs**: supported versions, ledger migration, rollback.
+**S9.5 Image hygiene**: non-root (already), read-only rootfs, image scan in CI.
+**S9.6 Encrypted producer keystore**: replace the plaintext 32-byte
 `producer.key` scalar from S1.4 with a password- or credential-store-wrapped
 keystore. Scope decision (ADR-011, Q-018): migration is an explicit CLI command
-(`subhost producer migrate`), not automatic at start-up — automatic
+(`subhost producer migrate`), not automatic at start-up: automatic
 passwordless migration is impossible; a startup migration option would need
 its own agreed decision. Track B landed the `subhost-keystore` crate, the
 `producer` CLI group and the init unlock consumer; Track A lands
@@ -635,7 +643,7 @@ fixes under the same ADR, after which encrypted node start-up replaces the
 plaintext path. Until then the file is `0600` and must be treated as the
 validator's identity: a copy is a copy of the right to produce blocks.
 
-### S10 — Execution layer (Track C, XL)
+### S10: Execution layer (Track C, XL)
 
 Decision required before starting: **EVM via `revm`** (compatibility, ecosystem) or
 **WASM via `wasmtime`** (determinism, easier metering). Recommendation: `revm`, because
@@ -650,7 +658,7 @@ journaled writes, revert on failure.
 **S10.4** Determinism + fuzz + differential tests against a reference EVM.
 **S10.5** Gas schedule and block gas limit policy.
 
-### S11 — IBC production (Track C, L)
+### S11: IBC production (Track C, L)
 
 **S11.1** Tendermint-style light client: validator-set rotation, signed-header
 verification, multisig quorum certificate.
@@ -659,17 +667,19 @@ verification, multisig quorum certificate.
 **S11.4** Relayer binary with retry, backoff, and metrics.
 **S11.5** End-to-end test against a local two-chain harness.
 
-### S12 — Audit and testnet (all tracks, gate)
+### S12: Audit and testnet (all tracks, gate)
 
 **S12.1** Refresh `docs/security/threat-model.md` for consensus, sync, auth, and
 storage.
 **S12.2** External audit of core/consensus/rpc/storage; close every High/Medium.
 **S12.3** Public four-validator testnet; 30 days; no manual ledger repair; publish
 incident log. Gated on SUBHOST-2026-003 fix 3 (automatic retention, Q-036): the
-storage/state half is implemented on `s12/ledger-retention` (`prune_to_height` +
-typed `RefusedBySnapshot` + `retain_from` atomic trim); the node trigger and
-`--retention-blocks` are the remaining consumer slices. Fix 1 (calldata pricing)
-is Q-037 and gates activation separately.
+storage/state mechanism (#87: `prune_to_height` + typed `RefusedBySnapshot` +
+`retain_from` atomic trim), height self-check (#89), `--retention-blocks` flag
+(#91) and prune metrics (#92) are merged; the node trigger (raka) is
+implemented on branch `s12.3/retention-node-trigger` (Q-041 agreed), PR
+pending, so retention stays inert on main until it lands. Fix 1 (calldata pricing) is Q-037 and gates activation
+separately (L4 merged+verified + nara re-probe).
 **S12.4** Bug bounty scope and disclosure policy.
 **S12.5** v1.0 go/no-go against section 2.
 

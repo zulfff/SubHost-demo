@@ -1,6 +1,6 @@
 # Encrypted producer keystore
 
-S9.6 (ADR-011) adds an encrypted keystore for the BLS producer key — the
+S9.6 (ADR-011) adds an encrypted keystore for the BLS producer key, the
 validator's identity. The crate is `subhost-keystore`; the CLI surface is
 `subhost producer …` plus `subhost init --producer-credential-file`.
 
@@ -13,7 +13,7 @@ proof-of-possession checks as a file-loaded key. The legacy `producer.key`
 loader uses the keystore crate's hardened owner-only reader (no symlinks,
 owner-only mode, effective-uid ownership, bounded read, explicit non-Unix
 refusal). Without the credential flag, `subhost node` keeps reading the
-plaintext `producer.key` — a migrated data directory still starts from that
+plaintext `producer.key`, a migrated data directory still starts from that
 preserved legacy file until the operator switches to the encrypted path.
 
 ## Commands
@@ -62,7 +62,7 @@ One shared convention everywhere the CLI reads a credential file:
 - every other byte is preserved, including leading/trailing spaces;
 - the result must be non-empty and at most 4 KiB;
 - the file itself must be a regular, owner-only (`0600`), non-symlink file
-  owned by the running user — the same rules as the keystore.
+  owned by the running user, the same rules as the keystore.
 
 Create it without leaving the password in shell history, e.g.:
 
@@ -74,7 +74,7 @@ install -m 600 /dev/null /run/secrets/producer.pass
 
 Creation requires at least 12 bytes. That is a length floor, not an entropy
 guarantee: use a real passphrase or a generated secret. Unlock applies no
-creation policy — an existing valid file must stay decryptable.
+creation policy: an existing valid file must stay decryptable.
 
 ## Migrating an existing validator
 
@@ -85,7 +85,7 @@ subhost producer migrate --data-dir ~/.subhost/data --credential-file FILE
 What migration does, in order:
 
 1. Reads the legacy `producer.key` (canonical scalar, owner-only mode).
-2. Refuses if the destination keystore already exists — it never replaces one.
+2. Refuses if the destination keystore already exists, it never replaces one.
 3. If a genesis exists, refuses unless the key is one of its validators.
 4. Writes the encrypted keystore with no-clobber publication, file and
    directory sync, and an authenticated decrypt read-back comparing against
@@ -105,7 +105,7 @@ refuses a blind recreation, which is safe but intentional.
 
 `subhost producer create` refuses to run next to a live `producer.key` at the
 default destination: creating a second identity beside the first is almost
-always a mistake — migrate instead. An explicit `--keystore-file` destination
+always a mistake: migrate instead. An explicit `--keystore-file` destination
 is allowed for genuinely separate identities.
 
 ## File format and bounds
@@ -118,7 +118,7 @@ domain-separated binary associated data. Unknown fields, duplicate fields
 Accepted scrypt costs: `log_n`
 15..=18, `r = 8`, `p = 1`, `dklen = 32`; default `log_n = 17` (~128 MiB,
 roughly half a second per derivation). Checked estimates cap the KDF working
-set at 256 MiB before any allocation — the same ceiling as the wallet fix
+set at 256 MiB before any allocation, the same ceiling as the wallet fix
 (SUBHOST-2026-002). Files are capped at 16 KiB, passwords at 4 KiB.
 
 Every input is opened with `O_NOFOLLOW` and checked for regular-file type,

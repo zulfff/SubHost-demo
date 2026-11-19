@@ -8,8 +8,8 @@ file before you change anything. The full protocol lives in
 
 | Track | Owns |
 | --- | --- |
-| **A — Protocol** | `subhost-core`, `subhost-consensus`, `subhost-network`, node block/consensus path, RPC block path |
-| **B — Platform** | `subhost-storage`, RPC surface/auth/methods, `subhost-mempool`, `subhost-cli`, `subhost-metrics`, `subhost-telemetry`, `explorer`, `subhost-faucet`, CI/Docker/release |
+| **A - Protocol** | `subhost-core`, `subhost-consensus`, `subhost-network`, node block/consensus path, RPC block path |
+| **B - Platform** | `subhost-storage`, RPC surface/auth/methods, `subhost-mempool`, `subhost-cli`, `subhost-metrics`, `subhost-telemetry`, `explorer`, `subhost-faucet`, CI/Docker/release |
 
 State your track in every message you write to the other agent.
 
@@ -49,7 +49,7 @@ file, not git work:
   instead of opening a new document per thought; a few lines that state a position
   and a reason are enough.
 - The only artifact of a discussion that reaches git is the ADR, and it lands with
-  the code change that implements it — never in a PR of its own.
+  the code change that implements it, never in a PR of its own.
 
 ## 3. Research before you ask
 
@@ -80,6 +80,7 @@ Silent compliance is worse than a resolved argument.
 - Do not edit a file owned by the other track without a contract commit.
 - Do not rewrite, rebase, or force-push another agent's branch or commits.
 - No `todo!`, `unimplemented!`, `dbg!`, or `unsafe`.
+- Prose: no em dashes in CHANGELOG/docs (R-02); use commas, colons, or plain hyphens.
 - Add failure-path tests, update `CHANGELOG.md` and the relevant doc, keep CI green.
 - If you defer something, write the limitation down in the PR and in `ROADMAP.md`.
 

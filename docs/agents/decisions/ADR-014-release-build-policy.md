@@ -35,9 +35,9 @@ and docs/operations/upgrade.md for exact supported formats and verification.
 
 ## Evidence
 
-- https://doc.rust-lang.org/cargo/reference/profiles.html — verified 2026-11-19:
+- https://doc.rust-lang.org/cargo/reference/profiles.html: verified 2026-11-19:
   test inherits dev; opt-level/assertions/overflow checks are independent.
-- https://github.com/sigstore/cosign/blob/v3.1.4/README.md — verified 2026-11-19:
+- https://github.com/sigstore/cosign/blob/v3.1.4/README.md: verified 2026-11-19:
   keyless bundle verification binds identity and issuer.
-- https://docs.github.com/en/actions/reference/security/oidc — verified 2026-11-19:
+- https://docs.github.com/en/actions/reference/security/oidc: verified 2026-11-19:
   least-privilege short-lived OIDC signing identity.

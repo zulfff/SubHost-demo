@@ -4,7 +4,7 @@ Status: Accepted · 2026-11-20
 
 Contract: Q-037 (agreed). Closes the High residual SUBHOST-2026-003 (unpriced
 calldata) once the ladder lands and nara re-verifies. Scope: the calldata
-pricing ladder — L2 core policy/genesis binding/v3 codec (this change), L3
+pricing ladder: L2 core policy/genesis binding/v3 codec (this change), L3
 Track B manifest binding and replay dispatch, L4 activation wiring, L5 docs.
 
 ## Staged landing
@@ -13,21 +13,21 @@ Nothing activates until a genesis binds the policy and the node produces
 version-3 headers, so `main` never carries a priced chain its storage cannot
 verify (the Q-030 discipline):
 
-1. **L0/L1 (merged)** — interim byte-cap refusal (dewi/yoga) and the Q-034
+1. **L0/L1 (merged)**: interim byte-cap refusal (dewi/yoga) and the Q-034
    commit-path wiring (raka, #80): admission persistence, seal/accept
    retirement and the `restore_pending()` path. Under the floor model the
    consumed-gas call-site swaps are unnecessary (yoga's Q5 audit: settlement,
    selection accumulator, receipts and the storage sites all stay
    `gas_limit`); L3/L4 insert the floor into those paths.
-2. **L2 (this change, `s6/calldata-floor-api`)** — `CalldataPolicy`, genesis
+2. **L2 (this change, `s6/calldata-floor-api`)**: `CalldataPolicy`, genesis
    field/validation/context binding, the version-3 header codec (accept-only)
    and the fee-continuity rule. Purely additive: no caller edits, no v3
    production, no admission enforcement yet.
-3. **L3 (Track B, dewi)** — manifest `calldata_policy` binding mirroring the
+3. **L3 (Track B, dewi)**: manifest `calldata_policy` binding mirroring the
    genesis layout, and replay validity dispatch from the header version.
-4. **L4 (Track A, bima)** — genesis/node admission and selection wiring; the
+4. **L4 (Track A, bima)**: genesis/node admission and selection wiring; the
    first step where a priced chain exists and version-3 headers are produced.
-5. **L5 (Track B, yoga)** — CLI genesis flag and operator docs.
+5. **L5 (Track B, yoga)**: CLI genesis flag and operator docs.
 
 ## Decision
 
@@ -35,7 +35,7 @@ Calldata is priced through the **gas axis as a validity floor**, not a new
 fee outcome. A genesis-bound `CalldataPolicy { version, gas_per_byte }`
 requires every transaction carrying `B` bytes to declare
 `gas_limit >= gas_per_byte * B`. Under-intrinsic is a distinct refusal
-(`FeeError::UnderIntrinsic`) — never clamped, topped up or defaulted, the same
+(`FeeError::UnderIntrinsic`), never clamped, topped up or defaulted, the same
 discipline as the underpriced refusal in Q-017. Consumption, debit, receipts
 and settlement stay `gas_limit` (there is no execution engine yet), so the
 sender pays for the whole declaration and a block's gas limit caps total
@@ -55,13 +55,13 @@ block. Overflow is invalid, never wrapped (`checked_mul` throughout).
 
 Policy validation is fail-closed: the version is pinned to
 `CALLDATA_POLICY_VERSION = 1`, the rate must be nonzero (a zero rate would
-reopen the residual — a chain that wants no calldata tightens the B-owned byte
+reopen the residual: a chain that wants no calldata tightens the B-owned byte
 cap instead), and `gas_per_byte * MAX_TX_DATA_BYTES <= genesis gas_limit` so a
 maximum-size transaction stays includable. `MAX_TX_DATA_BYTES = 128 KiB` is a
 core protocol constant; the mempool default matches it and operators may only
 tighten. The agreed devnet schedule is flat 16 gas/byte (a maximum-size
-transaction costs ~7% of the default block). Flat pricing — no zero/nonzero
-byte distinction — is a deliberate simplification; the policy version is the
+transaction costs ~7% of the default block). Flat pricing - no zero/nonzero
+byte distinction - is a deliberate simplification; the policy version is the
 upgrade path.
 
 **Calldata is a genesis property, not an upgrade.** `GenesisConfig` gains
@@ -84,7 +84,7 @@ refuses everything else on **both** serialize and deserialize; a fee-era
 Nothing produces version 3 until L4.
 
 **Fee continuity across the fork.** `FeePolicy::next_context` accepts a
-version-2 parent for a version-3 successor — the fork changes the validity
+version-2 parent for a version-3 successor: the fork changes the validity
 rule, not the fee schedule. A version-1 parent stays refused on either side
 of the fork. Pinned by test and rustdoc.
 

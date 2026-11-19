@@ -20,13 +20,13 @@ This is deliberately **not ERC-2335**: it uses AES-256-GCM, the repository's
 canonical little-endian scalar encoding and a Subhost purpose string, and makes
 no interoperability claim with Ethereum BLS keystores. Fields:
 
-- `purpose`, `version` — format identity; unknown values fail before any KDF.
-- `public_key` — 48-byte compressed G1 encoding of the derived public key.
-- `kdf` — scrypt parameters (`log_n`, `r`, `p`, `dklen`), strict allowlist below.
-- `salt` — 32 bytes, OS CSPRNG, regenerated on every write.
-- `nonce` — 12 bytes, OS CSPRNG, regenerated on every write; this is the AEAD
+- `purpose`, `version`: format identity; unknown values fail before any KDF.
+- `public_key`: 48-byte compressed G1 encoding of the derived public key.
+- `kdf`: scrypt parameters (`log_n`, `r`, `p`, `dklen`), strict allowlist below.
+- `salt`: 32 bytes, OS CSPRNG, regenerated on every write.
+- `nonce`: 12 bytes, OS CSPRNG, regenerated on every write; this is the AEAD
   nonce, so changing it breaks the tag.
-- `ciphertext` — 48 bytes: the canonical 32-byte secret
+- `ciphertext`: 48 bytes: the canonical 32-byte secret
   (`BLSScheme::encode_secret_key`) plus the 16-byte AES-GCM tag.
 
 Unknown/duplicate JSON fields, wrong lengths and trailing content fail before
@@ -164,8 +164,8 @@ lifecycle with the bootstrap API.
   credential file and fails closed without one; a legacy hex file keeps the
   original loader. With a credential file but no key file, init refuses rather
   than generating: encrypted keys are created explicitly with
-  `subhost producer create`. The init consumer reads the key file twice — once
-  to route, once through the loader — and both reads now use the same hardened
+  `subhost producer create`. The init consumer reads the key file twice, once
+  to route, once through the loader, and both reads now use the same hardened
   owner-only reader, so the symlink window between them is closed.
 
 ## Rejected alternatives
@@ -179,16 +179,16 @@ lifecycle with the bootstrap API.
 ## Evidence
 
 - Q-018 agreed thread and replies (`docs/agents/replies/Q-018-track-b.md`,
-  `Q-018-track-a.md`) — contract, deltas and acceptance, 2026-11-19.
-- https://www.rfc-editor.org/rfc/rfc7914 — scrypt `128*r*N` ROMix storage and
+  `Q-018-track-a.md`): contract, deltas and acceptance, 2026-11-19.
+- https://www.rfc-editor.org/rfc/rfc7914: scrypt `128*r*N` ROMix storage and
   parameter constraints; basis for the checked ceilings.
-- https://github.com/RustCrypto/AEADs/blob/aes-gcm-v0.11.0/aes-gcm/src/lib.rs —
+- https://github.com/RustCrypto/AEADs/blob/aes-gcm-v0.11.0/aes-gcm/src/lib.rs:
   AES-GCM AAD semantics and unique-nonce requirement; the zeroize-gated code
   wipes an intermediate GHASH key, not the whole key schedule.
-- https://github.com/RustCrypto/password-hashes/blob/scrypt-v0.11.0/scrypt/src/lib.rs —
+- https://github.com/RustCrypto/password-hashes/blob/scrypt-v0.11.0/scrypt/src/lib.rs:
   KDF allocates parameter-dependent work buffers; callers must bound cost.
-- https://ercs.ethereum.org/ERCS/erc-2335 — why this format must not claim
+- https://ercs.ethereum.org/ERCS/erc-2335: why this format must not claim
   ERC-2335 compatibility.
-- https://docs.rs/rpassword/7.5.5 — prompt reads `/dev/tty` (fails cleanly
+- https://docs.rs/rpassword/7.5.5: prompt reads `/dev/tty` (fails cleanly
   without a terminal), MSRV 1.85 within workspace 1.89.
-- PR #49 (SUBHOST-2026-002) — the 256 MiB / 2^22 ceiling pattern reused here.
+- PR #49 (SUBHOST-2026-002): the 256 MiB / 2^22 ceiling pattern reused here.

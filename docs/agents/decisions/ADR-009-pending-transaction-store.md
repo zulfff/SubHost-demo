@@ -44,6 +44,6 @@ reinterpretation of old records. Keep the newest voting journal independently.
 
 ## Evidence
 
-- https://doc.rust-lang.org/1.89.0/std/fs/struct.File.html — file sync exposes durability errors (verified 2026-11-18 in Q-011).
-- https://docs.rs/bincode/1.3.3/bincode/config/struct.DefaultOptions.html — explicit fixed encoding, byte limits and trailing-byte rejection (verified against cached 1.3.3 source, 2026-11-19).
+- https://doc.rust-lang.org/1.89.0/std/fs/struct.File.html: file sync exposes durability errors (verified 2026-11-18 in Q-011).
+- https://docs.rs/bincode/1.3.3/bincode/config/struct.DefaultOptions.html: explicit fixed encoding, byte limits and trailing-byte rejection (verified against cached 1.3.3 source, 2026-11-19).
 - Existing RPC candidate-pool and persist-before-visibility paths require this failure ordering.

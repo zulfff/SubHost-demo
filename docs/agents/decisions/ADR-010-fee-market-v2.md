@@ -2,7 +2,7 @@
 
 Status: Accepted · 2026-11-19
 
-Contract: Q-017 (agreed), Q-030 (agreed). Scope: S6.2 — core policy/codec, state
+Contract: Q-017 (agreed), Q-030 (agreed). Scope: S6.2 - core policy/codec, state
 settlement, ledger policy binding and replay, node bootstrap binding and the RPC
 block path. RPC consumer formatting (`eth_feeHistory`, `eth_gasPrice`, receipt
 `effectiveGasPrice`) remains Track B work on the same contract.
@@ -12,14 +12,14 @@ block path. RPC consumer formatting (`eth_feeHistory`, `eth_gasPrice`, receipt
 This decision lands in three PRs so that `main` never carries a fee-enabled
 chain that its own storage cannot verify (Q-030):
 
-1. **`s6/fee-market-api`** — the additive core/state API and the version-2
+1. **`s6/fee-market-api`**: the additive core/state API and the version-2
    header codec, plus mechanical `base_fee_per_gas: 0` test literals. Nothing
    enables a policy: no genesis wiring, no node bootstrap, no RPC binding, so
    this step produces only version-1 blocks.
-2. **Track B storage** — manifest `fee_policy` (additive, manifest version stays
+2. **Track B storage**: manifest `fee_policy` (additive, manifest version stays
    2), `LedgerStore::with_fee_policy`, the fail-closed binding rules, and
    re-execution + settlement in *both* replay paths for v2 histories.
-3. **`s6/fee-market-v2`** — genesis/node/RPC wiring, empty v2 blocks, admission
+3. **`s6/fee-market-v2`**: genesis/node/RPC wiring, empty v2 blocks, admission
    policy, and the durable non-empty v2 tests. First step where a fee-enabled
    chain exists.
 
@@ -35,7 +35,7 @@ byte-identical. Fee-enabled chains start from a fresh genesis; there is no
 in-place activation.
 
 `FeePolicy::{validate, initial_context, next_context}` carries no gas limit of
-its own — the limit is always the chain's. The base-fee update is exact floor
+its own: the limit is always the chain's. The base-fee update is exact floor
 arithmetic without wide integers: with `target = limit / 2`,
 `delta = |gas_used - target|` and `b = parent base fee`,
 `raw = (q * delta + (r * delta) / target) / 8` where `q = b / 8`, `r = b % 8`.

@@ -44,7 +44,7 @@ gossip and explicit CLI demo-mode policy remain pending, as documented in
 
 ## Evidence
 
-- https://github.com/cometbft/cometbft/blob/main/privval/file.go — saves last-sign state and reuses matching prior signatures (verified 2026-11-18).
-- https://doc.rust-lang.org/1.89.0/std/fs/struct.File.html — file locking is available at the Rust 1.89 floor; sync exposes durability errors (verified against upstream source 2026-11-18).
-- https://docs.rs/libp2p-swarm/0.48.0/libp2p_swarm/enum.SwarmEvent.html — attempt IDs and remaining connection counts support retry/accounting (verified against the locked source 2026-11-18).
+- https://github.com/cometbft/cometbft/blob/main/privval/file.go: saves last-sign state and reuses matching prior signatures (verified 2026-11-18).
+- https://doc.rust-lang.org/1.89.0/std/fs/struct.File.html: file locking is available at the Rust 1.89 floor; sync exposes durability errors (verified against upstream source 2026-11-18).
+- https://docs.rs/libp2p-swarm/0.48.0/libp2p_swarm/enum.SwarmEvent.html: attempt IDs and remaining connection counts support retry/accounting (verified against the locked source 2026-11-18).
 - Track B agreed with journal/backup semantics and requested consumption of the landed ADR-004 contract in the same node branch. The Q-011 conversation stays gitignored in the workspace.

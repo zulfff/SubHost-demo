@@ -1,4 +1,4 @@
-# Public four-validator testnet — activation prep and runbook
+# Public four-validator testnet: activation prep and runbook
 
 **Status: PREP, not activation.** Everything below can be prepared now, but the
 activation button is gated (Q-037). Do not re-enable public routes or advertise
@@ -10,12 +10,12 @@ Cross-references: [start-stop.md](start-stop.md), [key-rotation.md](key-rotation
 [release.md](../release.md). Contract threads: Q-012 (activation), Q-037
 (calldata-pricing gate), Q-027/ADR-007 (certified sync / fork accountability).
 
-## 1. The activation gate (Q-037) — must clear first
+## 1. The activation gate (Q-037): must clear first
 
 Activation is blocked until **both** are merged into the deployed revision and
 independently verified:
 
-1. **Calldata pricing — Q-037 ladder step L4 merged + verified** (the
+1. **Calldata pricing: Q-037 ladder step L4 merged + verified** (the
    SUBHOST-2026-003 residual). Bytes are capped today but never priced; a
    128 KiB calldata transaction at `gas_limit = 1` pays the same as an empty one.
    The approved shape (option A) is a genesis-bound **flat 16 gas/byte** schedule
@@ -28,7 +28,7 @@ independently verified:
    bima)** → L5 (verification/RPC). The gate is specifically **L4 merged +
    verified**, not merely an interim mitigation. The option-C interim (tighter
    caps, fee-per-byte ranking) reduces but does not close the gap.
-2. **S9.6 encrypted bootstrap loader (Track A)** — public validators must start
+2. **S9.6 encrypted bootstrap loader (Track A)**: public validators must start
    from encrypted keystores, not plaintext `producer.key`. The keystore crate +
    CLI are merged (#59); encrypted **node start-up** (`bootstrap_with_producer_key`)
    is the pending Track A piece. A public validator holding a plaintext signing
@@ -42,7 +42,7 @@ pressing the button.
 
 ## 2. Fresh four-validator genesis (template)
 
-A fee/pricing-enabled public chain starts from a **fresh genesis** — never an
+A fee/pricing-enabled public chain starts from a **fresh genesis**, never an
 in-place upgrade of the demo chain, and never the broken scalar-hash suite.
 
 - **Chain ID 31338** (Q-012), distinct from the chain-1337 demo and chain-1.
@@ -58,7 +58,7 @@ in-place upgrade of the demo chain, and never the broken scalar-hash suite.
   genesis and `consensus_context()`. Two chains with different schedules can
   never share a genesis commitment.
 
-Generation — prep script (encrypted key material, runnable now):
+Generation: prep script (encrypted key material, runnable now):
 
 ```sh
 # PREP ONLY: generates four distinct encrypted producer keystores + a pubkey
@@ -72,7 +72,7 @@ regeneration, the fee policy and the calldata schedule bound (gated on the
 fee/calldata CLI flags, Q-037 L4 and the S9.6 bootstrap, §1). It prints those
 gated next steps and never writes an activation-ready genesis. The
 `local-testnet` example (`cargo run -p subhost-node --example local-testnet`)
-is only a chain-1337 **plaintext demo fixture** — do not use it for the public
+is only a chain-1337 **plaintext demo fixture**, do not use it for the public
 chain.
 
 For separate public hosts, generate the shared `genesis.json` once (it lists all
@@ -117,7 +117,7 @@ target/release/examples/sync-relay \
 
 - A non-loopback RPC bind requires `--rpc-allow-public` **and**
   `--rpc-auth-token-file`. Generate a distinct owner-only token per node; never
-  commit it. There is no server-side TLS — terminate TLS at a reverse proxy.
+  commit it. There is no server-side TLS: terminate TLS at a reverse proxy.
 - Bind the metrics exporter and `/health/*` to loopback or a private interface
   (unauthenticated); front with an authenticating proxy if exposed.
 
@@ -154,7 +154,7 @@ chain-1 RPC is running. Re-enable only after §1–§5 are satisfied and recorde
    unauthenticated one is refused.
 5. Watch [alerts.md](alerts.md): height stall, no-quorum finality-stall proxy,
    finality lag, QC latency, ledger growth, pending-cleanup failures. A halted
-   node (conflicting final evidence) pages via not-ready — follow
+   node (conflicting final evidence) pages via not-ready: follow
    [incident-investigation.md](incident-investigation.md), not a restart loop.
 6. Announce activation with the actual enabled features and the verification
    evidence. Do not claim finality, sync or pricing guarantees the revision does
@@ -163,14 +163,14 @@ chain-1 RPC is running. Re-enable only after §1–§5 are satisfied and recorde
 ## 7. Soak (S12.3) and abort
 
 - **Soak:** 30 days, four validators, **no manual ledger repair**, published
-  incident log. A manual repair is a soak-blocking event — record it explicitly
+  incident log. A manual repair is a soak-blocking event: record it explicitly
   ([incident-checklist.md](incident-checklist.md)).
 - **Abort/rollback:** if a safety incident occurs (conflicting final evidence,
   forged certificate accepted, key compromise), halt public routes back to 503,
   preserve evidence (journal, `fork-incidents.bin`, archives, logs), and follow
   the incident runbook. Roll back to the saved verified digest only with a
   compatible genesis; never roll finalized history back. The ledger is
-  append-only — recovery is restore/resync, not rewrite
+  append-only: recovery is restore/resync, not rewrite
   ([ledger-repair.md](ledger-repair.md)).
 
 ## Prep checklist (do now, activation later)
