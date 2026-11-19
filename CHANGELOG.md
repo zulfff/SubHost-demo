@@ -245,6 +245,31 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Encrypted producer keystore (S9.6, ADR-011).** New Track B crate
+  `subhost-keystore`: purpose-specific JSON v1 (`subhost-producer-keystore/v1`,
+  explicitly not ERC-2335) wrapping the canonical 32-byte BLS scalar in
+  scrypt-derived AES-256-GCM. Purpose, version, public key, KDF parameters and
+  salt are authenticated as domain-separated binary associated data. The scrypt
+  allowlist is `log_n` 15..=18, `r = 8`, `p = 1`, `dklen = 32` (default
+  `log_n = 17`, 128 MiB) with checked memory/work estimates under the same
+  256 MiB ceiling as the wallet fix (SUBHOST-2026-002) before any KDF work.
+  Inputs are `O_NOFOLLOW`, owner-only, ownership-checked and bounded (16 KiB
+  keystore, 4 KiB password); non-Unix platforms fail explicitly. Writes publish
+  a `0600` sibling tempfile with no-clobber hard-link semantics, file and
+  directory sync, and an authenticated decrypt read-back. New CLI:
+  `subhost producer create/inspect/unlock/migrate` — passwords come from twice
+  non-echo prompts or an owner-only credential file (one trailing LF/CRLF
+  stripped, embedded CR/LF/NUL refused), never a password argument.
+  `subhost init --producer-credential-file` unlocks an existing keystore and
+  fails closed without one; it never generates a key when a credential is
+  supplied. Migration is an explicit CLI command (not automatic at start-up):
+  it preserves the plaintext source on success and every failure, checks
+  genesis membership when a genesis exists, and never replaces an existing
+  keystore. Encrypted node start-up itself awaits Track A's
+  `bootstrap_with_producer_key`; until then `subhost node` is unchanged and the
+  legacy `0600` file remains the explicit demo path. Guide:
+  `docs/operations/producer-keystore.md`.
+
 - **View-change safety regressions (S2.4b, Q-031).** Direct tests now cover the
   phased view-change safety contract: same-view report equivocation is refused
   and a lower report from the same signer is ignored; a peer report whose
