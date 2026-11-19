@@ -58,14 +58,22 @@ in-place upgrade of the demo chain, and never the broken scalar-hash suite.
   genesis and `consensus_context()`. Two chains with different schedules can
   never share a genesis commitment.
 
-Generation (local fixture pattern; adapt paths/ports for the public hosts):
+Generation — prep script (encrypted key material, runnable now):
 
 ```sh
-# Builds a fresh 4-validator genesis + keys under a new directory, chain 31338.
-# The example creates keys once at 0600 and refuses a conflicting setup.
-cargo run -p subhost-node --example local-testnet -- \
-  --data-dir /var/lib/subhost-testnet --smoke
+# PREP ONLY: generates four distinct encrypted producer keystores + a pubkey
+# manifest for a fresh chain-31338 genesis. No deployment, no route changes,
+# no final genesis. Refuses a conflicting setup; keys/credentials are 0600.
+scripts/testnet/prepare-public-genesis.sh --data-dir /var/lib/subhost-testnet
 ```
+
+The script stops at the key material: the shared genesis still needs PoP
+regeneration, the fee policy and the calldata schedule bound (gated on the
+fee/calldata CLI flags, Q-037 L4 and the S9.6 bootstrap, §1). It prints those
+gated next steps and never writes an activation-ready genesis. The
+`local-testnet` example (`cargo run -p subhost-node --example local-testnet`)
+is only a chain-1337 **plaintext demo fixture** — do not use it for the public
+chain.
 
 For separate public hosts, generate the shared `genesis.json` once (it lists all
 four validators with their public keys and PoP), then distribute the **same**

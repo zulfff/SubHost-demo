@@ -289,6 +289,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Public genesis prep script (Q-012/Q-037).** Added
+  `scripts/testnet/prepare-public-genesis.sh`: generates the four distinct
+  encrypted producer keystores (`subhost producer create`) plus owner-only
+  credential files and a public-key manifest for a fresh chain-31338 genesis.
+  Prep-only — no deployment, no route changes, and no activation-ready genesis:
+  it stops at the key material and prints the gated assembly steps (PoP
+  regeneration, fee policy and calldata schedule binding) that wait on the
+  fee/calldata CLI flags, Q-037 L4 and the S9.6 bootstrap (#79). Refuses a
+  conflicting setup, never clobbers keys, keeps secrets `0600`, and warns never
+  to commit them. The activation runbook §2 now points to it and marks the
+  `local-testnet` example as a chain-1337 plaintext demo only.
+
 - **Public testnet activation prep runbook (Q-012, gated by Q-037).** Added
   `docs/operations/public-testnet-activation.md`: the activation gate (Q-037
   calldata-pricing ladder step **L4** merged+verified AND the S9.6 encrypted
