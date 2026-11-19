@@ -133,7 +133,8 @@ pub struct RpcState {
     /// a signing key, and a producer needs both.
     pub(crate) validators: Option<Arc<ValidatorRegistry>>,
     /// Metrics registry for committed mempool lifecycle events, attached by
-    /// `RpcServer::with_metrics`. `None` keeps the pool's event buffer inert.
+    /// `RpcServer::with_metrics`. `None` drains and discards buffered events
+    /// on flush instead of recording them.
     pub(crate) metrics: Option<Metrics>,
 }
 
@@ -234,10 +235,14 @@ impl RpcState {
     ///
     /// Called after a successful submit: the candidate pool's event buffer was
     /// swapped into the live pool, and rejected candidates dropped theirs, so
-    /// this counts exactly the committed admissions. Inert without metrics.
+    /// this counts exactly the committed admissions. The buffer is drained
+    /// unconditionally; without a registry the events are discarded, so they
+    /// neither accumulate nor publish when a registry is attached later.
     pub(crate) fn flush_mempool_events(&self) {
-        if let Some(metrics) = &self.metrics {
-            write(&self.mempool).flush_events(metrics);
+        let mut pool = write(&self.mempool);
+        match &self.metrics {
+            Some(metrics) => pool.flush_events(metrics),
+            None => pool.drain_events(),
         }
     }
 

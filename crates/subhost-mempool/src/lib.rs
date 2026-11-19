@@ -212,6 +212,16 @@ impl Mempool {
         }
     }
 
+    /// Discard buffered lifecycle events without recording them.
+    ///
+    /// The no-registry counterpart of [`Self::flush_events`]: a pool whose
+    /// owner has no metrics must still drain on every flush, so the buffer
+    /// cannot grow unbounded and a registry attached later never publishes
+    /// admissions that predate it.
+    pub fn drain_events(&mut self) {
+        self.events.clear();
+    }
+
     /// Drop a transaction once it is mined or expired.
     pub fn remove(&mut self, tx_hash: &Hash) -> bool {
         let Some(tx) = self.txs.remove(tx_hash) else {
@@ -594,6 +604,27 @@ mod tests {
         let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
         assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 0"));
         pool.flush_events(&metrics);
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+    }
+
+    #[test]
+    fn drain_without_a_registry_discards_and_never_publishes_history() {
+        let mut pool = Mempool::default();
+        pool.add(tx(1, 0, 10)).unwrap();
+        pool.add(tx(2, 0, 10)).unwrap();
+        assert_eq!(pool.events.len(), 2);
+        pool.drain_events();
+        assert!(pool.events.is_empty(), "the buffer must not grow without a registry");
+        pool.drain_events();
+
+        // A registry attached later sees only admissions that follow it.
+        let metrics = Metrics::new().unwrap();
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 0"));
+        pool.add(tx(3, 0, 10)).unwrap();
         pool.flush_events(&metrics);
         let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
         assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));

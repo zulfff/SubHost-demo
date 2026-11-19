@@ -238,8 +238,11 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   carries them, so rejected candidates drop their events and only committed
   admissions count. `Mempool::flush_events` drains the buffer into
   `subhost_mempool_transactions_total`, called by the `eth_sendTransaction`
-  handler after a successful submit. `expired` remains registered at 0 until
-  the S6.3 TTL path exists. `subhost-mempool` now depends on `subhost-metrics`
+  handler after a successful submit. The drain is unconditional: without a
+  registry, `Mempool::drain_events` discards the buffer, so it never grows and
+  a registry attached later counts only subsequent admissions. `expired`
+  remains registered at 0 until the S6.3 TTL path exists. `subhost-mempool`
+  now depends on `subhost-metrics`
   (enum + flush only; no registry handle is stored in the pool).
 
 - **Corrected BLS authentication for the testnet.** RFC 9380 G2 hashing replaces

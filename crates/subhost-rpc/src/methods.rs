@@ -764,6 +764,27 @@ mod tests {
         handle.stopped().await;
     }
 
+    #[test]
+    fn flush_without_a_registry_drains_and_publishes_no_history() {
+        let key = signing_key(11);
+        let mut state = funded_state(&key, 100_000);
+        // No registry attached: committed submits must still drain the buffer,
+        // so it cannot grow across the process lifetime.
+        state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        state.flush_mempool_events();
+        state.submit_transaction(signed_transfer(&key, 1, 10)).unwrap();
+        state.flush_mempool_events();
+
+        // A registry attached later counts only admissions that follow it;
+        // the drained history above must not publish retroactively.
+        let metrics = Metrics::new().unwrap();
+        state.set_metrics(metrics.clone());
+        state.submit_transaction(signed_transfer(&key, 2, 10)).unwrap();
+        state.flush_mempool_events();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+    }
+
     #[tokio::test]
     async fn mempool_events_count_only_committed_submits() {
         let key = signing_key(9);
