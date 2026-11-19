@@ -1492,3 +1492,13 @@ fn a_restored_ledger_refuses_a_different_genesis_gas_limit() {
         "the refusal must name the gas limit, got: {error}"
     );
 }
+
+#[test]
+fn node_config_defaults_to_no_automatic_retention() {
+    // Q-036 Q5: the CLI's `--retention-blocks` stacks on this field, so `None`
+    // must stay the default and mean exactly today's offline-only prune.
+    let dir = tempfile::tempdir().unwrap();
+    assert_eq!(test_config(dir.path()).retention_blocks, None);
+    let configured = NodeConfig { retention_blocks: Some(50_000), ..test_config(dir.path()) };
+    assert_eq!(configured.retention_blocks, Some(50_000));
+}
