@@ -217,6 +217,17 @@ Durability and integrity:
   removed. `subhost db prune --keep-segments N` drops the oldest segment files, keeps
   the newest snapshot as the replay anchor, and refuses (without writing) when the
   retained history would no longer contain the block at the snapshot's own height;
+- `LedgerStore::prune_to_height(h)` is the height-based, online-safe counterpart
+  (Q-036): it drops whole segments whose every block is at or below `h` and keeps
+  any segment that straddles `h`, so the new base is a segment boundary, not
+  exactly `h`. **The newest snapshot is the hard floor**: a request at or above
+  `newest_snapshot_height` returns `PruneOutcome::RefusedBySnapshot` without
+  writing, because the anchor's own block must stay retained. With snapshots
+  every 1024 blocks the honest retention bound is `n + up to 1023 blocks`, not
+  `n`. A successful prune refreshes the verified-head cache's base in place, so
+  a warm append still takes the suffix path; head height, hash and state are
+  unchanged by retention. The caller serializes it with persist/load under the
+  node's commit lock;
 - every read is validated before it is trusted: size bounds, magic, versions,
   checksums, manifest consistency (segment file names, record counts, snapshot name
   and height), and chain binding;
@@ -292,8 +303,15 @@ What the ledger does not guarantee:
   blocks and start-up executes at most that many blocks on top of it, but every
   segment is still read and scanned, and old segments are never dropped, so
   start-up I/O and disk use still grow with history until S4.3–S4.4;
-- pruning is offline only: `subhost db prune` runs with the node stopped, keeps the
-  newest N segments, and needs the snapshot to stay inside the retained history. A
+- pruning has two entry points: the offline `subhost db prune` (node stopped,
+  newest N segments) and the online `RpcState::retain_from(h)`, which prunes
+  storage and then trims the in-memory `blocks`, `receipts` and `base_height`
+  under the commit lock, storage first. A refusal or failure leaves every
+  in-memory view untouched, and a crash between the two is safe because `load()`
+  rebuilds the views from the retained suffix. Both need the snapshot to stay
+  inside the retained history. The automatic node trigger and the
+  `--retention-blocks` flag are separate consumer slices; until they land,
+  retention still requires an explicit call. A
   pruned node is not an archive node: `eth_getBlockByNumber` returns `null` below its
   base height, `eth_getTransactionByHash` and `eth_getTransactionReceipt` return
   `null` for a pruned transaction, `earliest` is the oldest retained block, and

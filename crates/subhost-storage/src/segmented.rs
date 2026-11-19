@@ -1174,6 +1174,87 @@ pub(crate) fn prune(
     Ok(PruneOutcome::Pruned { dropped_segments, retained_segments: keep_segments, base_height })
 }
 
+/// Height-based prune for automatic retention (Q-036): drop whole segments whose
+/// every block is at or below `height`, keeping any segment that straddles it.
+///
+/// The newest snapshot is the hard floor. A request at or above its height
+/// returns `RefusedBySnapshot` without writing: the anchor's own block must stay
+/// retained, so the honest bound is the request plus up to one snapshot cadence.
+/// On success the verified-head cache's base is refreshed in place — retention
+/// changes neither the head height, its hash, nor the state.
+pub(crate) fn prune_to_height(
+    chain_id: ChainId,
+    data_dir: &Path,
+    height: u64,
+    head_cache: &HeadCache,
+) -> Result<PruneOutcome, StorageError> {
+    let committed = read_manifest(data_dir, chain_id)?;
+    let snapshot = committed
+        .snapshot
+        .clone()
+        .ok_or_else(|| StorageError::Manifest("manifest has no snapshot".into()))?;
+    if height >= snapshot.height {
+        return Ok(PruneOutcome::RefusedBySnapshot {
+            snapshot_height: snapshot.height,
+            requested_height: height,
+        });
+    }
+
+    // Whole segments only: a segment holding any block above `height` stays.
+    let mut dropped_segments = 0usize;
+    let mut base_height = committed.base_height;
+    for segment in &committed.segments {
+        let last_height = base_height
+            .checked_add(segment.records)
+            .ok_or_else(|| StorageError::Manifest("base height overflow".into()))?;
+        if last_height > height {
+            break;
+        }
+        base_height = last_height;
+        dropped_segments += 1;
+    }
+    if dropped_segments == 0 {
+        return Ok(PruneOutcome::NothingToPrune { segments: committed.segments.len() });
+    }
+    let retained_segments = committed.segments.len() - dropped_segments;
+    let first_retained_height = base_height
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Manifest("base height overflow".into()))?;
+    if first_retained_height > snapshot.height {
+        return Err(StorageError::PruneWouldDropSnapshot {
+            first_retained_height,
+            snapshot_height: snapshot.height,
+        });
+    }
+
+    let pruned = CommittedLedger {
+        head_height: committed.head_height,
+        head_hash: committed.head_hash,
+        base_height,
+        fee_policy: committed.fee_policy.clone(),
+        snapshot: Some(snapshot.clone()),
+        segments: committed.segments[dropped_segments..].to_vec(),
+    };
+    let covered = pruned.base_height.checked_add(pruned.records()?);
+    if covered != Some(pruned.head_height) {
+        return Err(StorageError::Manifest(
+            "pruned segments do not cover the committed head".into(),
+        ));
+    }
+
+    write_manifest(data_dir, chain_id, &pruned)?;
+    cleanup(data_dir, &pruned, Some(&snapshot));
+    // The retained prefix is the same verified prefix, only shorter, so a warm
+    // append keeps its suffix path instead of paying one full validation.
+    if let Some(cached) = lock_cache(head_cache).as_mut() {
+        if cached.height == committed.head_height && cached.hash == committed.head_hash {
+            cached.base_height = base_height;
+        }
+    }
+    debug!(base_height, dropped_segments, retained_segments, "pruned ledger to a height");
+    Ok(PruneOutcome::Pruned { dropped_segments, retained_segments, base_height })
+}
+
 /// Group the receipts of the blocks this persist appends (heights above
 /// `previous_head`); receipts of the committed prefix are never rewritten.
 fn group_receipts(snapshot: &LedgerSnapshot, previous_head: u64) -> HashMap<u64, Vec<Receipt>> {

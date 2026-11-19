@@ -370,6 +370,21 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   the restored pool. No store is attached in production yet, so both paths keep
   today's volatile pool; tests pin the call sites and that a stray
   `mempool.bin` is ignored while no store is attached.
+- **Height-based online ledger retention (SUBHOST-2026-003 fix 3, Q-036).**
+  `LedgerStore::prune_to_height(h)` drops whole segments at or below `h`, keeps a
+  straddling segment, and returns the new base as a segment boundary. The newest
+  snapshot is the hard floor: a request at or above it returns the new typed
+  `PruneOutcome::RefusedBySnapshot { snapshot_height, requested_height }` without
+  writing, so automatic retention logs and counts a normal no-op instead of
+  treating it as a fault. The documented bound is therefore `n + up to 1023
+  blocks` (snapshot cadence), not `n`. A successful prune refreshes the
+  verified-head cache's base in place, so warm appends keep the suffix path.
+  `RpcState::retain_from(h)` prunes storage first and then trims the in-memory
+  blocks, receipts and `base_height` atomically under the commit lock; a refusal
+  or failure leaves every view untouched, and a crash between the two is safe
+  because load rebuilds from the retained suffix. `base_height` is now an atomic
+  so the trim works across clones. The node trigger and `--retention-blocks` are
+  separate consumer slices; no automatic pruning happens until they land.
 
 - **RPC method spans (S8.1, Q-033).** Every decoded JSON-RPC call on HTTP and
   WebSocket emits one `info` span (`rpc_call`, target `subhost_rpc`) through

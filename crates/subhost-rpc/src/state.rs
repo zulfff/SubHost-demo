@@ -13,7 +13,7 @@ use subhost_core::{
 use subhost_mempool::{Mempool, MempoolStore};
 use subhost_metrics::Metrics;
 use subhost_state::{AccountProof, State};
-use subhost_storage::{LedgerDiskStats, LedgerStore, StorageError};
+use subhost_storage::{LedgerDiskStats, LedgerStore, PruneOutcome, StorageError};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
@@ -123,7 +123,9 @@ pub struct RpcState {
     pub(crate) blocks: Arc<RwLock<Vec<Block>>>,
     /// Height of the last block that pruning removed, captured when the state is
     /// built. `0` when history still starts at genesis.
-    pub(crate) base_height: u64,
+    /// Atomic so an online retention trim can advance it across clones under
+    /// the commit lock, exactly like `block_height` (Q-036).
+    pub(crate) base_height: Arc<AtomicU64>,
     /// Confirmed receipts keyed by transaction hash.
     pub(crate) receipts: Arc<RwLock<HashMap<Hash, Receipt>>>,
     pub(crate) store: LedgerStore,
@@ -194,7 +196,7 @@ impl RpcState {
             mempool: Arc::new(RwLock::new(Mempool::default())),
             state: Arc::new(RwLock::new(restored.state)),
             blocks: Arc::new(RwLock::new(restored.blocks)),
-            base_height: restored.base_height,
+            base_height: Arc::new(AtomicU64::new(restored.base_height)),
             receipts: Arc::new(RwLock::new(receipts)),
             store,
             commit_lock: Arc::new(Mutex::new(())),
@@ -278,6 +280,35 @@ impl RpcState {
     /// The fee policy in force, when this chain is fee-enabled.
     pub fn fee_policy(&self) -> Option<&FeePolicy> {
         self.fee_policy.as_ref()
+    }
+
+    /// Prune storage to `height` and trim the in-memory views to match (Q-036).
+    ///
+    /// Storage first, memory second, both under the commit lock: a refusal or a
+    /// failure leaves every in-memory view untouched, and a crash between the
+    /// two is safe because `load()` rebuilds the views from the retained suffix.
+    /// Returns the storage outcome so the node can log and count it; a prune
+    /// never fails an already durable block commit.
+    ///
+    /// The newest snapshot is the hard floor, so a request at or above it is a
+    /// typed `RefusedBySnapshot` no-op. State is unchanged by retention.
+    pub fn retain_from(&self, height: u64) -> Result<PruneOutcome, RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        let outcome = self.store.prune_to_height(height)?;
+        self.trim_to_pruned_base(outcome);
+        Ok(outcome)
+    }
+
+    /// Apply a storage prune to the in-memory views. Only a `Pruned` outcome
+    /// trims; a refusal, a no-op or an error leaves every view untouched.
+    fn trim_to_pruned_base(&self, outcome: PruneOutcome) {
+        if let PruneOutcome::Pruned { base_height, .. } = outcome {
+            let mut blocks = write(&self.blocks);
+            blocks.retain(|block| block.header.height > base_height);
+            let mut receipts = write(&self.receipts);
+            receipts.retain(|_, receipt| receipt.block_height > base_height);
+            self.base_height.store(base_height, Ordering::SeqCst);
+        }
     }
 
     /// Attach the durable pending-transaction store (S6.1b, Q-016/Q-034).
@@ -562,19 +593,19 @@ impl RpcState {
     pub fn block_at_height(&self, height: u64) -> Option<Block> {
         // A pruned height has no block to serve; the mapping stays a single
         // offset because the retained history is contiguous.
-        let index = height.checked_sub(self.base_height)?.checked_sub(1)?;
+        let index = height.checked_sub(self.base_height())?.checked_sub(1)?;
         let index = usize::try_from(index).ok()?;
         read(&self.blocks).get(index).cloned()
     }
 
     /// Height of the newest block this node can serve.
     pub fn head_height(&self) -> u64 {
-        self.base_height.saturating_add(self.block_count() as u64)
+        self.base_height().saturating_add(self.block_count() as u64)
     }
 
     /// Height of the last block pruning removed; `0` without pruning.
     pub fn base_height(&self) -> u64 {
-        self.base_height
+        self.base_height.load(Ordering::SeqCst)
     }
 
     /// Number of retained blocks, which is not the head height after a prune.
@@ -865,5 +896,92 @@ mod tests {
         assert!(pool.len() < txs.len());
         assert!(pool.pending_bytes() <= pool.config().max_pending_bytes);
         assert!(pool.contains(&txs[0].hash()), "the lowest nonces are restored first");
+    }
+
+    // --- Q-036 online retention ---
+
+    #[test]
+    fn trim_to_pruned_base_drops_blocks_and_receipts_below_the_new_base() {
+        let key = signing_key(41);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = RpcState::in_memory(1).unwrap();
+        state.seed_accounts([(sender, 1_000_000)]).unwrap();
+        for nonce in 0..6 {
+            state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+        }
+        assert_eq!(state.block_height(), 6);
+        assert_eq!(state.base_height(), 0);
+
+        state.trim_to_pruned_base(PruneOutcome::Pruned {
+            dropped_segments: 3,
+            retained_segments: 3,
+            base_height: 3,
+        });
+        assert_eq!(state.base_height(), 3);
+        assert_eq!(state.block_count(), 3);
+        assert_eq!(state.head_height(), 6);
+        assert!(state.block_at_height(3).is_none(), "a pruned height is not servable");
+        assert_eq!(state.block_at_height(4).unwrap().header.height, 4);
+        assert_eq!(read(&state.receipts).len(), 3);
+        assert!(read(&state.receipts).values().all(|r| r.block_height > 3));
+        // Retention does not touch state: the newest nonce is still committed.
+        assert_eq!(state.nonce(&sender), 6);
+    }
+
+    #[test]
+    fn a_refused_or_no_op_prune_leaves_every_view_untouched() {
+        let key = signing_key(42);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = RpcState::in_memory(1).unwrap();
+        state.seed_accounts([(sender, 1_000_000)]).unwrap();
+        for nonce in 0..3 {
+            state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+        }
+        for outcome in [
+            PruneOutcome::RefusedBySnapshot { snapshot_height: 1, requested_height: 2 },
+            PruneOutcome::NothingToPrune { segments: 1 },
+        ] {
+            state.trim_to_pruned_base(outcome);
+            assert_eq!(state.base_height(), 0);
+            assert_eq!(state.block_count(), 3);
+            assert_eq!(read(&state.receipts).len(), 3);
+        }
+    }
+
+    #[test]
+    fn retain_from_refuses_at_the_snapshot_floor_and_keeps_memory() {
+        let dir = tempdir().unwrap();
+        let key = signing_key(43);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = RpcState::with_data_dir(1, dir.path()).unwrap();
+        state.seed_accounts([(sender, 1_000_000)]).unwrap();
+        for nonce in 0..4 {
+            state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+        }
+        // Seeding persists the genesis anchor at height 0 and the default
+        // cadence writes no new snapshot before 1024 blocks, so the floor is 0
+        // and any request is the typed refusal, not a fault.
+        let outcome = state.retain_from(2).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                PruneOutcome::RefusedBySnapshot { snapshot_height: 0, requested_height: 2 }
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(state.base_height(), 0);
+        assert_eq!(state.block_count(), 4);
+        assert_eq!(read(&state.receipts).len(), 4);
+    }
+
+    #[test]
+    fn retain_from_on_a_store_without_a_ledger_errors_without_trimming() {
+        let state = RpcState::in_memory(1).unwrap();
+        let key = signing_key(44);
+        let tx = signed_transfer(&key, 0, 1);
+        state.mempool.write().unwrap().add(tx).unwrap();
+        assert!(state.retain_from(1).is_err());
+        assert_eq!(state.base_height(), 0);
+        assert_eq!(state.pending_count(), 1);
     }
 }

@@ -2044,3 +2044,117 @@ fn a_policy_less_manifest_stays_byte_identical() {
     assert!(value.get("fee_policy").is_none(), "{value}");
     assert_eq!(value["version"], 2);
 }
+
+// --- Q-036 height-based retention ---
+
+#[test]
+fn prune_to_height_drops_whole_segments_below_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    // One segment per block, a snapshot every two blocks: the newest anchor is 5.
+    persist_each_block(&store, 6, 1, 2);
+    let before = manifest_value(dir.path());
+
+    let outcome = store.prune_to_height(3).unwrap();
+    assert!(
+        matches!(
+            outcome,
+            PruneOutcome::Pruned { base_height: 3, dropped_segments: 3, retained_segments: 3 }
+        ),
+        "{outcome:?}"
+    );
+    let after = manifest_value(dir.path());
+    assert_eq!(after["base_height"], 3);
+    assert_eq!(after["head_height"], before["head_height"]);
+    assert_eq!(after["head_hash"], before["head_hash"]);
+
+    let restored = store.load().unwrap();
+    assert_eq!(restored.base_height, 3);
+    assert_eq!(restored.height(), 6);
+    assert_eq!(restored.blocks[0].header.height, 4);
+    assert_eq!(restored.blocks.len(), 3);
+}
+
+#[test]
+fn prune_to_height_refuses_at_the_snapshot_floor_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 6, 1, 2);
+    let before = fs::read(segmented::manifest_path(dir.path())).unwrap();
+    let segments_before = segment_names(dir.path());
+
+    // The newest snapshot is at height 5: at or above it the anchor block would
+    // be dropped, so this is a typed no-op, not an error and not a write.
+    for height in [5, 6, 100] {
+        let outcome = store.prune_to_height(height).unwrap();
+        assert!(
+            matches!(outcome, PruneOutcome::RefusedBySnapshot { snapshot_height: 5, requested_height } if requested_height == height),
+            "{outcome:?}"
+        );
+    }
+    assert_eq!(fs::read(segmented::manifest_path(dir.path())).unwrap(), before);
+    assert_eq!(segment_names(dir.path()), segments_before);
+    assert_eq!(store.load().unwrap().base_height, 0);
+}
+
+#[test]
+fn prune_to_height_is_a_no_op_when_no_segment_is_fully_below() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 4, 1, 2);
+    assert!(matches!(
+        store.prune_to_height(0).unwrap(),
+        PruneOutcome::NothingToPrune { segments: 4 }
+    ));
+    assert_eq!(store.load().unwrap().base_height, 0);
+}
+
+#[test]
+fn prune_to_height_keeps_a_segment_that_straddles_the_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    // Every block lands in one segment, so no whole segment is below the target.
+    // A snapshot per block keeps the anchor at the tip, above the request.
+    for prefix in 1..=4 {
+        store.persist_with_limits(&ledger(prefix).0, 1024 * 1024, 1).unwrap();
+    }
+    assert!(matches!(
+        store.prune_to_height(3).unwrap(),
+        PruneOutcome::NothingToPrune { segments: 1 }
+    ));
+    assert_eq!(store.load().unwrap().base_height, 0);
+}
+
+#[test]
+fn warm_append_after_prune_to_height_still_takes_the_suffix_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 6, 1, 2);
+    store.prune_to_height(3).unwrap();
+
+    // The cache base was refreshed in place, so this append is still validated
+    // as a suffix on the verified head: a nonce skip is refused by re-execution,
+    // which the commitment-only full path would accept.
+    let (full, state) = ledger(6);
+    let (block, receipts) = seal_without_replay(&full.blocks[5], vec![transfer(9)], &state);
+    let mut blocks = full.blocks[3..].to_vec();
+    blocks.push(block);
+    let mut retained: Vec<Receipt> =
+        full.receipts.iter().filter(|r| r.block_height >= 4).cloned().collect();
+    retained.extend(receipts);
+    let suffix =
+        LedgerSnapshot { chain_id: 1, state: state.snapshot(), blocks, receipts: retained };
+
+    let error = store.persist(&suffix).unwrap_err();
+    assert!(error.to_string().contains("cannot replay block 7"), "{error}");
+    assert_eq!(store.load().unwrap().height(), 6);
+}
+
+#[test]
+fn prune_to_height_needs_a_segmented_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = open(dir.path());
+    assert!(matches!(fresh.prune_to_height(1), Err(StorageError::Invalid(_))));
+    let ephemeral = LedgerStore::ephemeral(1).unwrap();
+    assert!(matches!(ephemeral.prune_to_height(1), Err(StorageError::Invalid(_))));
+}

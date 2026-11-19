@@ -100,6 +100,11 @@ pub enum PruneOutcome {
     Pruned { dropped_segments: usize, retained_segments: usize, base_height: u64 },
     /// The ledger already keeps at most the requested number of segments.
     NothingToPrune { segments: usize },
+    /// The newest snapshot anchor is at or below the requested height, so
+    /// pruning would drop the block the replay anchor is rooted in. Nothing was
+    /// written. This is a normal outcome of automatic retention, not a fault:
+    /// the caller logs and counts it and never fails a block commit (Q-036).
+    RefusedBySnapshot { snapshot_height: u64, requested_height: u64 },
 }
 
 /// Result of [`LedgerStore::migrate`].
@@ -420,6 +425,34 @@ impl LedgerStore {
             return Err(StorageError::Invalid("there is no segmented ledger to prune".into()));
         }
         segmented::prune(self.chain_id, data_dir, keep_segments)
+    }
+
+    /// Prune whole segments so that only blocks above `height` are retained.
+    ///
+    /// The height-based, online-safe counterpart of [`Self::prune`]: the node
+    /// knows a height, not a file count. Segments are dropped whole, so the new
+    /// `base_height` is the last segment boundary at or below `height` — a
+    /// segment straddling `height` is retained because it holds blocks above it.
+    ///
+    /// **The newest snapshot is the hard floor.** A request at or above
+    /// `newest_snapshot_height` returns
+    /// [`PruneOutcome::RefusedBySnapshot`] without writing anything, because the
+    /// replay anchor's own block must stay retained. With snapshots every 1024
+    /// blocks the honest retention bound is `n + up to 1023 blocks`, not `n`.
+    ///
+    /// The caller serializes this with [`Self::persist`]/[`Self::load`] under the
+    /// node's commit lock (single writer). On success the verified-head cache's
+    /// base is refreshed in place, so a warm append still takes the suffix path;
+    /// the head height, hash and state are unchanged by retention.
+    pub fn prune_to_height(&self, height: u64) -> Result<PruneOutcome, StorageError> {
+        let Some(path) = &self.path else {
+            return Err(StorageError::Invalid("an ephemeral store has no ledger to prune".into()));
+        };
+        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
+        if !segmented::manifest_path(data_dir).is_file() {
+            return Err(StorageError::Invalid("there is no segmented ledger to prune".into()));
+        }
+        segmented::prune_to_height(self.chain_id, data_dir, height, &self.head)
     }
 
     /// Measure the committed ledger's on-disk footprint without replaying it.
