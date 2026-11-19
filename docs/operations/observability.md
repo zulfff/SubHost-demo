@@ -1,12 +1,11 @@
 # Observability: health, runtime metrics and alerts
 
-Status: S8 Platform API (this document, ADR-013). The node runtime hooks that
-feed the runtime gauges are Track A work and land after this API; until then
-the new gauges read their registered defaults and `/health/ready` stays 503.
-The read-only RPC contract accessors (`RpcState::finalized_height`,
-`RpcState::ledger_disk_stats`) are landed; the node call-sites that publish them
-periodically are the follow-up hooks slice.
-Nothing here infers readiness from peer counts or block height.
+Status: S8 Platform API (this document, ADR-013) plus the Track A node runtime
+hooks (Q-020/Q-032): health predicates come from actual runtime state, finalized
+height and QC latency are published at the verified final commit path, and the
+ledger footprint/snapshot age are measured periodically under the commit lock.
+`subhost_connected_peers` is the remaining gated gauge (needs a network handle
+accessor). Nothing here infers readiness from peer counts or block height.
 
 ## Health endpoints
 
@@ -165,20 +164,21 @@ groups:
         labels: { severity: ticket }
 ```
 
-`SubhostNodeNotReady` assumes a blackbox exporter probing `/health/ready`;
-height/finality alerts assume the Track A runtime hooks have landed. Until
-then `subhost_finalized_height` stays 0 and `SubhostFinalityLag` would fire on
-any committed chain — enable it only after the hooks ship.
+`SubhostNodeNotReady` assumes a blackbox exporter probing `/health/ready`.
+The node runtime hooks have landed, so `subhost_finalized_height` carries a real
+value on validator and observer chains and `SubhostFinalityLag` can be enabled.
+An explicit single-writer demo chain publishes finalized height 0 by design (no
+quorum certificates exist), so that alert must stay disabled for demo deployments.
 
 ## Limitations
 
-- Node/consensus/network call-sites for the runtime gauges and health
-  predicates are Track A work (Q-020); this API publication changes no
-  A-owned source.
+- Node/consensus call-sites for the runtime gauges and health predicates are
+  landed (Q-020/Q-032). `subhost_connected_peers` still needs a network handle
+  accessor and stays 0 until then.
 - OTLP tracing export provider (S8.1) is published behind the `subhost-telemetry`
   `otlp` feature (Q-035): `otlp::init_with_otlp` installs the export layer and
   returns a retained shutdown guard. RPC method spans are landed (#69) and
   export through it once a binary installs the provider; binary wiring (CLI flag
-  / node) and the Track A block/consensus spans follow.
+  / node) and the Track A block/consensus spans follow (contract agreed, Q-035).
 - The exporter is unauthenticated: bind loopback or a private interface, or
   front it with an authenticating proxy. `/health/*` reveals readiness state.

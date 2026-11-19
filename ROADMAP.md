@@ -560,7 +560,7 @@ looking traffic.
 | Task | Status |
 | --- | --- |
 | S8.2/S8.3 Platform API | Merged (PR #47, ADR-013, Q-020) |
-| S8.2/S8.3 node runtime hooks | Partial: block height + health wired; finalized height, QC latency, disk stats and peer count still pending Track A (see `docs/operations/alerts.md`) |
+| S8.2/S8.3 node runtime hooks | In review (Q-032): truthful health predicates (`ledger_loaded` after recovery, `pipeline_alive` task liveness, `syncing` = catch-up, halt clears readiness), finalized height + QC latency at the verified commit path, periodic disk stats/snapshot age under the commit lock. Peer count still pending a network handle accessor (see `docs/operations/alerts.md`) |
 | S8.2 mempool event wiring | Merged (#51, Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
 | S8.1 RPC spans | Landed (Q-033, #69): per-call spans in the RPC metrics middleware, privacy-boundary tested |
 | S8.1 OTLP export | Provider published (tania, Q-035, `subhost-telemetry` `otlp` feature); binary wiring + Track A block/consensus spans pending |

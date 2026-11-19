@@ -19,11 +19,11 @@ gated rules only after their call-sites land, or they fire on a healthy chain.
 | Readiness/liveness | `/health/ready`, `/health/live` | **live** (`ledger_loaded && !syncing && consensus_alive`) |
 | RPC requests/errors/latency | `subhost_rpc_*` | **live** |
 | Mempool lifecycle | `subhost_mempool_transactions_total{event}` | **live** (pool-committed; `expired` is 0 until S6.3) |
-| Finalized height | `subhost_finalized_height` | **gated** — setter exists, node does not call it yet; stays 0 |
-| QC commit latency | `subhost_qc_commit_latency_seconds` | **gated** — histogram empty until wired |
-| Ledger disk footprint | `subhost_ledger_active_bytes` | **gated** — stays 0 until `disk_stats` is wired |
-| Snapshot age | `subhost_ledger_snapshot_modified_seconds` | **gated** — 0 means unavailable, not an epoch |
-| Connected peers | `subhost_connected_peers` | **gated** — stays 0 until wired |
+| Finalized height | `subhost_finalized_height` | **live** (verified final Commit path; a single-writer demo chain publishes 0 by design) |
+| QC commit latency | `subhost_qc_commit_latency_seconds` | **live** (samples only for proposals this node authenticated; catch-up commits add none) |
+| Ledger disk footprint | `subhost_ledger_active_bytes` | **live** (`disk_stats` under the commit lock; a failed measurement keeps the last value) |
+| Snapshot age | `subhost_ledger_snapshot_modified_seconds` | **live** (same measurement; 0 means unavailable, not an epoch) |
+| Connected peers | `subhost_connected_peers` | **gated** — stays 0 until a network handle accessor is wired |
 | Reorg count | `subhost_reorg_total` | registered at 0, **no increment API** — reorgs unsupported; never alert on it |
 | Pending-file cleanup failures | `subhost_mempool_pending_cleanup_failures_total` | **gated** — registered at 0 and *will* increment once the S6.1b node wiring lands (unlike reorgs, whose 0 is permanent). Enable `SubhostPendingCleanupFailing` with that wiring |
 
