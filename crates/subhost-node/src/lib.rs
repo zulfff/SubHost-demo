@@ -279,6 +279,12 @@ impl Node {
             .transpose()?;
         if let Some(history) = &certified_history {
             let history = history.lock().expect("fresh archive lock");
+            check_archive_matches_ledger(
+                history.path(),
+                history.last(),
+                state.block_height(),
+                state.tip_hash(),
+            )?;
             info!(
                 retained = history.len(),
                 from = ?history.retained_from(),
@@ -687,6 +693,48 @@ async fn run_network_inner(
 struct ProducedRound {
     proposal: DriverProposal,
     vote: Option<Vote>,
+}
+
+/// Refuse a restored archive that cannot belong to this ledger.
+///
+/// A certificate is archived just before the ledger commit, so one item of lead
+/// (`archive_tip == ledger_height + 1`) is the normal crash state and is
+/// accepted: the retry appends the same height and the archive treats it as a
+/// no-op. A larger lead means the files came from different points — a partial
+/// restore — and every future commit below the archived tip would fail. Report
+/// that at boot instead of wedging the node on its first commit.
+fn check_archive_matches_ledger(
+    path: &Path,
+    last: Option<(BlockHeight, &[u8])>,
+    ledger_height: BlockHeight,
+    ledger_tip: Hash,
+) -> Result<(), NodeError> {
+    let Some((tip, block_bytes)) = last else { return Ok(()) };
+    let mixed_restore = |detail: String| NodeError::CertifiedHistory {
+        path: path.to_path_buf(),
+        detail: format!(
+            "{detail}; restore the archive, ledger, journal and incident log from \
+             the same stopped node"
+        ),
+    };
+    if tip > ledger_height.saturating_add(1) {
+        return Err(mixed_restore(format!(
+            "archive tip {tip} is ahead of ledger height {ledger_height}"
+        )));
+    }
+    if tip == ledger_height.saturating_add(1) {
+        // The normal crash state, but only a real child of this ledger tip may be
+        // replayed. Anything else means the files came from different points.
+        let parent_matches = decode_block(block_bytes).is_ok_and(|block| {
+            block.header.height == tip && block.header.parent_hash == ledger_tip
+        });
+        if !parent_matches {
+            return Err(mixed_restore(format!(
+                "the archive records height {tip}, which does not extend the restored ledger tip"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Append a verified `(block, QC)` to the node-owned archive.
@@ -1098,6 +1146,9 @@ impl CandidateBuffer {
     fn offer(&mut self, block: Block, qc: QuorumCertificate) {
         let height = block.header.height;
         if self.entries.contains_key(&height) {
+            // The first pair per height wins; keep the drop visible so a peer
+            // serving two certified blocks at one height is not silent.
+            debug!(height, "dropping a second certified candidate at an occupied height");
             return;
         }
         if self.entries.len() >= MAX_CANDIDATES {
@@ -1177,6 +1228,40 @@ fn apply_certified_item(
     Ok(())
 }
 
+/// What an authenticated `Historical` certificate means against this ledger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoricalMeaning {
+    /// The retained block at that height carries the same hash.
+    Duplicate,
+    /// The retained block at that height carries a different hash.
+    Conflict,
+    /// No retained block can be compared: pruned, or the genesis anchor.
+    Unverifiable,
+}
+
+/// Decide a `Historical` certificate against the retained ledger (R-57-01).
+///
+/// Pruning drops old blocks but not the finality they proved, so a canonical
+/// certificate replayed at a pruned height can be neither confirmed nor refuted.
+/// Only a **retained** differing hash is accountable evidence; an unverifiable
+/// height must never halt the node, otherwise anyone replaying old canonical
+/// history could stop every pruning validator.
+fn historical_meaning(
+    base_height: BlockHeight,
+    height: BlockHeight,
+    retained: Option<Hash>,
+    incoming: Hash,
+) -> HistoricalMeaning {
+    if height <= base_height {
+        return HistoricalMeaning::Unverifiable;
+    }
+    match retained {
+        Some(local) if local == incoming => HistoricalMeaning::Duplicate,
+        Some(_) => HistoricalMeaning::Conflict,
+        None => HistoricalMeaning::Unverifiable,
+    }
+}
+
 /// Route an authenticated final certificate by its local meaning (S3.1/S3.2).
 ///
 /// Junk is a plain error from the classifier and never halts. Duplicate evidence
@@ -1196,11 +1281,20 @@ fn route_final_evidence(
             Ok(None)
         }
         FinalEvidence::Historical { height, hash } => {
-            let local = state.block_at_height(height).map(|block| block.hash());
-            if local == Some(hash) {
-                return Ok(None);
+            let retained = state.block_at_height(height).map(|block| block.hash());
+            let meaning = historical_meaning(state.base_height(), height, retained, hash);
+            if meaning == HistoricalMeaning::Conflict {
+                record_conflict(state, driver, height, hash, &qc, commit)?;
+            } else {
+                // Duplicate, or evidence this node cannot verify after a prune:
+                // append-only finality means there is nothing to adopt or halt on.
+                debug!(
+                    height,
+                    base_height = state.base_height(),
+                    unverifiable = meaning == HistoricalMeaning::Unverifiable,
+                    "historical certificate needs no ledger change"
+                );
             }
-            record_conflict(state, driver, height, hash, &qc, commit)?;
             Ok(None)
         }
         FinalEvidence::Conflicting { height } => {
@@ -1225,8 +1319,11 @@ fn record_conflict(
     qc: &QuorumCertificate,
     commit: &mut CommitContext<'_>,
 ) -> Result<(), NodeError> {
-    let local_hash =
-        state.block_at_height(height).map(|block| block.hash()).unwrap_or_else(|| state.tip_hash());
+    // `Hash::ZERO` is a sentinel, not a block hash: it records that no local
+    // block is retained at this height. Only a retained, differing hash is a
+    // contradiction, so the fallback should be unreachable and must not claim the
+    // tip hash proves anything about `height`.
+    let local_hash = state.block_at_height(height).map_or(Hash::ZERO, |block| block.hash());
     let incident = ForkIncident {
         height,
         local_hash,

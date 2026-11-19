@@ -90,7 +90,13 @@ A conflicting authenticated final certificate is a durable incident: the node
 writes `fork-incidents.bin` beside the voting journal, halts, and reports readiness
 as not alive until an operator resolves it. A restart re-halts from that file
 before signing, so a mute validator never silently returns. Duplicate and
-unauthenticated evidence change no obligation and never halt. Transaction
+unauthenticated evidence change no obligation and never halt.
+
+A historical certificate is only decidable where the block is still retained.
+After a ledger prune, a canonical certificate replayed at a pruned height is
+unverifiable, not a fork: the node ignores it rather than halting, because it has
+already committed that height and no longer holds the block to compare. Only a
+retained differing hash records an incident. Transaction
 gossip and peer abuse controls are S7; submit the same transaction to potential
 leaders until that stage lands. Pending transactions remain volatile until S6.
 The timer assumes eventual delivery within its configured capped bound.

@@ -118,6 +118,16 @@ impl CertifiedHistory {
         Ok(())
     }
 
+    /// Path of this archive, for actionable bootstrap errors.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The newest archived `(height, block)` pair, for bootstrap coherence.
+    pub(crate) fn last(&self) -> Option<(BlockHeight, &[u8])> {
+        self.items.back().map(|item| (item.height, item.block.as_slice()))
+    }
+
     /// Ascending items inside `[from, to]`, capped by [`super::MAX_SYNC_ITEMS`].
     ///
     /// Heights above the archived tip are simply absent, so a peer receives a

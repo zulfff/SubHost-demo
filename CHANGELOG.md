@@ -91,6 +91,32 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **A pruned height is no longer treated as a fork (R-57-01, PR #57 review).**
+  `route_final_evidence` decided a `Historical` certificate by looking up the
+  block at its height and comparing hashes; after a ledger prune that lookup
+  returns `None`, so replaying old *canonical* history could halt a pruning
+  validator. The decision now compares against `base_height`: at or below the
+  retained base the certificate is unverifiable, records no incident and halts
+  nothing; only a retained differing hash is accountable evidence. The durable
+  record's `local_hash` fallback is the documented `Hash::ZERO` sentinel instead
+  of the tip hash, and a dropped second candidate at an occupied height is
+  logged. No wire or on-disk format change; `fork-incidents.bin` records written
+  before this fix remain readable.
+
+- **An incoherent restore is refused at boot instead of wedging commits.**
+  `certified-history.bin` may lead the restored ledger by exactly one item (the
+  normal crash state, where the retry is idempotent). A larger lead, an
+  undecodable newest item, or a one-item lead that does not extend the restored
+  ledger tip is now a startup error naming the files to restore together; before
+  this, every later commit failed with "certified history must ascend by height".
+  `docs/operations/backup-restore.md` lists the node-owned files that must be
+  copied from the same stopped node.
+
+- **One four-validator test was still outside the shared cluster lock (Q-031).**
+  `four_validator_nodes_require_three_votes_before_a_ledger_write` now takes
+  `NETWORK_TEST_LOCK` like the liveness and real-network suites, so the last
+  in-process cluster no longer overlaps another live four-validator cluster.
+
 - **Wallet files could abort the process through their scrypt cost parameters.**
   `KdfParams::validate` now refuses file-supplied costs above 256 MiB of memory
   (`128 * N * r`) or 2^22 work units (`N * r * p`) with checked arithmetic before

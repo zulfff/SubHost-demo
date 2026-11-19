@@ -286,8 +286,8 @@ separate storage/execution contract and cannot be advertised as finalized reorg.
 | S3.1–S3.2 | Consensus classifier + halt merged (ADR-007); node consumption implemented on `s3.3/native-sync` (raka) |
 | S3.1 node buffering | Implemented: bounded node-owned candidate store fed by `classify_final_evidence`, drained ascending after backfill |
 | S3.2 node consumption | Implemented: durable `fork-incidents.bin`, halt propagation, readiness suppression, re-halt on restart |
-| S3.3–S3.4 | Merged (#57): bounded range sync, catch-up stall budget, node archive; backup inclusion remains |
-| S3.5 | Planned |
+| S3.3–S3.4 | Merged (#57): bounded range sync, catch-up stall budget and node archive. The follow-up adds the coherent-backup set, the boot coherence check and the pruned-height rule (R-57-01) |
+| S3.5 | Partly landed: the classifier, sync, stall, incident and archive-coherence failure paths have tests; the shared single-cluster test guard (Q-031) now covers every live cluster |
 
 **S3.1 Candidate selection**
 - Buffer bounded authenticated H+1 candidates by block hash and unknown-parent
@@ -313,6 +313,10 @@ separate storage/execution contract and cannot be advertised as finalized reorg.
   do not alter active vote/view obligations merely on duplicate certification.
 - Certified history remains append-only; balances, nonces and receipts preserve
   the final canonical prefix.
+- A `Historical` certificate is decidable only where the block is retained. At or
+  below `base_height` it is unverifiable, not a fork: no incident and no halt,
+  otherwise old canonical history could stop every pruning validator (R-57-01).
+  Only a retained differing hash records an incident.
 
 **S3.3 Sync protocol** (`subhost-network`, `subhost-node`)
 
@@ -340,8 +344,10 @@ archive byte cap stops ingestion. See `docs/operations/certified-sync.md`.
   ledger, reconcile crash suffixes with the newest journal, refuse corruption.
 - Retain the latest 4096 actual certificates. Include archive, ledger, genesis,
   producer identity and newest signing journal in coherent backups.
-  (Archive + ledger + genesis + producer identity are bound and reconciled by
-  this slice; the backup layout itself is a separate storage/ops slice.)
+  Implemented: `docs/operations/backup-restore.md` names the node-owned set
+  (journal, archive, incident log, producer key) and requires one stopped node;
+  boot refuses an archive more than one item ahead of the restored ledger, or a
+  one-item lead that does not extend the restored ledger tip.
 - LedgerStore remains append-only under the agreed contract; speculative rollback
   requires a separate Platform storage contract.
 

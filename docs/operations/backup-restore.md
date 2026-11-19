@@ -13,6 +13,25 @@ A snapshot contains account state, but no receipt index; retained segments are
 required to validate commitments and rebuild receipts. A snapshot alone cannot
 restore a node. A pruned backup contains only its retained history.
 
+A validator directory also holds node-owned consensus files that must come from
+the same stopped node as the ledger:
+
+| File | What it proves |
+| --- | --- |
+| `consensus-state.bin` | The newest signing journal: committed height/view and quorum certificates |
+| `certified-history.bin` | The bounded `(block, QC)` archive this node serves to lagging peers |
+| `fork-incidents.bin` | Any durable finality contradiction; its presence re-halts the node at boot |
+| `producer.key` | The validator identity, when kept in the data directory |
+
+Do not mix these files with a ledger from a different point. The archive may lead
+the restored ledger by exactly one item (a certificate is archived before the
+ledger commit, and the retry is idempotent); the node refuses to boot when the
+archive is further ahead, or when its newest item does not extend the restored
+ledger tip, because every later commit would fail. A `fork-incidents.bin` carried
+over from a newer backup re-halts the node even if the restored ledger predates
+the incident: preserve it as evidence and resolve the incident deliberately rather
+than deleting the file.
+
 An older directory may contain `node-state.bin` (format version 2) or
 `node-state.bin.v2-backup`. Keep these files too. Once the manifest exists, it is
 authoritative; the loader does not fall back to an older legacy file if committed
@@ -111,10 +130,14 @@ segments or substitute a snapshot from another backup: those edits can silently
 discard committed history or break its state and receipt commitments. This stage
 provides no automatic rollback or repair of committed corruption.
 
-Block catch-up and fork choice remain S3 work. Restoring an older backup does not
-fetch missing blocks automatically; a validator must have an agreed recovery
-procedure for the network before it resumes producing. Startup still reads every
-retained segment, so backup validation time grows with retained history.
+A node with a genesis validator set can catch up over peer gossip: it requests
+bounded retained certified ranges and verifies every certificate and state
+transition before appending (S3.3, ADR-007). Restoring an older backup therefore
+recovers the missing blocks when the peer set still retains them; a gap beyond the
+peers' retained window still needs a snapshot. Fork choice and reorg remain
+separate work, so a validator must have an agreed recovery procedure for the
+network before it resumes producing. Startup still reads every retained segment,
+so backup validation time grows with retained history.
 
 ## Verified failure coverage
 

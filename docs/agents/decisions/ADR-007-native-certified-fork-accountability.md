@@ -169,9 +169,9 @@ decision.
   and resumes signing, so a peer cannot pin a validator mute by announcing a
   height it never serves.
 - `produce_blocks` refuses both signals in the same place: a halted driver never
-  proposes, signs or extends local finality, and a catching-up node never signs
-  even though it is not halted. No `subhost-consensus` change is required for
-  either flag.
+  proposes, signs, or creates new finality (adopting already-certified history
+  continues), and a catching-up node never signs even though it is not halted.
+  No `subhost-consensus` change is required for either flag.
 
 ### Durable incident
 
@@ -181,9 +181,30 @@ decision.
   hash)`, so replayed gossip cannot fill the ring.
 - `Conflicting` and a mismatched `Historical` write a record, call `halt`, and
   publish readiness with `consensus_alive: false`. The ledger is untouched.
+- A `Historical` certificate is decidable only where the block is retained. At
+  or below `base_height` (and at the genesis anchor) there is no local block to
+  compare, so the certificate is *unverifiable*, not a fork: no record, no halt
+  (R-57-01). Otherwise anyone replaying old canonical history could stop every
+  pruning validator. Only a retained differing hash is accountable evidence.
+- When a record is written for a height this node cannot resolve, `local_hash` is
+  the `Hash::ZERO` sentinel meaning "no retained local block", never the tip hash
+  standing in for evidence about another height.
 - Bootstrap reads the newest record and re-halts before the first tick, so a
   restart cannot sign one view while the incident is unresolved. Clearing a halt
   is an operator action, not a code path.
+
+### Backup and restore
+
+- The archive, ledger, voting journal, incident log, genesis and producer
+  identity are one coherent set and must be copied from the same stopped node.
+  `docs/operations/backup-restore.md` is the operator procedure.
+- The archive may lead the restored ledger by exactly one item, because it
+  records a certificate before the ledger commit; that is the normal crash state
+  and the retry is a no-op. A larger lead, an undecodable item, or a one-item lead
+  that does not extend the restored ledger tip is refused at boot with an
+  actionable error instead of failing every later commit.
+- A restored incident log re-halts the node even if the restored ledger predates
+  the contradiction; keeping the set together is what makes that safe.
 
 ### Limits
 
@@ -197,6 +218,9 @@ decision.
 - Buffered candidates live only in memory. A restart drops them and refetches
   from the archive; the bounded incident ring is the only new durable state.
 - Sync only extends the committed chain; it never rolls finalized history back.
+- A canonical certificate at a pruned height is ignored rather than verified: the
+  node has already committed that height and dropped the block it would need to
+  compare. Deep-history auditing therefore needs an archive that was not pruned.
 
 ### Evidence for the amendment
 
