@@ -44,6 +44,9 @@ subhost node --validator \
   encrypted producer keystore instead of the plaintext `producer.key`;
   fail-closed, no plaintext fallback. See
   [producer-keystore.md](producer-keystore.md).
+- `--retention-blocks <N>` configures automatic ledger retention (unset = off).
+  Accepted now, inert until the Q-036 trigger slice lands; semantics and the
+  snapshot floor are in [ledger-repair.md](ledger-repair.md).
 
 ## Confirm it is healthy
 

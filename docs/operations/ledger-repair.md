@@ -60,6 +60,39 @@ block at its height. Pruned blocks and receipts are gone permanently: the node
 stops serving those heights. Prune to bound disk growth on a healthy node; never
 prune to "fix" a load failure, and never prune below the snapshot anchor.
 
+### Automatic retention (`--retention-blocks`, Q-036)
+
+`subhost node --retention-blocks <N>` configures automatic height-based
+retention: once the trigger slice lands, the node prunes after a successful
+commit when `tip - base_height > N`, without an operator command. Unset = off
+(the default; today's offline-only behaviour). The flag is **accepted now but
+inert** until the node-side trigger lands — `subhost db prune` remains the only
+prune path until then.
+
+Semantics once active (agreed in Q-036):
+
+- **The newest snapshot is the hard floor.** Automatic retention never prunes
+  below the newest snapshot anchor, so the real bound is *snapshot cadence + N*,
+  not exactly `N`. A prune refused by the floor is a logged no-op, never an
+  error that halts the node.
+- **Failure never halts.** A failed prune is logged and counted, never
+  propagated, and never fails the block commit. `subhost_ledger_active_bytes`
+  is the operator signal that retention is not keeping up.
+- **Any `N >= 1` is allowed; below 4096 the node warns at boot.** Aggressive
+  values make the node a degraded sync source: heights it no longer retains
+  are unavailable to peers (never an error — see
+  [certified-sync.md](certified-sync.md)), and historical certificates at
+  pruned heights are unverifiable, not a fork. A small testnet genesis node may
+  run lean; a public serving node should keep at least the certified-archive
+  window.
+- Retention applies to validator/observer chains where committed = final.
+  Explicit `--single-writer` demo mode has committed ≠ final; automatic
+  retention there is a demo-only operation.
+
+`subhost db prune --keep-segments` stays the offline tool (segment-count unit,
+process stopped); `--retention-blocks` is the online height policy. They share
+the same snapshot floor.
+
 ## After recovery
 
 Start the node and confirm `/health/ready` returns 200 and the committed height
