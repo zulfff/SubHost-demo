@@ -317,6 +317,21 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   Track A block/consensus spans follow per Q-035; the Track B RPC spans are
   landed (#69) and export through this provider once a binary installs it.
 
+- **Pending-store consumer wiring (S6.1b, Q-034/Q-016).** The five RPC commit
+  call sites now use the hooks landed in #75: admission and builder-driven
+  installs go through `publish_pool` (persist before the candidate becomes
+  live, so an acknowledged hash is always durable), `seal_block` retires mined
+  transactions from its uninstalled candidate with the pure
+  `retire_mined_candidate` and `publish_pool` writes the cleaned pool once, and
+  a validated commit retires from the live pool with best-effort
+  `retire_mined` (a snapshot write failure is logged and counted, never turned
+  into a commit failure). `Node::bootstrap` calls `restore_pending()` once,
+  after ledger/journal/archive/fork-log reconciliation and genesis seeding and
+  immediately before metrics construction, so the pending-depth gauge reports
+  the restored pool. No store is attached in production yet, so both paths keep
+  today's volatile pool; tests pin the call sites and that a stray
+  `mempool.bin` is ignored while no store is attached.
+
 - **RPC method spans (S8.1, Q-033).** Every decoded JSON-RPC call on HTTP and
   WebSocket emits one `info` span (`rpc_call`, target `subhost_rpc`) through
   the existing RPC metrics middleware: `rpc.method` (registered static name or

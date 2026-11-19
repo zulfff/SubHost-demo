@@ -369,6 +369,13 @@ impl Node {
             }
         }
 
+        // Q-034 requirement 1: a configured pending store is restored only after
+        // the ledger, journal, archive, fork log and genesis seeding are
+        // reconciled, and before the node serves traffic. Placing it before the
+        // metrics construction makes the pending-depth gauge report the restored
+        // pool. No store configured keeps today's volatile behaviour.
+        state.restore_pending()?;
+
         let metrics = Metrics::new()?;
         metrics.set_block_height(state.block_height());
         metrics.set_pending_transactions(state.pending_count());

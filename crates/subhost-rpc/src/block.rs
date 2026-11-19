@@ -175,7 +175,7 @@ impl RpcState {
                     "transaction is not executable against the current state".into(),
                 ));
             }
-            *write(&self.mempool) = candidate_pool;
+            self.publish_pool(candidate_pool)?;
             return Ok(requested_hash);
         }
 
@@ -186,7 +186,7 @@ impl RpcState {
             ));
         }
 
-        *write(&self.mempool) = candidate_pool;
+        self.publish_pool(candidate_pool)?;
         Ok(requested_hash)
     }
 
@@ -220,7 +220,7 @@ impl RpcState {
         }
         let receipts = self.seal_block(&mut candidate_pool)?;
         let receipt = receipts.get(tx_hash).cloned().ok_or(RpcError::InvalidTxHash)?;
-        *write(&self.mempool) = candidate_pool;
+        self.publish_pool(candidate_pool)?;
         Ok(receipt)
     }
 
@@ -430,9 +430,9 @@ impl RpcState {
         // Durability before visibility: if this fails nothing is swapped in.
         self.persist(&candidate_state, &next_blocks, &next_receipts)?;
 
-        for tx in &block.transactions {
-            pool.remove(&tx.hash());
-        }
+        // Q-034/Q-016: a candidate that may never be installed must not write
+        // the pending file; `publish_pool` persists it when it becomes live.
+        RpcState::retire_mined_candidate(pool, &block.transactions, &candidate_state);
         *write(&self.state) = candidate_state;
         *write(&self.blocks) = next_blocks;
         *write(&self.receipts) = next_receipts;
@@ -714,13 +714,7 @@ impl RpcState {
 
         self.persist(&candidate_state, &next_blocks, &next_receipts)?;
 
-        {
-            let mut pool = write(&self.mempool);
-            for tx in &block.transactions {
-                pool.remove(&tx.hash());
-                pool.prune_below_nonce(&tx.from, candidate_state.nonce(&tx.from));
-            }
-        }
+        self.retire_mined(&block.transactions, &candidate_state);
         *write(&self.state) = candidate_state;
         *write(&self.blocks) = next_blocks;
         *write(&self.receipts) = next_receipts;
@@ -759,6 +753,7 @@ mod tests {
         Amount, FeePolicy, Nonce, TransactionSignature, TransactionType, BLOCK_GAS_LIMIT,
         FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER,
     };
+    use subhost_mempool::MempoolStore;
 
     /// A one-validator authority for `secret`, with a fixed producer address.
     fn authority(secret: &PrivateKey) -> (BlockAuthority, Address) {
@@ -1514,5 +1509,127 @@ mod tests {
         assert_eq!(reopened.balance(&alice), 5 * gas);
         assert_eq!(reopened.balance(&sender), 2_000_000 - 20 - 20 * gas);
         assert_eq!(reopened.build_block().unwrap().unwrap().header.base_fee_per_gas, 6);
+    }
+
+    // --- S6.1b pending-store wiring (Q-034/Q-016) ---
+    //
+    // The hook bodies live in `state.rs` and are tested there. These tests pin
+    // the *call sites*: admission must persist before acknowledging, the seal
+    // path must publish the cleaned pool rather than the pre-seal candidate,
+    // and commit cleanup stays best-effort.
+
+    fn pending_store(dir: &std::path::Path) -> MempoolStore {
+        MempoolStore::open(1, Hash::ZERO, dir).unwrap()
+    }
+
+    #[test]
+    fn submit_transaction_persists_the_pending_snapshot_before_acknowledging() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let tx_key = signing_key(7);
+        let (bls_secret, _) = BLSScheme::keygen();
+        let (authority, _) = authority(&bls_secret);
+        let state = funded_state(&tx_key, 1_000_000)
+            .with_authority(authority)
+            .with_pending_store(store.clone());
+
+        let tx = signed_transfer(&tx_key, 0, 10);
+        let hash = state.submit_transaction(tx).unwrap();
+
+        // No quorum yet, so the transaction is still pending and the durable
+        // snapshot must already match the live pool when the hash is returned.
+        assert!(state.mempool.read().unwrap().contains(&hash));
+        let on_disk = store.load().unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].hash(), hash);
+    }
+
+    #[test]
+    fn submit_transaction_refuses_admission_when_the_snapshot_cannot_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = pending_store(dir.path());
+        // A directory where the snapshot file belongs makes every persist fail.
+        std::fs::create_dir(store.path()).unwrap();
+        let tx_key = signing_key(7);
+        let (bls_secret, _) = BLSScheme::keygen();
+        let (authority, _) = authority(&bls_secret);
+        let state =
+            funded_state(&tx_key, 1_000_000).with_authority(authority).with_pending_store(store);
+
+        let tx = signed_transfer(&tx_key, 0, 10);
+        let error = state.submit_transaction(tx.clone()).unwrap_err();
+        assert!(matches!(error, RpcError::Persistence(_)), "{error:?}");
+        // An acknowledgement is never issued for an admission that is not
+        // durable, and the failed candidate must not become the live pool.
+        assert!(!state.mempool.read().unwrap().contains(&tx.hash()));
+        assert_eq!(state.pending_count(), 0);
+    }
+
+    #[test]
+    fn demo_seal_publishes_one_cleaned_pending_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let key = signing_key(7);
+        let state = funded_state(&key, 1_000_000).with_pending_store(store.clone());
+
+        // A nonce gap cannot be selected into the sealed block, so it proves
+        // the published snapshot is the cleaned candidate, not an empty file.
+        let parked = signed_transfer(&key, 5, 1);
+        state.mempool.write().unwrap().add(parked.clone()).unwrap();
+
+        let hash = state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        assert_eq!(state.block_height(), 1);
+        assert!(!state.mempool.read().unwrap().contains(&hash));
+
+        let on_disk = store.load().unwrap();
+        assert_eq!(on_disk.len(), 1, "exactly the still-pending entry");
+        assert_eq!(on_disk[0].hash(), parked.hash());
+    }
+
+    #[test]
+    fn accept_block_retires_mined_transactions_from_the_live_pool_and_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let key = signing_key(7);
+        let state = funded_state(&key, 1_000_000).with_pending_store(store.clone());
+
+        let mined = signed_transfer(&key, 0, 10);
+        let parked = signed_transfer(&key, 5, 1);
+        {
+            let mut pool = state.mempool.write().unwrap();
+            pool.add(mined.clone()).unwrap();
+            pool.add(parked.clone()).unwrap();
+        }
+
+        let block = state.build_block().unwrap().unwrap();
+        assert!(block.transactions.iter().any(|tx| tx.hash() == mined.hash()));
+        state.accept_block(block).unwrap();
+
+        let pool = read(&state.mempool);
+        assert!(!pool.contains(&mined.hash()));
+        assert!(pool.contains(&parked.hash()), "a nonce gap stays pending");
+        let on_disk = store.load().unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].hash(), parked.hash());
+    }
+
+    #[test]
+    fn accept_block_commits_when_pending_cleanup_cannot_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = pending_store(dir.path());
+        std::fs::create_dir(store.path()).unwrap();
+        let key = signing_key(7);
+        let state = funded_state(&key, 1_000_000).with_pending_store(store);
+
+        let mined = signed_transfer(&key, 0, 10);
+        state.mempool.write().unwrap().add(mined.clone()).unwrap();
+        let block = state.build_block().unwrap().unwrap();
+        let height = block.header.height;
+
+        // The block is already durable: a snapshot write failure must be
+        // logged and counted, never turned into a commit failure (Q-034).
+        state.accept_block(block).unwrap();
+        assert_eq!(state.block_height(), height);
+        assert!(!state.mempool.read().unwrap().contains(&mined.hash()));
     }
 }
