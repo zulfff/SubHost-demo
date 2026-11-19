@@ -3423,6 +3423,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "afab94fb28594581f62d981211a9a4d53cc8130bbcbbb89a0440d9b8e81a7746"
 
 [[package]]
+name = "rpassword"
+version = "7.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa2c5d9304b618df61ff17f3d3485c6e1854a3d94902a49abbb8d43dfbe0464"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rtnetlink"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3438,6 +3449,16 @@ dependencies = [
  "nix",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3859,12 +3880,14 @@ dependencies = [
  "ed25519-dalek",
  "hex",
  "reqwest",
+ "rpassword",
  "serde",
  "serde_json",
  "sha3",
  "subhost-consensus",
  "subhost-core",
  "subhost-crypto",
+ "subhost-keystore",
  "subhost-network",
  "subhost-node",
  "subhost-rpc",
@@ -3874,6 +3897,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -3977,6 +4001,23 @@ dependencies = [
  "subhost-core",
  "thiserror 2.0.21",
  "tracing",
+]
+
+[[package]]
+name = "subhost-keystore"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm 0.11.1",
+ "hex",
+ "libc",
+ "rand 0.10.4",
+ "scrypt",
+ "serde",
+ "serde_json",
+ "subhost-crypto",
+ "tempfile",
+ "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
