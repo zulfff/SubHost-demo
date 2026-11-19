@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 subhost-core = { workspace = true }
+subhost-metrics = { workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
 tempfile = { workspace = true }

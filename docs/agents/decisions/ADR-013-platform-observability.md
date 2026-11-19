@@ -41,6 +41,16 @@ orphans are excluded; missing/invalid active data is an error, never a false
 zero; ephemeral/fresh stores report empty metadata. The caller serializes it
 with persist/prune under the existing commit lock.
 
+Mempool lifecycle counting (S8.2, Q-026): `Mempool::admit` buffers typed
+events in the pool itself; the submit path's candidate clone carries the
+buffer, so a rejected candidate drops its events and only the committed
+write-back can publish them. `Mempool::flush_events(&Metrics)` drains the
+buffer, called from the B-owned `eth_sendTransaction` dispatch after a
+successful submit — no Track A source edit, exactly-once and rollback-safe.
+`subhost-mempool` depends on `subhost-metrics` for the enum and flush only;
+the pool stores no registry handle. `expired` stays at 0 until an expiry
+path exists (S6.3).
+
 ## Consequences
 
 Track A owns all node/consensus/network call-sites: publishing health
@@ -65,5 +75,8 @@ export and RPC method spans are later S8 slices under the same contract.
   gauges (verified 2026-11-19 via Q-020).
 - ADR-004 — cloned metrics share one registry; ADR-008 — only verified final
   Commit evidence may advance canonical state/finality measurements.
+- `crates/subhost-rpc/src/block.rs` — candidate-clone admission with fallible
+  steps after `admit`; the reason events buffer in the pool instead of
+  counting at admission time (Q-026, 2026-11-19).
 - `crates/subhost-storage/src/segmented.rs`, `read_manifest` — structural
   manifest validation without block replay, reused by `disk_stats`.

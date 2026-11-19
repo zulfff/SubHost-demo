@@ -46,7 +46,7 @@ All names live in the one `Metrics` registry (ADR-004); cloning shares it.
 | `subhost_ledger_active_bytes` | gauge | `LedgerStore::disk_stats()` under the commit lock. |
 | `subhost_ledger_snapshot_modified_seconds` | gauge | Same measurement; Unix seconds. **0 means unavailable**, not a real epoch time. |
 | `subhost_reorg_total` | counter | Registered at 0 with no increment API: reorgs are unsupported until a reviewed reorg protocol ships. Safety incidents are not reorgs. |
-| `subhost_mempool_transactions_total{event}` | counter | Pool lifecycle: `admitted`, `replaced`, `evicted`, `expired` (S6.3). Labels come from `MempoolEvent` only. |
+| `subhost_mempool_transactions_total{event}` | counter | Pool lifecycle: `admitted`, `replaced`, `evicted`, `expired` (S6.3). Labels come from `MempoolEvent` only. Counts committed admissions only; see below. |
 
 Existing families (`subhost_rpc_*`, `subhost_connected_peers`,
 `subhost_block_height`, `subhost_pending_transactions`) are unchanged; see
@@ -68,6 +68,20 @@ not block/QC authentication.
   indistinguishable without extra state); segmented stores error instead.
 - The caller serializes measurement with persist/prune under the node's
   commit lock.
+
+### Mempool lifecycle counting
+
+`admit()` buffers typed events inside the pool instead of touching the
+registry. The submit path admits into a cloned candidate pool and drops the
+clone when a later step (dry-run build or seal) fails, so buffered events
+vanish with rejected candidates; only the committed write-back publishes
+them. The `eth_sendTransaction` handler flushes the committed pool's buffer
+after a successful submit (`Mempool::flush_events`), which makes the counters
+exactly-once and rollback-safe. Idempotent resubmissions and lower-price
+rejections buffer nothing; mined removals are not lifecycle events.
+
+`expired` stays at 0: no TTL/expiry path exists in the pool or node yet. It
+wires when the S6.3 expiry lifecycle lands.
 
 ## Sample alert rules (S8.5)
 

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use subhost_consensus::ValidatorRegistry;
 use subhost_core::{Address, Amount, Block, ChainId, Hash, Nonce, Receipt, TransactionType};
 use subhost_mempool::Mempool;
+use subhost_metrics::Metrics;
 use subhost_state::{AccountProof, State};
 use subhost_storage::{LedgerStore, StorageError};
 use tokio::sync::broadcast;
@@ -131,6 +132,9 @@ pub struct RpcState {
     /// Separate from `authority`: a follower verifies peer blocks without holding
     /// a signing key, and a producer needs both.
     pub(crate) validators: Option<Arc<ValidatorRegistry>>,
+    /// Metrics registry for committed mempool lifecycle events, attached by
+    /// `RpcServer::with_metrics`. `None` keeps the pool's event buffer inert.
+    pub(crate) metrics: Option<Metrics>,
 }
 
 /// Buffered block events per subscriber. A node only needs the newest few.
@@ -173,6 +177,7 @@ impl RpcState {
             block_events: broadcast::channel(BLOCK_EVENT_CAPACITY).0,
             authority: None,
             validators: None,
+            metrics: None,
         })
     }
 
@@ -218,6 +223,22 @@ impl RpcState {
     pub fn with_proposal_bytes_limit(mut self, max_bytes: usize) -> Self {
         self.proposal_bytes_limit = Some(max_bytes);
         self
+    }
+
+    /// Attach the metrics registry used for committed mempool lifecycle events.
+    pub(crate) fn set_metrics(&mut self, metrics: Metrics) {
+        self.metrics = Some(metrics);
+    }
+
+    /// Publish lifecycle events buffered by committed admissions (S8.2).
+    ///
+    /// Called after a successful submit: the candidate pool's event buffer was
+    /// swapped into the live pool, and rejected candidates dropped theirs, so
+    /// this counts exactly the committed admissions. Inert without metrics.
+    pub(crate) fn flush_mempool_events(&self) {
+        if let Some(metrics) = &self.metrics {
+            write(&self.mempool).flush_events(metrics);
+        }
     }
 
     pub fn consensus_context(&self) -> Hash {
