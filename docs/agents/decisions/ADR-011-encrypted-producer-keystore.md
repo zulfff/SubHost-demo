@@ -135,24 +135,36 @@ lifecycle with the bootstrap API.
 
 ## Consumer contract
 
-- **Track A (pending):** `Node::bootstrap_with_producer_key(config, key)`
+- **Track A (landed):** `Node::bootstrap_with_producer_key(config, key)`
   accepts an already unlocked BLS key and still verifies canonical encoding,
   derived public key, unique genesis membership and corrected-suite genesis
-  PoPs. Unlocking never bypasses validator configuration or journal recovery.
-  Supplying a key to a non-validator configuration is an error. Normal
-  bootstrap remains usable by observers without key material. Track A also
-  lands the legacy loader's symlink and non-Unix permission fixes. Until then,
-  encrypted node start-up is unavailable and `subhost node` is unchanged.
+  PoPs (the registry verifies PoPs before the key is resolved). Unlocking never
+  bypasses validator configuration or journal recovery: it runs the same
+  bootstrap path, and a supplied key wins over any configured file, which is
+  never read. Supplying a key to a non-validator configuration is an error.
+  Normal bootstrap remains usable by observers without key material.
+- **Track A (landed): legacy loader hardening.** `read_producer_key` now reads
+  through `subhost_keystore::read_bounded_owner_only`, so the legacy hex file
+  gets the same rules as a keystore: `O_NOFOLLOW` on the opened handle, a
+  regular file, owner-only mode, effective-uid ownership and a 256-byte bound.
+  Symlinks are refused outright, non-Unix platforms fail explicitly, and the
+  node's separate `stat`-then-open permission check is gone. Permission-bit
+  refusals keep the existing `InsecureProducerKey` variant; the other refusals
+  surface as `UnsafeProducerKey { path, reason }`.
+- **Remaining consumer step (Track B):** `subhost node` does not yet unlock a
+  keystore itself. The node API is in place; wiring a
+  `--producer-credential-file` flag through the CLI to
+  `bootstrap_with_producer_key` is the CLI owner's step. Until then a migrated
+  data directory still starts from the preserved legacy `producer.key`, which
+  is now read through the hardened loader.
 - **CLI init (landed here):** `subhost init --producer-credential-file` routes
   an existing producer key file by content. A keystore is unlocked with the
   credential file and fails closed without one; a legacy hex file keeps the
   original loader. With a credential file but no key file, init refuses rather
   than generating: encrypted keys are created explicitly with
-  `subhost producer create`. Known residual (Track A dependency): the init
-  consumer reads the key file twice — once to route, once through the loader —
-  and the legacy loader's second read still follows symlinks until Track A's
-  `symlink_metadata`/`O_NOFOLLOW` fix lands. The keystore path itself is
-  symlink-safe on both reads.
+  `subhost producer create`. The init consumer reads the key file twice — once
+  to route, once through the loader — and both reads now use the same hardened
+  owner-only reader, so the symlink window between them is closed.
 
 ## Rejected alternatives
 

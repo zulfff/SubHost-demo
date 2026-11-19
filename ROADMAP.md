@@ -131,7 +131,7 @@ agent always sees the real state.
 | S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038 + yoga flag); S6.2 steps 1-3 merged (#60/#65/#71); S6.3 counters merged (#51), TTL/eviction pending; Q-036 retention slice in progress (dewi) |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
 | S8 | Observability, health, runbooks | B | S0 | M | Slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74) merged; node runtime hooks in review (#78, approved); block/consensus spans next (sari); peer count gated on network accessor (raka) |
-| S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) |
+| S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap API + hardened legacy loader in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
 | S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep runbook (#77) merged; R-57-01 fixed (#67/#73); activation gated on Q-037 calldata ladder (L0–L5 in progress) + S9.6 completion; external audit + 30-day soak + go/no-go remain human/time-gated |
@@ -583,7 +583,7 @@ ledger repair, reorg investigation, incident checklist.
 | --- | --- |
 | S9.1 | RC/RPC-semver and tag consistency policy implemented; workspace remains 0.1.0 until reviewed version activation |
 | S9.2–S9.5 | Implemented on `s9/release-engineering`; local checks/CI review in progress |
-| S9.6 | Track B landed: `subhost-keystore` crate, `producer` CLI, init unlock consumer (Q-018/ADR-011); Track A bootstrap API + loader fixes pending after S6.2 |
+| S9.6 | Track B landed: `subhost-keystore` crate, `producer` CLI, init unlock consumer (Q-018/ADR-011). Track A landed: `Node::bootstrap_with_producer_key` (same membership/PoP checks, supplied key never reads the configured file) and the legacy loader hardened through the keystore's owner-only reader (no symlinks, euid ownership, bounded read, explicit non-Unix refusal), closing the init double-read window. Remaining: the CLI flag that unlocks a keystore for `subhost node` |
 
 The pipeline prepares Linux x86_64 binaries, SBOMs, checksum/Sigstore artifacts
 and scanned signed OCI images after all seven CI gates. Candidate image scans
