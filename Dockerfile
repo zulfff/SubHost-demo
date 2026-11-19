@@ -14,8 +14,9 @@ RUN cargo build --release --locked \
     -p subhost-cli -p subhost-faucet -p subhost-explorer -p subhost-bench
 
 # Keep the resolved Rust dependency inventories alongside the runtime binaries.
+# 0.5.10 defaults to <crate>.cdx.json; --override-filename bom yields bom.json.
 RUN cargo install --locked --version 0.5.10 cargo-cyclonedx \
-    && cargo cyclonedx --format json --all
+    && cargo cyclonedx --format json --all --override-filename bom
 
 # Runtime stage: no toolchain, no build dependencies.
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc

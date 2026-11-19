@@ -37,7 +37,7 @@ docker run --rm --platform linux/amd64 \
     -p subhost-cli -p subhost-faucet -p subhost-explorer -p subhost-bench
 # CycloneDX has no --locked flag. Offline metadata plus this digest check prevents
 # publishing an SBOM against a dependency graph that changed the reviewed lockfile.
-CARGO_NET_OFFLINE=true cargo cyclonedx --format json --all --target "$release_target"
+CARGO_NET_OFFLINE=true cargo cyclonedx --format json --all --target "$release_target" --override-filename bom
 if [[ "$release_lock_before" != "$(sha256sum "$release_root/Cargo.lock")" ]]; then
   echo "SBOM generation changed Cargo.lock; refusing publication" >&2
   exit 1
