@@ -11,7 +11,7 @@ use subhost_core::{
     Transaction, TransactionType, BLOCK_GAS_LIMIT, FEE_HEADER_VERSION,
 };
 use subhost_mempool::{Mempool, MempoolStore};
-use subhost_metrics::Metrics;
+use subhost_metrics::{LedgerPruneOutcome, Metrics};
 use subhost_state::{AccountProof, State};
 use subhost_storage::{LedgerDiskStats, LedgerStore, PruneOutcome, StorageError};
 use tokio::sync::broadcast;
@@ -296,7 +296,25 @@ impl RpcState {
         let _commit_guard = lock(&self.commit_lock);
         let outcome = self.store.prune_to_height(height)?;
         self.trim_to_pruned_base(outcome);
+        self.record_prune_outcome(outcome);
         Ok(outcome)
+    }
+
+    /// Publish a prune outcome and, on a real prune, the new base height
+    /// (Q-036). Without a registry the outcome is simply not counted; metrics
+    /// never fail a prune. Errors are not an outcome label — they propagate to
+    /// the caller before this is reached.
+    fn record_prune_outcome(&self, outcome: PruneOutcome) {
+        let Some(metrics) = &self.metrics else { return };
+        let label = match outcome {
+            PruneOutcome::Pruned { base_height, .. } => {
+                metrics.set_ledger_base_height(base_height);
+                LedgerPruneOutcome::Pruned
+            }
+            PruneOutcome::NothingToPrune { .. } => LedgerPruneOutcome::NothingToPrune,
+            PruneOutcome::RefusedBySnapshot { .. } => LedgerPruneOutcome::RefusedBySnapshot,
+        };
+        metrics.record_ledger_prune(label);
     }
 
     /// Apply a storage prune to the in-memory views. Only a `Pruned` outcome
@@ -476,8 +494,12 @@ impl RpcState {
         self
     }
 
-    /// Attach the metrics registry used for committed mempool lifecycle events.
+    /// Attach the metrics registry used for committed mempool lifecycle events
+    /// and ledger retention outcomes (Q-036). Seeds the base-height gauge from
+    /// the current base so a restored, already-trimmed ledger publishes its
+    /// real base before the first prune.
     pub(crate) fn set_metrics(&mut self, metrics: Metrics) {
+        metrics.set_ledger_base_height(self.base_height.load(Ordering::SeqCst));
         self.metrics = Some(metrics);
     }
 
@@ -1015,5 +1037,84 @@ mod tests {
         assert_eq!(state.block_at_height(4).unwrap().header.height, 4);
         assert_eq!(state.block_at_height(6).unwrap().header.height, 6);
         assert!(state.block_at_height(3).is_none());
+    }
+
+    #[test]
+    fn retain_from_counts_a_refusal_when_metrics_are_attached() {
+        let dir = tempdir().unwrap();
+        let key = signing_key(45);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let mut state = RpcState::with_data_dir(1, dir.path()).unwrap();
+        state.set_metrics(Metrics::new().unwrap());
+        state.seed_accounts([(sender, 1_000_000)]).unwrap();
+        for nonce in 0..4 {
+            state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+        }
+        // Floor is 0 (genesis anchor only): the typed refusal must count as
+        // refused_by_snapshot, leave the base gauge at 0 and touch no view.
+        let outcome = state.retain_from(2).unwrap();
+        assert!(matches!(outcome, PruneOutcome::RefusedBySnapshot { .. }));
+        let metrics = state.metrics.as_ref().unwrap();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"refused_by_snapshot\"} 1"));
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"pruned\"} 0"));
+        assert!(rendered.contains("subhost_ledger_base_height 0"));
+        assert_eq!(state.base_height(), 0);
+        assert_eq!(state.block_count(), 4);
+    }
+
+    #[test]
+    fn a_prune_error_counts_no_outcome() {
+        let mut state = RpcState::in_memory(1).unwrap();
+        state.set_metrics(Metrics::new().unwrap());
+        assert!(state.retain_from(1).is_err());
+        let metrics = state.metrics.as_ref().unwrap();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        for label in ["pruned", "nothing_to_prune", "refused_by_snapshot"] {
+            assert!(
+                rendered.contains(&format!("subhost_ledger_prune_total{{outcome=\"{label}\"}} 0"))
+            );
+        }
+    }
+
+    #[test]
+    fn record_prune_outcome_maps_every_variant_and_moves_the_gauge_only_on_pruned() {
+        let mut state = RpcState::in_memory(1).unwrap();
+        // Without a registry the recording is a silent no-op, never a panic.
+        state.record_prune_outcome(PruneOutcome::Pruned {
+            dropped_segments: 1,
+            retained_segments: 1,
+            base_height: 9,
+        });
+        state.set_metrics(Metrics::new().unwrap());
+        state.record_prune_outcome(PruneOutcome::Pruned {
+            dropped_segments: 3,
+            retained_segments: 3,
+            base_height: 3,
+        });
+        state.record_prune_outcome(PruneOutcome::NothingToPrune { segments: 3 });
+        state.record_prune_outcome(PruneOutcome::RefusedBySnapshot {
+            snapshot_height: 5,
+            requested_height: 6,
+        });
+        let metrics = state.metrics.as_ref().unwrap();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"pruned\"} 1"));
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"nothing_to_prune\"} 1"));
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"refused_by_snapshot\"} 1"));
+        // Only the Pruned outcome moves the gauge; the no-op and the refusal
+        // leave it at the last real base.
+        assert!(rendered.contains("subhost_ledger_base_height 3"));
+    }
+
+    #[test]
+    fn attaching_metrics_seeds_the_base_gauge_from_the_current_base() {
+        let mut state = RpcState::in_memory(1).unwrap();
+        // Simulate a restored, already-trimmed ledger base.
+        state.base_height.store(1024, Ordering::SeqCst);
+        state.set_metrics(Metrics::new().unwrap());
+        let metrics = state.metrics.as_ref().unwrap();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_ledger_base_height 1024"));
     }
 }

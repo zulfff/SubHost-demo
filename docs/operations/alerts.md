@@ -26,6 +26,8 @@ gated rules only after their call-sites land, or they fire on a healthy chain.
 | Connected peers | `subhost_connected_peers` | **gated** — stays 0 until a network handle accessor is wired |
 | Reorg count | `subhost_reorg_total` | registered at 0, **no increment API** — reorgs unsupported; never alert on it |
 | Pending-file cleanup failures | `subhost_mempool_pending_cleanup_failures_total` | **gated** — registered at 0 and *will* increment once the S6.1b node wiring lands (unlike reorgs, whose 0 is permanent). Enable `SubhostPendingCleanupFailing` with that wiring |
+| Ledger prune outcomes | `subhost_ledger_prune_total{outcome}` | **gated** — registered at 0 (three bounded labels); recording is wired into `RpcState::retain_from` and increments once a retention caller drives it. Refusals are normal no-ops, not faults — no refusal alert |
+| Ledger base height | `subhost_ledger_base_height` | **live at attach** — seeded from the restored base when the registry is attached; moved only by a real prune. 0 = full history retained (a real value, not unavailable) |
 
 There is **no direct quorum-participation metric**. "No quorum" below is a
 finality-stall proxy, not a measurement of votes; it is gated on
