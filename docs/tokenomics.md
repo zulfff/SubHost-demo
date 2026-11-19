@@ -98,8 +98,12 @@ The proposed fee model would charge SUB based on:
 
 ### Fee burn
 
-The design target burns half of transaction fees. No fee-burn accounting is
-implemented.
+The design target burns half of transaction fees; that split is not implemented.
+What ships today (S6.2, ADR-010) is a genesis-opt-in EIP-1559-style market: the
+`base_fee * gas_used` portion burns and the remainder is credited to the block
+producer as a priority tip (burned as well in the explicit validatorless demo
+mode). Policy-less chains keep the legacy rule of burning the entire fee.
+Neither mode issues new tokens.
 
 ## Governance
 

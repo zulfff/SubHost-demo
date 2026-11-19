@@ -14,6 +14,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **Fee-enabled chains start from a new genesis, not an upgrade (S6.2,
+  ADR-010).** A genesis `fee_policy` binds into the consensus context and
+  switches block headers to version 2: a 13-field binary layout whose base fee
+  is inside the header hash, signatures and QCs. Policy-less chains keep the
+  exact 12-field header bytes, the six-field genesis context and the
+  fixed-price burn rules. A fee-enabled node refuses a restored legacy ledger
+  rather than rewriting it; use a fresh devnet genesis and data directory.
+
 - **Legacy BLS validator proofs and signatures are refused.** RFC 9380 G2 hashing
   replaces a construction that allowed arbitrary signature forgery from a public
   PoP. Use fresh genesis proofs and signing/history directories; preserve old data
@@ -357,6 +365,19 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   blocks with byte-identical headers, genesis bindings and burn rules. Ledger
   policy binding/replay (Track B) and the node/RPC behaviour change land in the
   next two steps of ADR-010.
+
+- **Fee-enabled block path and node bootstrap (S6.2 step 3, ADR-010, contracts
+  Q-017/Q-030).** The node binds the genesis fee policy at startup and the RPC
+  block path derives each block's base fee from the committed tip, records it in
+  a version-2 header, and settles burned/priority fees before taking the state
+  root. Fee-enabled chains seal and accept empty certified blocks so an idle or
+  fully underpriced chain still returns to the floor; a wrong base fee, version
+  or state root and underpriced inclusion are rejected. Admission refuses a bid
+  below the next block's base fee under the commit lock, while entries admitted
+  before a fee rise stay parked without skipping their sender's nonce.
+  Validatorless demo mode burns the tip and creates no `Address::ZERO` reward.
+  A fee-enabled node refuses a restored legacy ledger instead of rewriting it.
+  Legacy chains keep byte-identical headers, bindings and burn rules.
 
 - **Release engineering and checked optimized tests (S9).** Added exact tag/version
   validation, an immutable compiler-image binary build, deterministic archives

@@ -226,6 +226,12 @@ impl Node {
         let store = LedgerStore::open(chain_id, &config.data_dir)?;
         let fresh = !store.exists();
         let mut state = RpcState::with_store(store)?.with_consensus_context(protocol_context);
+        // A fee-enabled genesis owns the fee rules for this chain; the node
+        // refuses to extend a legacy ledger with it. Absent policy keeps the
+        // legacy fixed-price behaviour byte-for-byte.
+        if let Some(policy) = genesis.as_ref().and_then(|genesis| genesis.fee_policy.clone()) {
+            state = state.with_fee_policy(policy)?;
+        }
         if let Some(limit) = proposal_limit {
             state = state.with_proposal_bytes_limit(limit);
         }

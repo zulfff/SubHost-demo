@@ -516,6 +516,15 @@ the metrics match a request-count test.
   pre-existing genesis `gas_limit` inconsistency — `GenesisConfig::validate`
   checks the policy against `genesis.gas_limit` while the node never reads it
   and the block path hardcodes `BLOCK_GAS_LIMIT`.
+- Step 3 (`s6/fee-market-v2`) adds the genesis/node/RPC wiring: fee derived from
+  the committed tip, version-2 headers, end-of-block settlement before the state
+  root, empty certified blocks, below-base-fee admission refusal with parked
+  entries, and refusal of a legacy data directory. It also makes the genesis
+  seeding persist unconditional when a policy is configured, so a fee-enabled
+  ledger always has the height-0 anchor storage requires (Q-030).
+- Remaining Track B after step 2: `eth_feeHistory` / `eth_gasPrice` /
+  `eth_maxPriorityFeePerGas` and receipt `effectiveGasPrice` from recorded fees;
+  CLI genesis generation for fee-enabled devnets.
 
 **S6.3 Eviction and metrics**
 - Count admitted, replaced, evicted, expired; expose a pool-depth gauge per sender
