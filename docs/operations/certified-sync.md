@@ -77,9 +77,12 @@ a historical QC index.
 Do not restore an older validator journal to force a lagging ledger to start.
 Normal offline nodes keep their latest matching journal/ledger and can receive
 subsequent certificates; incoherent signing-state rollback remains refused.
-Native range requests, fork choice/reorg and production finality remain separate
-protocol work. Timeout and leader behavior comes from the node's consensus
-implementation; the relay only replays already finalized blocks.
+Native nodes now answer bounded `GetBlocks`/`Blocks` ranges from their own
+node-owned certified archive (newest 4096 items, ADR-007), so a validator that
+falls behind the relay chain catches up without the relay. Fork choice/reorg and
+production finality remain separate protocol work. Timeout and leader behavior
+comes from the node's consensus implementation; the relay only replays already
+finalized blocks.
 
 Verification covers invalid/insufficient QCs, tampered execution, corruption,
 wrong genesis, exclusive-writer locking, capacity failure, out-of-order blocks,

@@ -77,8 +77,11 @@ repeated prepared blocks and proof signatures in full timeout envelopes and the
 16 MiB journal. Node sets support 1 through 64 validators. Oversized admission
 or replacement preserves the existing pool and committed state.
 
-Native historical sync is S3: latest-commit gossip repairs only the next block,
-and ledger replay does not yet authenticate every historical QC. Transaction
+Native historical sync is implemented in S3.3: a node archives the newest 4096
+certified block/QC pairs it committed and answers bounded `GetBlocks`/`Blocks`
+ranges, so a peer missing more than the next block backfills and verifies every
+certificate and state transition in order (ADR-007). A gap beyond the retained
+window still needs a snapshot or a fresh testnet. Transaction
 gossip and peer abuse controls are S7; submit the same transaction to potential
 leaders until that stage lands. Pending transactions remain volatile until S6.
 The timer assumes eventual delivery within its configured capped bound.

@@ -272,9 +272,9 @@ separate storage/execution contract and cannot be advertised as finalized reorg.
 
 | Task | Status |
 | --- | --- |
-| S3.1–S3.2 | Consensus classifier + halt signal (ADR-007); node buffering and readiness gating land with S3.3 |
-| S3.1 node buffering | Pending, Track A node side with S3.3 (raka): bounded candidate store, readiness gating |
-| S3.3–S3.4 | In progress on `s3.3/native-sync` (raka) |
+| S3.1–S3.2 | Consensus classifier + halt signal merged (ADR-007); node buffering and readiness gating land separately |
+| S3.1 node buffering | Pending, Track A node side (raka): bounded candidate store fed by `classify_final_evidence`, readiness gating |
+| S3.3–S3.4 | Range sync, catch-up and the node archive land on `s3.3/native-sync` (raka); backup inclusion remains |
 | S3.5 | Planned |
 
 **S3.1 Candidate selection**
@@ -318,6 +318,8 @@ archive byte cap stops ingestion. See `docs/operations/certified-sync.md`.
   ledger, reconcile crash suffixes with the newest journal, refuse corruption.
 - Retain the latest 4096 actual certificates. Include archive, ledger, genesis,
   producer identity and newest signing journal in coherent backups.
+  (Archive + ledger + genesis + producer identity are bound and reconciled by
+  this slice; the backup layout itself is a separate storage/ops slice.)
 - LedgerStore remains append-only under the agreed contract; speculative rollback
   requires a separate Platform storage contract.
 

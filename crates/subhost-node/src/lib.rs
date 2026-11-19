@@ -6,10 +6,14 @@
 //!
 //! With a genesis validator set, the node exchanges proposals, verified votes
 //! and certified commits, and writes blocks through [`RpcState::commit_qc`].
+//! Every committed certificate is archived beside the voting journal, and a
+//! node that receives a certified tip beyond its next height asks for the
+//! missing range instead of dropping it (Q-013 / ADR-007).
 //! Demo chains without validators use [`RpcState::accept_block`] and buffer
 //! blocks that arrive before their parent. There are no consensus timeouts,
-//! view changes, peer scoring, fork choice, or historical block sync yet.
+//! peer scoring, or fork choice yet.
 
+mod certified_history;
 mod consensus_journal;
 #[cfg(test)]
 mod liveness_tests;
@@ -17,12 +21,14 @@ mod liveness_tests;
 mod testnet_tests;
 
 use bincode::Options;
+use certified_history::CertifiedHistory;
 use consensus_journal::ConsensusJournal;
 use serde::de::DeserializeOwned;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use subhost_consensus::{
     driver::{
@@ -129,6 +135,10 @@ pub struct Node {
     /// A driver for every node with a validator set. Observers verify without voting.
     consensus: Option<Arc<Mutex<ConsensusDriver>>>,
     consensus_journal: Option<Arc<ConsensusJournal>>,
+    /// Certified `(block, QC)` history this node committed, served to lagging peers.
+    certified_history: Option<Arc<Mutex<CertifiedHistory>>>,
+    /// Set while a certified range is being adopted; signing stays suppressed.
+    catching_up: Arc<AtomicBool>,
 }
 
 impl Node {
@@ -255,6 +265,24 @@ impl Node {
             info!(height = state.block_height(), "restored existing ledger");
         }
 
+        let certified_history = consensus_journal
+            .as_ref()
+            .map(|journal| {
+                let path = journal.path().with_file_name(certified_history::HISTORY_FILE);
+                CertifiedHistory::open(&path, Some(protocol_context))
+                    .map(|history| Arc::new(Mutex::new(history)))
+            })
+            .transpose()?;
+        if let Some(history) = &certified_history {
+            let history = history.lock().expect("fresh archive lock");
+            info!(
+                retained = history.len(),
+                from = ?history.retained_from(),
+                tip = ?history.tip(),
+                "opened certified history"
+            );
+        }
+
         if genesis.is_none() {
             warn!(
                 path = %config.genesis_path().display(),
@@ -267,7 +295,16 @@ impl Node {
         metrics.set_block_height(state.block_height());
         metrics.set_pending_transactions(state.pending_count());
 
-        Ok(Self { state, metrics, config, genesis, consensus, consensus_journal })
+        Ok(Self {
+            state,
+            metrics,
+            config,
+            genesis,
+            consensus,
+            consensus_journal,
+            certified_history,
+            catching_up: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     pub fn state(&self) -> &RpcState {
@@ -341,16 +378,20 @@ impl Node {
             (Some(config), driver) => {
                 let state = self.state.clone();
                 let journal = self.consensus_journal.clone();
+                let history = self.certified_history.clone();
+                let catching_up = self.catching_up.clone();
                 services.spawn(async move {
-                    run_network_inner(state, config, driver, journal).await?;
+                    run_network_inner(state, config, driver, journal, history, catching_up).await?;
                     Err(NodeError::ServiceStopped("peer gossip"))
                 });
             }
             (None, Some(driver)) => {
                 let state = self.state.clone();
                 let journal = self.consensus_journal.clone();
+                let history = self.certified_history.clone();
+                let catching_up = self.catching_up.clone();
                 services.spawn(async move {
-                    produce_blocks(state, Some(driver), None, journal).await;
+                    produce_blocks(state, Some(driver), None, journal, history, catching_up).await;
                     Err(NodeError::ServiceStopped("consensus producer"))
                 });
             }
@@ -507,7 +548,7 @@ fn decode_block(data: &[u8]) -> Result<Block, bincode::Error> {
 /// stops both. Nothing is spawned here that could outlive the node.
 #[cfg(test)]
 async fn run_network(state: RpcState, config: NetworkConfig) -> Result<(), NodeError> {
-    run_network_inner(state, config, None, None).await
+    run_network_inner(state, config, None, None, None, Arc::new(AtomicBool::new(false))).await
 }
 
 /// Gossip plus block production for a node that holds a consensus driver.
@@ -517,7 +558,8 @@ async fn run_network_with_driver(
     config: NetworkConfig,
     driver: Arc<Mutex<ConsensusDriver>>,
 ) -> Result<(), NodeError> {
-    run_network_inner(state, config, Some(driver), None).await
+    run_network_inner(state, config, Some(driver), None, None, Arc::new(AtomicBool::new(false)))
+        .await
 }
 
 #[cfg(test)]
@@ -527,7 +569,8 @@ async fn run_network_with_journal(
     driver: Arc<Mutex<ConsensusDriver>>,
     journal: Option<Arc<ConsensusJournal>>,
 ) -> Result<(), NodeError> {
-    run_network_inner(state, config, Some(driver), journal).await
+    run_network_inner(state, config, Some(driver), journal, None, Arc::new(AtomicBool::new(false)))
+        .await
 }
 
 async fn run_network_inner(
@@ -535,6 +578,8 @@ async fn run_network_inner(
     config: NetworkConfig,
     driver: Option<Arc<Mutex<ConsensusDriver>>>,
     journal: Option<Arc<ConsensusJournal>>,
+    history: Option<Arc<Mutex<CertifiedHistory>>>,
+    catching_up: Arc<AtomicBool>,
 ) -> Result<(), NodeError> {
     let (manager, handle) = NetworkManager::new(config)?;
     let local_peer_id = handle.local_peer_id;
@@ -548,10 +593,29 @@ async fn run_network_inner(
         result = manager.run() => {
             result.map_err(NodeError::from)
         }
-        () = pump_gossip(&state, &outbound, &mut inbound, &mut block_events, &mut buffer, driver.as_ref(), journal.as_deref()) => {
+        () = pump_gossip(
+            &state,
+            &outbound,
+            &mut inbound,
+            &mut block_events,
+            &mut buffer,
+            driver.as_ref(),
+            CertifiedSync {
+                journal: journal.as_deref(),
+                history: history.as_deref(),
+                catching_up: &catching_up,
+            },
+        ) => {
             Ok(())
         }
-        () = produce_blocks(state.clone(), driver.clone(), Some(outbound.clone()), journal.clone()) => {
+        () = produce_blocks(
+            state.clone(),
+            driver.clone(),
+            Some(outbound.clone()),
+            journal.clone(),
+            history.clone(),
+            catching_up.clone(),
+        ) => {
             Ok(())
         }
     }
@@ -563,12 +627,28 @@ struct ProducedRound {
     vote: Option<Vote>,
 }
 
+/// Append a verified `(block, QC)` to the node-owned archive.
+///
+/// Q-013: the certificate is durable before the ledger append, and serving
+/// later re-checks the block hash against the committed ledger.
+fn archive_commit(
+    history: Option<&Mutex<CertifiedHistory>>,
+    block: &Block,
+    qc: &QuorumCertificate,
+) -> Result<(), NodeError> {
+    let Some(history) = history else { return Ok(()) };
+    let mut history =
+        history.lock().map_err(|_| NodeError::ServiceStopped("poisoned certified history lock"))?;
+    history.append(block.header.height, &encode_block(block), &encode_canonical(qc))
+}
+
 /// Commit a certified candidate before advancing the live consensus driver.
 /// Valid votes stay in the live tally on I/O failure, so the ticker can retry.
 fn commit_ready(
     state: &RpcState,
     driver: &mut ConsensusDriver,
     journal: Option<&ConsensusJournal>,
+    history: Option<&Mutex<CertifiedHistory>>,
 ) -> Result<(), NodeError> {
     let Some(qc) = driver.pending_qc() else { return Ok(()) };
     let block = driver.open_proposal().expect("pending QC requires a proposal").block.clone();
@@ -579,6 +659,7 @@ fn commit_ready(
     if let Some(journal) = journal {
         journal.prepare_commit(driver, block.clone(), qc.clone())?;
     }
+    archive_commit(history, &block, &qc)?;
     state.commit_qc(block, &qc)?;
     *driver = candidate;
     if let Some(journal) = journal {
@@ -592,8 +673,9 @@ fn produce_once_inner(
     state: &RpcState,
     driver: &mut ConsensusDriver,
     journal: Option<&ConsensusJournal>,
+    history: Option<&Mutex<CertifiedHistory>>,
 ) -> Result<Option<ProducedRound>, NodeError> {
-    commit_ready(state, driver, journal)?;
+    commit_ready(state, driver, journal, history)?;
     let initial_view =
         driver.committed_qc().map_or(driver.height(), |qc| qc.view).checked_add(1).ok_or_else(
             || NodeError::InvalidConsensusConfiguration("view counter overflow".into()),
@@ -619,7 +701,7 @@ fn produce_once_inner(
         .open_proposal()
         .cloned()
         .map(|proposal| ProducedRound { proposal, vote: driver.own_vote().cloned() });
-    commit_ready(state, driver, journal)?;
+    commit_ready(state, driver, journal, history)?;
     Ok(round)
 }
 
@@ -628,7 +710,7 @@ fn produce_once(
     state: &RpcState,
     driver: &mut ConsensusDriver,
 ) -> Result<Option<ProducedRound>, NodeError> {
-    produce_once_inner(state, driver, None)
+    produce_once_inner(state, driver, None, None)
 }
 
 fn adopt_pending(
@@ -750,8 +832,9 @@ fn handle_consensus_message_inner(
     driver: &mut ConsensusDriver,
     message: NetworkMessage,
     journal: Option<&ConsensusJournal>,
+    history: Option<&Mutex<CertifiedHistory>>,
 ) -> Result<Option<Vote>, NodeError> {
-    commit_ready(state, driver, journal)?;
+    commit_ready(state, driver, journal, history)?;
     match message {
         NetworkMessage::ConsensusProposal { data } => {
             let proposal: DriverProposal = decode_consensus(&data)?;
@@ -765,7 +848,7 @@ fn handle_consensus_message_inner(
             let mut candidate = driver.clone();
             let vote = candidate.observe_proposal(proposal)?;
             adopt_pending(driver, candidate, journal)?;
-            commit_ready(state, driver, journal)?;
+            commit_ready(state, driver, journal, history)?;
             Ok(vote)
         }
         NetworkMessage::ConsensusVote { data } => {
@@ -773,7 +856,7 @@ fn handle_consensus_message_inner(
             let mut candidate = driver.clone();
             let fresh = candidate.record_vote(vote.clone())?;
             adopt_pending(driver, candidate, journal)?;
-            commit_ready(state, driver, journal)?;
+            commit_ready(state, driver, journal, history)?;
             Ok(fresh.then_some(vote))
         }
         NetworkMessage::PreparedBlock { data } => {
@@ -785,7 +868,7 @@ fn handle_consensus_message_inner(
             let mut candidate = driver.clone();
             let vote = candidate.receive_prepare(prepared)?;
             adopt_pending(driver, candidate, journal)?;
-            commit_ready(state, driver, journal)?;
+            commit_ready(state, driver, journal, history)?;
             Ok(vote)
         }
         NetworkMessage::ViewChange { data } => {
@@ -839,6 +922,7 @@ fn handle_consensus_message_inner(
             if let Some(journal) = journal {
                 journal.prepare_commit(driver, block.clone(), qc.clone())?;
             }
+            archive_commit(history, &block, &qc)?;
             state.commit_qc(block, &qc)?;
             *driver = candidate;
             if let Some(journal) = journal {
@@ -856,7 +940,139 @@ fn handle_consensus_message(
     driver: &mut ConsensusDriver,
     message: NetworkMessage,
 ) -> Result<Option<Vote>, NodeError> {
-    handle_consensus_message_inner(state, driver, message, None)
+    handle_consensus_message_inner(state, driver, message, None, None)
+}
+
+/// Catch-up progress owned by the gossip pump: where the peer tip is and when
+/// the current window was last requested.
+#[derive(Default)]
+struct SyncState {
+    /// Newest certified height a peer announced; the range target.
+    target: Option<BlockHeight>,
+    /// Start of the last request, so the retry ticker does not spam peers.
+    requested_at: Option<std::time::Instant>,
+}
+
+/// Certified-history inputs the gossip pump needs beyond the ledger view.
+struct CertifiedSync<'a> {
+    journal: Option<&'a ConsensusJournal>,
+    history: Option<&'a Mutex<CertifiedHistory>>,
+    catching_up: &'a AtomicBool,
+}
+
+impl SyncState {
+    /// Ask for the next bounded window, if the peer tip is still ahead.
+    fn request(&mut self, tip: BlockHeight) -> Option<NetworkMessage> {
+        let target = self.target?;
+        if target <= tip {
+            return None;
+        }
+        let from = tip + 1;
+        let to = target.min(from.saturating_add(subhost_network::MAX_SYNC_ITEMS as u64 - 1));
+        self.requested_at = Some(std::time::Instant::now());
+        Some(NetworkMessage::GetBlocks { from, to })
+    }
+
+    /// Retry the window once the previous request has gone unanswered for a while.
+    fn retry(&mut self, tip: BlockHeight) -> Option<NetworkMessage> {
+        let stale =
+            self.requested_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(1));
+        if !stale {
+            return None;
+        }
+        self.request(tip)
+    }
+}
+
+/// Binary item budget whose JSON byte-array expansion still fits the wire cap.
+fn sync_payload_budget() -> usize {
+    subhost_network::MAX_WIRE_BYTES.saturating_sub(4096) / 4
+}
+
+/// Serve a bounded ascending slice of certified history this node committed.
+///
+/// Q-013: never invent history. An item leaves only when the retained ledger
+/// holds the same block hash at that height, and the response is truncated to a
+/// valid prefix rather than padded to the requested range.
+fn serve_certified_range(
+    state: &RpcState,
+    history: &Mutex<CertifiedHistory>,
+    from: BlockHeight,
+    to: BlockHeight,
+) -> Result<Option<NetworkMessage>, NodeError> {
+    let history =
+        history.lock().map_err(|_| NodeError::ServiceStopped("poisoned certified history lock"))?;
+    let to = to.min(state.block_height());
+    let budget = sync_payload_budget();
+    let mut items = Vec::new();
+    let mut bytes = 0usize;
+    for (height, block_bytes, qc_bytes) in history.range(from, to) {
+        let Some(committed) = state.block_at_height(height) else { break };
+        let Ok(block) = decode_block(block_bytes) else { break };
+        if block.hash() != committed.hash() {
+            break;
+        }
+        let item = certified_history::encode_item(block_bytes, qc_bytes);
+        if bytes + item.len() > budget {
+            break;
+        }
+        bytes += item.len();
+        items.push(item);
+    }
+    if items.is_empty() {
+        return Ok(None);
+    }
+    let message = NetworkMessage::Blocks { items };
+    message.validate()?;
+    Ok(Some(message))
+}
+
+/// Adopt certified history in ascending parent-linked order.
+///
+/// Sari's Q-027 boundary: the live `BlockCommit` ordering on a driver clone, a
+/// journal save per commit, and no consensus-crate change. A failed suffix stops
+/// the run; everything already committed stays, so the tip never skips a
+/// missing certificate.
+fn apply_certified_range(
+    state: &RpcState,
+    driver: &mut ConsensusDriver,
+    journal: Option<&ConsensusJournal>,
+    history: Option<&Mutex<CertifiedHistory>>,
+    items: &[Vec<u8>],
+) -> Result<u64, NodeError> {
+    let mut applied = 0u64;
+    for item in items {
+        let (block_bytes, qc_bytes) = certified_history::decode_item(item).ok_or_else(|| {
+            subhost_rpc::RpcError::BlockRejected("malformed certified sync item".into())
+        })?;
+        let block = decode_block(block_bytes)
+            .map_err(|error| subhost_rpc::RpcError::BlockRejected(error.to_string()))?;
+        if block.header.height != driver.height() + 1 {
+            // Only a contiguous extension is adoptable; stop at the first gap.
+            break;
+        }
+        let qc: QuorumCertificate = decode_consensus(qc_bytes)?;
+        if qc.block_hash != block.hash() {
+            return Err(subhost_rpc::RpcError::BlockRejected(
+                "certificate does not match the synced block".into(),
+            )
+            .into());
+        }
+        let mut candidate = driver.clone();
+        candidate.receive_commit(block.clone(), qc.clone())?;
+        state.validate_certified_block(&block, &qc)?;
+        if let Some(journal) = journal {
+            journal.prepare_commit(driver, block.clone(), qc.clone())?;
+        }
+        archive_commit(history, &block, &qc)?;
+        state.commit_qc(block.clone(), &qc)?;
+        *driver = candidate;
+        if let Some(journal) = journal {
+            journal.save(driver)?;
+        }
+        applied += 1;
+    }
+    Ok(applied)
 }
 
 /// Retry proposal/vote/commit dissemination as peers join the mesh.
@@ -865,6 +1081,8 @@ async fn produce_blocks(
     driver: Option<Arc<Mutex<ConsensusDriver>>>,
     outbound: Option<tokio::sync::mpsc::Sender<NetworkMessage>>,
     journal: Option<Arc<ConsensusJournal>>,
+    history: Option<Arc<Mutex<CertifiedHistory>>>,
+    catching_up: Arc<AtomicBool>,
 ) {
     let Some(driver) = driver else {
         std::future::pending::<()>().await;
@@ -876,10 +1094,15 @@ async fn produce_blocks(
     let mut had_pending = false;
     loop {
         ticker.tick().await;
+        // A catching-up node must not propose or sign: the range about to be
+        // adopted may already contain the height it would vote at (Q-027.4).
+        if catching_up.load(Ordering::SeqCst) {
+            continue;
+        }
         let result = (|| -> Result<Vec<NetworkMessage>, NodeError> {
             let mut driver =
                 driver.lock().map_err(|_| NodeError::ServiceStopped("poisoned consensus lock"))?;
-            commit_ready(&state, &mut driver, journal.as_deref())?;
+            commit_ready(&state, &mut driver, journal.as_deref(), history.as_deref())?;
             let mut candidate = driver.clone();
             let pending = state.pending_count() > 0;
             if pending && !had_pending {
@@ -888,7 +1111,8 @@ async fn produce_blocks(
             had_pending = pending;
             candidate.tick(clock.elapsed())?;
             adopt_pending(&mut driver, candidate, journal.as_deref())?;
-            let round = produce_once_inner(&state, &mut driver, journal.as_deref())?;
+            let round =
+                produce_once_inner(&state, &mut driver, journal.as_deref(), history.as_deref())?;
             let mut messages = current_round_messages(&driver);
             // A just-completed round can still supply its original proposal/vote
             // to a lagging peer before the final certificate is relayed.
@@ -928,6 +1152,28 @@ async fn produce_blocks(
     }
 }
 
+/// Finish or advance a catch-up window after the tip moved.
+///
+/// Returns the next `GetBlocks` request, or `None` once the announced peer tip
+/// is reached — at which point signing resumes.
+fn advance_sync(
+    sync: &mut SyncState,
+    tip: BlockHeight,
+    catching_up: &AtomicBool,
+) -> Option<NetworkMessage> {
+    match sync.target {
+        Some(target) if tip >= target => {
+            sync.target = None;
+            sync.requested_at = None;
+            catching_up.store(false, Ordering::SeqCst);
+            debug!(tip, "certified catch-up reached the announced peer tip");
+            None
+        }
+        Some(_) => sync.request(tip),
+        None => None,
+    }
+}
+
 /// Apply inbound blocks and relay locally sealed ones.
 async fn pump_gossip(
     state: &RpcState,
@@ -936,29 +1182,97 @@ async fn pump_gossip(
     block_events: &mut tokio::sync::broadcast::Receiver<BlockEvent>,
     buffer: &mut BlockBuffer,
     driver: Option<&Arc<Mutex<ConsensusDriver>>>,
-    journal: Option<&ConsensusJournal>,
+    certified: CertifiedSync<'_>,
 ) {
+    let CertifiedSync { journal, history, catching_up } = certified;
+    let mut sync = SyncState::default();
+    let mut retry = tokio::time::interval(std::time::Duration::from_millis(500));
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             message = inbound.recv() => match message {
+                Some(NetworkMessage::GetBlocks { from, to }) if driver.is_some() => {
+                    match history {
+                        Some(history) => match serve_certified_range(state, history, from, to) {
+                            Ok(Some(message)) => relay(outbound, message),
+                            Ok(None) => debug!(from, to, "no retained certified history for the range"),
+                            Err(error) => debug!(%error, "cannot serve certified history"),
+                        },
+                        None => debug!(from, to, "this node keeps no certified history"),
+                    }
+                }
+                Some(NetworkMessage::Blocks { items }) if driver.is_some() => {
+                    let Some(driver) = driver else { continue };
+                    let outcome = match driver.lock() {
+                        Ok(mut driver) => {
+                            let before = driver.height();
+                            let result = apply_certified_range(state, &mut driver, journal, history, &items);
+                            if result.is_ok() && driver.height() > before {
+                                if let Some(message) = certified_tip_message(state, &driver) {
+                                    relay(outbound, message);
+                                }
+                            }
+                            result.map(|applied| (applied, before, driver.height()))
+                        }
+                        Err(_) => {
+                            warn!("consensus lock poisoned; stopping gossip application");
+                            return;
+                        }
+                    };
+                    match outcome {
+                        Ok((applied, before, height)) if height > before => {
+                            debug!(applied, height, "adopted certified history");
+                            if let Some(request) = advance_sync(&mut sync, height, catching_up) {
+                                relay(outbound, request);
+                            }
+                        }
+                        Ok((0, _, height)) if sync.target.is_some_and(|target| height >= target) => {
+                            sync.target = None;
+                            sync.requested_at = None;
+                            catching_up.store(false, Ordering::SeqCst);
+                        }
+                        Ok(_) => {}
+                        Err(error) => debug!(%error, "certified range stopped at the first bad item"),
+                    }
+                }
                 Some(message) if driver.is_some() => {
                     let Some(driver) = driver else { continue };
                     let (result, fresh) = match driver.lock() {
                         Ok(mut driver) => {
                             let before = current_round_messages(&driver);
                             let height = driver.height();
-                            let result = handle_consensus_message_inner(state, &mut driver, message, journal);
-                            let mut fresh = Vec::new();
-                            if result.is_ok() {
-                                fresh = current_round_messages(&driver).into_iter()
-                                    .filter(|message| !before.contains(message)).collect();
-                                if driver.height() > height {
-                                    if let Some(message) = certified_tip_message(state, &driver) {
-                                        fresh.push(message);
+                            // A certified tip beyond the next height means history is
+                            // missing here. Ask for the range instead of dropping it.
+                            let gap = match &message {
+                                NetworkMessage::BlockCommit { data, .. } => decode_block(data)
+                                    .ok()
+                                    .map(|block| block.header.height)
+                                    .filter(|announced| *announced > height + 1),
+                                _ => None,
+                            };
+                            if let Some(announced) = gap {
+                                sync.target = Some(sync.target.map_or(announced, |target| target.max(announced)));
+                                catching_up.store(true, Ordering::SeqCst);
+                                debug!(announced, height, "certified tip is ahead; requesting history");
+                                let request = sync.request(height);
+                                (Ok(None), request.into_iter().collect())
+                            } else {
+                                let result = handle_consensus_message_inner(state, &mut driver, message, journal, history);
+                                let mut fresh = Vec::new();
+                                if result.is_ok() {
+                                    fresh = current_round_messages(&driver).into_iter()
+                                        .filter(|message| !before.contains(message)).collect();
+                                    if driver.height() > height {
+                                        if let Some(message) = certified_tip_message(state, &driver) {
+                                            fresh.push(message);
+                                        }
+                                        if let Some(request) = advance_sync(&mut sync, driver.height(), catching_up) {
+                                            fresh.push(request);
+                                        }
                                     }
                                 }
+                                (result, fresh)
                             }
-                            (result, fresh)
                         },
                         Err(_) => { warn!("consensus lock poisoned; stopping gossip application"); return; }
                     };
@@ -987,6 +1301,17 @@ async fn pump_gossip(
                 Some(_) => {}
                 None => break,
             },
+            _ = retry.tick() => {
+                if sync.target.is_some() {
+                    if let Some(driver) = driver {
+                        if let Ok(driver) = driver.lock() {
+                            if let Some(request) = sync.retry(driver.height()) {
+                                relay(outbound, request);
+                            }
+                        }
+                    }
+                }
+            }
             event = block_events.recv() => match event {
                 // Only relay blocks this node produced; a received block already
                 // reached every peer through gossip.
@@ -1155,6 +1480,9 @@ pub enum NodeError {
 
     #[error("consensus journal {path}: {detail}")]
     ConsensusJournal { path: PathBuf, detail: String },
+
+    #[error("certified history {path}: {detail}")]
+    CertifiedHistory { path: PathBuf, detail: String },
 
     #[error("cannot create data directory {path}: {source}")]
     DataDir {

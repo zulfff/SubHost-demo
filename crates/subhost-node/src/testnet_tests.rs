@@ -8,6 +8,7 @@ fn produce(node: &Node) -> Result<Option<ProducedRound>, NodeError> {
         node.state(),
         &mut node.consensus().unwrap().lock().unwrap(),
         node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
     )
 }
 
@@ -17,6 +18,7 @@ fn deliver(node: &Node, message: NetworkMessage) -> Result<Option<Vote>, NodeErr
         &mut node.consensus().unwrap().lock().unwrap(),
         message,
         node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
     )
 }
 

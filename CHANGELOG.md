@@ -265,6 +265,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   overflow-checked, and direct tests cover the halted Commit-vote and
   view-change refusals.
 
+- **Native certified history and bounded block sync (S3.3, ADR-007).** A
+  validator node archives every certified `(block, QC)` it commits in a
+  genesis-bound, checksummed file beside the voting journal (newest 4096 items),
+  serves it only when the retained ledger holds the same block hash, and a node
+  that sees a certified tip beyond its next height requests the missing range
+  with the new `GetBlocks`/`Blocks` messages (appended at the end of the enum,
+  hard cap 128 items). Adopted items follow the live commit ordering with a
+  driver clone and a per-commit journal save; signing is suppressed by a
+  node-owned `catching_up` flag until the announced tip is reached. No
+  `LedgerStore`, RPC, CLI, or `subhost-consensus` change. See the S3.3 amendment
+  in `docs/agents/decisions/ADR-007-native-certified-fork-accountability.md`.
+
 - **Platform observability API (S8, ADR-013).** `Metrics::set_health` publishes
   one coherent `HealthStatus` snapshot; the exporter serves `/health/live`
   (and legacy `/health`) as liveness-only and `/health/ready` as 200 only when

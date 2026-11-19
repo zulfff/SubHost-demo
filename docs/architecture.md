@@ -267,8 +267,9 @@ What the ledger does not guarantee:
 
 - no finality and no fork choice: `accept_block` only appends one block to the local
   tip, and a competing branch is rejected because it does not extend that tip;
-- no block sync or backfill: a gap is only filled by blocks arriving through gossip
-  within the 64-block window;
+- no block sync for the legacy single-writer demo: a gap there is only filled by
+  blocks arriving through gossip within the 64-block window. Validator-set nodes
+  do fill a longer gap from a peer's retained certified history (S3.3, ADR-007);
 - no reorg: `persist` refuses a snapshot that does not extend the committed head
   (`StorageError::NonAppendPersist`), so a competing branch can only replace the
   chain by deleting the ledger directory and replaying from genesis;
@@ -280,8 +281,9 @@ What the ledger does not guarantee:
   newest N segments, and needs the snapshot to stay inside the retained history. A
   pruned node is not an archive node: `eth_getBlockByNumber` returns `null` below its
   base height, `eth_getTransactionByHash` and `eth_getTransactionReceipt` return
-  `null` for a pruned transaction, `earliest` is the oldest retained block, and there
-  is no backfill (that returns with block sync in S3/S7);
+  `null` for a pruned transaction, `earliest` is the oldest retained block, and
+  there is no backfill below the retained window (S3.3 sync serves only the
+  newest certified 4096 items, not pruned history);
 - no failed receipts: a transaction that fails to execute is not included, so every
   persisted receipt is `Success` with empty logs and no contract address;
 - JSON-RPC authentication is opt-in and the metrics endpoint has none: without

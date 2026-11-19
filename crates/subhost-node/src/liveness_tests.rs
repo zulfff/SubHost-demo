@@ -151,7 +151,11 @@ async fn wait_for_height(
     height: u64,
     drivers: &[Arc<Mutex<ConsensusDriver>>],
 ) {
-    tokio::time::timeout(Duration::from_secs(20), async {
+    // These clusters spend real 750 ms view timeouts and run beside every other
+    // cluster test in the same process, so convergence can take ~20 s under
+    // load. Keep a bounded failure, but do not turn scheduler pressure into a
+    // false liveness regression.
+    tokio::time::timeout(Duration::from_secs(60), async {
         while states.iter().any(|state| state.block_height() != height) {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -847,6 +851,7 @@ fn a_lagging_designated_leader_persists_a_complete_timeout_certificate_from_the_
             &mut driver,
             NetworkMessage::TimeoutCertificate { data: encode_canonical(&certificate) },
             node.consensus_journal.as_deref(),
+            node.certified_history.as_deref(),
         )
         .unwrap();
         assert_eq!(driver.view(), 5);

@@ -124,9 +124,14 @@ fn validator_mode_boots_with_the_default_producer_key() {
 
     let driver = node.consensus().expect("a validator node must own a driver");
     let mut driver = driver.lock().unwrap();
-    assert!(produce_once_inner(node.state(), &mut driver, node.consensus_journal.as_deref())
-        .unwrap()
-        .is_some());
+    assert!(produce_once_inner(
+        node.state(),
+        &mut driver,
+        node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
+    )
+    .unwrap()
+    .is_some());
     drop(driver);
 
     let block = node.state().block_at_height(1).unwrap();
@@ -343,6 +348,84 @@ fn restarting_a_validator_restores_the_committed_height_and_view() {
     assert_eq!(restarted.state().block_height(), 2);
     assert_eq!(restarted.state().block_at_height(2).unwrap().header.parent_hash, first_hash);
     assert_eq!(restarted.state().committed_view(), Some(2));
+}
+
+#[test]
+fn a_lagging_validator_backfills_certified_history_and_restarts_at_the_synced_tip() {
+    let (dirs, nodes) = validator_nodes(1);
+    let producer = &nodes[0];
+    for nonce in 0..3 {
+        producer.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 10)).unwrap();
+        produce_for_test(producer).unwrap();
+    }
+    assert_eq!(producer.state().block_height(), 3);
+    assert_eq!(
+        producer.certified_history.as_ref().map(|history| history.lock().unwrap().len()),
+        Some(3),
+        "every committed certificate is archived before serving"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    for file in [GENESIS_FILE_NAME, PRODUCER_KEY_FILE_NAME] {
+        std::fs::copy(dirs[0].path().join(file), dir.path().join(file)).unwrap();
+    }
+    let lagging =
+        Node::bootstrap(NodeConfig { validator: true, ..test_config(dir.path()) }).unwrap();
+    assert_eq!(lagging.state().block_height(), 0, "the replica starts behind");
+
+    let (items, applied) = {
+        let history = producer.certified_history.as_ref().unwrap();
+        let served = serve_certified_range(producer.state(), history, 1, 3).unwrap().unwrap();
+        let NetworkMessage::Blocks { items } = served else {
+            panic!("serving certified history must answer with a block range");
+        };
+        let mut driver = lagging.consensus().unwrap().lock().unwrap();
+        let applied = apply_certified_range(
+            lagging.state(),
+            &mut driver,
+            lagging.consensus_journal.as_deref(),
+            lagging.certified_history.as_deref(),
+            &items,
+        )
+        .unwrap();
+        (items.len(), applied)
+    };
+    assert_eq!(items, 3);
+    assert_eq!(applied, 3);
+    assert_eq!(lagging.state().block_height(), 3);
+    assert_eq!(lagging.state().tip_hash(), producer.state().tip_hash());
+    assert_eq!(lagging.state().state_root(), producer.state().state_root());
+
+    let config = lagging.config().clone();
+    assert_eq!(
+        lagging.certified_history.as_ref().unwrap().lock().unwrap().tip(),
+        Some(3),
+        "adopted history is archived for the next peer"
+    );
+    drop(lagging);
+    let reopened = Node::bootstrap(config).unwrap();
+    assert_eq!(reopened.state().block_height(), 3);
+    assert_eq!(reopened.state().tip_hash(), producer.state().tip_hash());
+}
+
+#[test]
+fn sync_requests_and_served_windows_are_bounded() {
+    let mut sync = SyncState { target: Some(1_000), requested_at: None };
+    let NetworkMessage::GetBlocks { from, to } = sync.request(10).unwrap() else {
+        panic!("a gap request must be a GetBlocks message");
+    };
+    assert_eq!(from, 11);
+    assert_eq!(to, 10 + subhost_network::MAX_SYNC_ITEMS as u64);
+    assert!(sync.request(1_000).is_none(), "no request once the tip is reached");
+    assert!(sync.retry(1_000).is_none());
+
+    let (_dirs, nodes) = validator_nodes(1);
+    let node = &nodes[0];
+    node.state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+    produce_for_test(node).unwrap();
+    let history = node.certified_history.as_ref().unwrap();
+    assert!(serve_certified_range(node.state(), history, 2, 9).unwrap().is_none());
+    assert!(serve_certified_range(node.state(), history, 1, 9).unwrap().is_some());
 }
 
 #[test]
@@ -616,6 +699,7 @@ pub(super) fn produce_for_test(node: &Node) -> Result<Option<ProducedRound>, Nod
         node.state(),
         &mut node.consensus().unwrap().lock().unwrap(),
         node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
     )
 }
 
@@ -628,6 +712,7 @@ pub(super) fn deliver_for_test(
         &mut node.consensus().unwrap().lock().unwrap(),
         message,
         node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
     )
 }
 
