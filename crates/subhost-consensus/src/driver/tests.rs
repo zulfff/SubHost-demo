@@ -1013,3 +1013,183 @@ fn fresh_phases_get_full_deadlines_without_retransmission_extensions() {
     assert_eq!(timeout.view, 2);
     assert_eq!(timeout.prepared, Some(prepared));
 }
+
+fn final_qc(
+    keys: &[(Address, PrivateKey)],
+    indices: &[usize],
+    view: u64,
+    hash: Hash,
+) -> QuorumCertificate {
+    QuorumCertificate {
+        protocol_context: Hash::ZERO,
+        view,
+        block_hash: hash,
+        signatures: indices
+            .iter()
+            .map(|index| {
+                let (address, key) = &keys[*index];
+                (
+                    *address,
+                    BLSScheme::encode_signature(&BLSScheme::sign(
+                        key,
+                        &QuorumCertificate::payload_for(view, &hash),
+                    )),
+                )
+            })
+            .collect(),
+    }
+}
+
+fn committed_pair(drivers: &mut [ConsensusDriver]) -> (Block, QuorumCertificate) {
+    let first = block(1, Hash::ZERO, 1);
+    let (proposal, _) = drivers[0].propose(first.clone()).unwrap();
+    let qc = certify(drivers, &[0, 1, 2], proposal);
+    (first, qc)
+}
+
+#[test]
+fn a_second_certificate_for_the_finalized_hash_is_duplicate_evidence() {
+    let (_, keys, mut drivers) = setup(4);
+    let (first, _) = committed_pair(&mut drivers);
+    let view_before = drivers[1].view();
+    let duplicate = final_qc(&keys, &[0, 1, 2], 2, first.hash());
+    assert_eq!(
+        drivers[1].classify_final_evidence(&first, &duplicate).unwrap(),
+        FinalEvidence::Duplicate { height: 1 }
+    );
+    // Duplicate evidence must not disturb any active vote, view or lock.
+    assert_eq!(drivers[1].view(), view_before);
+    assert_eq!(drivers[1].tip(), first.hash());
+    assert!(drivers[1].own_vote().is_none());
+    assert!(drivers[1].prepared_certificate().is_none());
+    assert!(drivers[1].halted().is_none());
+}
+
+#[test]
+fn conflicting_final_hashes_at_a_finalized_height_are_accountable_evidence() {
+    let (_, keys, mut drivers) = setup(4);
+    let (first, _) = committed_pair(&mut drivers);
+    let other = block(1, Hash::ZERO, 9);
+    assert_ne!(other.hash(), first.hash());
+    let qc = final_qc(&keys, &[0, 1, 2], 2, other.hash());
+    assert_eq!(
+        drivers[1].classify_final_evidence(&other, &qc).unwrap(),
+        FinalEvidence::Conflicting { height: 1 }
+    );
+    assert_eq!(drivers[1].tip(), first.hash(), "classification never rolls back");
+    assert!(drivers[1].halted().is_none(), "classifying alone must not halt");
+}
+
+#[test]
+fn certified_history_below_the_tip_defers_to_the_ledger() {
+    let (_, keys, mut drivers) = setup(4);
+    let (first, _) = committed_pair(&mut drivers);
+    let second = block(2, first.hash(), 2);
+    let (proposal, _) = drivers[1].propose(second).unwrap();
+    certify(&mut drivers, &[0, 1, 2], proposal);
+    let qc = final_qc(&keys, &[0, 1, 2], 3, first.hash());
+    assert_eq!(
+        drivers[1].classify_final_evidence(&first, &qc).unwrap(),
+        FinalEvidence::Historical { height: 1, hash: first.hash() }
+    );
+}
+
+#[test]
+fn certified_next_block_gap_and_non_extending_child_are_distinguished() {
+    let (_, keys, mut drivers) = setup(4);
+    let (first, _) = committed_pair(&mut drivers);
+
+    let next = block(2, first.hash(), 2);
+    let qc = final_qc(&keys, &[0, 1, 2], 2, next.hash());
+    assert_eq!(drivers[1].classify_final_evidence(&next, &qc).unwrap(), FinalEvidence::Next);
+
+    let far = block(4, Hash::from_data(&[7]), 4);
+    let qc = final_qc(&keys, &[0, 1, 2], 2, far.hash());
+    assert_eq!(
+        drivers[1].classify_final_evidence(&far, &qc).unwrap(),
+        FinalEvidence::MissingAncestors { from: 2, to: 3 }
+    );
+
+    let off_tip = block(2, Hash::from_data(&[8]), 8);
+    let qc = final_qc(&keys, &[0, 1, 2], 2, off_tip.hash());
+    assert_eq!(
+        drivers[1].classify_final_evidence(&off_tip, &qc).unwrap(),
+        FinalEvidence::Conflicting { height: 2 },
+        "a certified child that ignores the finalized tip is accountable"
+    );
+
+    // Finality is monotone: a certificate from a view behind committed finality
+    // cannot be the next block.
+    let qc = final_qc(&keys, &[0, 1, 2], 1, next.hash());
+    assert_eq!(
+        drivers[1].classify_final_evidence(&next, &qc).unwrap(),
+        FinalEvidence::Conflicting { height: 2 }
+    );
+}
+
+#[test]
+fn unauthenticated_or_mismatched_evidence_is_rejected_without_an_incident() {
+    let (_, keys, mut drivers) = setup(4);
+    let (first, _) = committed_pair(&mut drivers);
+    let other = block(1, Hash::ZERO, 9);
+
+    // Two signers are below the 3-of-4 quorum.
+    let weak = final_qc(&keys, &[0, 1], 2, other.hash());
+    assert!(drivers[1].classify_final_evidence(&other, &weak).is_err());
+
+    // Valid signatures, but the certificate names the finalized hash while the
+    // presented block is a different one.
+    let valid = final_qc(&keys, &[0, 1, 2], 2, first.hash());
+    assert!(drivers[1].classify_final_evidence(&other, &valid).is_err());
+    assert!(drivers[1].halted().is_none(), "junk evidence must not halt");
+}
+
+#[test]
+fn halting_is_sticky_and_stops_every_signature_but_not_certified_history() {
+    let (_, keys, mut drivers) = setup(4);
+    let (first, _) = committed_pair(&mut drivers);
+    let mut leader = drivers[1].clone();
+    let (proposal, _) = leader.propose(block(2, first.hash(), 2)).unwrap();
+
+    drivers[1].halt(HaltReason::ConflictingFinalEvidence { height: 1 });
+    drivers[1].halt(HaltReason::ConflictingFinalEvidence { height: 2 });
+    assert_eq!(
+        drivers[1].halted(),
+        Some(&HaltReason::ConflictingFinalEvidence { height: 1 }),
+        "the first reason wins"
+    );
+    assert!(matches!(
+        drivers[1].observe_proposal(proposal.clone()),
+        Err(ConsensusError::Halted(_))
+    ));
+    assert!(matches!(
+        drivers[1].propose(block(2, first.hash(), 3)),
+        Err(ConsensusError::Halted(_))
+    ));
+
+    // Certified finalized history still applies: S3.2 halts signing and
+    // readiness, never the append-only ledger.
+    let next = proposal.block.clone();
+    let qc = final_qc(&keys, &[0, 1, 2], 2, next.hash());
+    drivers[1].receive_commit(next.clone(), qc).unwrap();
+    assert_eq!(drivers[1].tip(), next.hash());
+}
+
+#[test]
+fn the_halt_reason_is_process_local_and_never_serialized() {
+    let (registry, keys, mut drivers) = setup(4);
+    let _ = committed_pair(&mut drivers);
+    drivers[1].halt(HaltReason::ConflictingFinalEvidence { height: 1 });
+    let checkpoint = drivers[1].checkpoint();
+    let restored = ConsensusDriver::from_checkpoint(
+        ConsensusConfig::new(4).unwrap(),
+        registry,
+        Some(keys[1].clone()),
+        checkpoint,
+    )
+    .unwrap();
+    assert!(
+        restored.halted().is_none(),
+        "the node persists and re-applies the incident outside the checkpoint"
+    );
+}

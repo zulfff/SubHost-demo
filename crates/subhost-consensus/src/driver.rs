@@ -181,6 +181,47 @@ pub enum VoteOutcome {
     Committed { view: u64, block_hash: Hash },
 }
 
+/// Why signing stopped. The durable incident record itself is node-owned; this
+/// reason is the in-process signal the node mirrors into its own evidence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HaltReason {
+    /// A valid final certificate names a different hash at a finalized height,
+    /// or a child that does not extend the finalized tip.
+    ConflictingFinalEvidence { height: u64 },
+}
+
+impl std::fmt::Display for HaltReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConflictingFinalEvidence { height } => {
+                write!(f, "conflicting final evidence at height {height}")
+            }
+        }
+    }
+}
+
+/// Meaning of an authenticated final certificate relative to local finality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalEvidence {
+    /// Certifies the already-finalized hash at the finalized height. A different
+    /// valid certificate for the same block is duplicate evidence, not a fork,
+    /// and must not change any active vote or view obligation.
+    Duplicate { height: u64 },
+    /// Valid certificate for the next height on the finalized tip: the caller may
+    /// apply it through the normal `receive_commit` path after execution checks.
+    Next,
+    /// Valid certificate that contradicts local finality. Persist an incident,
+    /// halt signing and readiness; never roll back the append-only ledger.
+    Conflicting { height: u64 },
+    /// Certificate for a height below the final tip. The driver keeps no
+    /// history, so the caller compares `hash` against its ledger at `height` and
+    /// treats equality as `Duplicate`, inequality as `Conflicting`.
+    Historical { height: u64, hash: Hash },
+    /// Certificate past a gap above the tip: buffer the certified block by hash
+    /// and request the missing certified ancestors `from..=to` before applying.
+    MissingAncestors { from: u64, to: u64 },
+}
+
 #[derive(Clone)]
 pub struct ConsensusDriver {
     config: ConsensusConfig,
@@ -203,6 +244,10 @@ pub struct ConsensusDriver {
     started_at: Option<Duration>,
     timeout_attempts: u32,
     committed: Vec<Block>,
+    /// Set when finality itself is broken; sticky for this process and never
+    /// serialized. The node persists the accountable incident and re-halts on
+    /// startup, so the checkpoint/journal format stays unchanged.
+    halted: Option<HaltReason>,
     /// Successful checks only, scoped to this immutable registry. This cache is
     /// never serialized; recovery authenticates every restored obligation again.
     verified_signatures: RefCell<BTreeSet<Hash>>,
@@ -273,6 +318,7 @@ impl ConsensusDriver {
             started_at: None,
             timeout_attempts: 0,
             committed: Vec::new(),
+            halted: None,
             verified_signatures: RefCell::new(BTreeSet::new()),
         })
     }
@@ -429,6 +475,19 @@ impl ConsensusDriver {
     }
     pub fn is_validator(&self) -> bool {
         self.identity.is_some()
+    }
+    /// The reason signing stopped, if it did. Sticky for this process: clearing
+    /// it is an operator action on a restarted node, never an automatic recovery.
+    pub fn halted(&self) -> Option<&HaltReason> {
+        self.halted.as_ref()
+    }
+    /// Halt signing after accountable conflicting final evidence. The first
+    /// reason wins; later calls are ignored. Existing vote/view state is kept so
+    /// the node can still report it, and certified history may still be applied.
+    pub fn halt(&mut self, reason: HaltReason) {
+        if self.halted.is_none() {
+            self.halted = Some(reason);
+        }
     }
     pub fn leader(&self) -> Address {
         self.leader_for(self.view)
@@ -759,6 +818,48 @@ impl ConsensusDriver {
         self.changes.clear();
         self.timeout_attempts = 0;
         Ok(())
+    }
+
+    /// Classify an authenticated final certificate against local finality.
+    ///
+    /// Signature validity is checked first; anything unauthenticated is a plain
+    /// rejection, never an incident, so junk evidence cannot halt the node. The
+    /// caller owns persistence: `Conflicting` becomes a durable incident plus
+    /// `halt`, `Historical` is compared with the ledger hash at that height,
+    /// `MissingAncestors` feeds candidate buffering and certified range sync.
+    pub fn classify_final_evidence(
+        &self,
+        block: &Block,
+        qc: &QuorumCertificate,
+    ) -> Result<FinalEvidence, ConsensusError> {
+        if qc.block_hash != block.hash() {
+            return Err(invalid("final certificate does not match the presented block"));
+        }
+        self.validate_commit_certificate(qc)?;
+        let height = block.header.height;
+        if height < self.height {
+            return Ok(FinalEvidence::Historical { height, hash: block.hash() });
+        }
+        if height == self.height {
+            return Ok(if block.hash() == self.tip {
+                FinalEvidence::Duplicate { height }
+            } else {
+                FinalEvidence::Conflicting { height }
+            });
+        }
+        if height == self.height + 1
+            && block.header.parent_hash == self.tip
+            && qc.view >= self.initial_view()?
+        {
+            return Ok(FinalEvidence::Next);
+        }
+        if height == self.height + 1 {
+            // A certified child of the finalized height that is not our tip (or a
+            // view behind committed finality) means a quorum finalized a different
+            // branch: accountable evidence, never a silent rollback.
+            return Ok(FinalEvidence::Conflicting { height });
+        }
+        Ok(FinalEvidence::MissingAncestors { from: self.height + 1, to: height - 1 })
     }
 
     /// Reset an idle timer when newly admitted work first arrives. No view,
@@ -1175,6 +1276,9 @@ impl ConsensusDriver {
         Ok(())
     }
     fn sign(&self, payload: &[u8]) -> Result<Vec<u8>, ConsensusError> {
+        if let Some(reason) = &self.halted {
+            return Err(ConsensusError::Halted(reason.to_string()));
+        }
         let (_, key) = self.identity.as_ref().ok_or(ConsensusError::NotAValidator)?;
         Ok(BLSScheme::encode_signature(&BLSScheme::sign(key, payload)))
     }
