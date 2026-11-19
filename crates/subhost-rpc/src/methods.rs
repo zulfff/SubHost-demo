@@ -641,6 +641,7 @@ mod tests {
     use crate::security::SecretToken;
     use crate::test_support::{funded_state, signed_transfer, signing_key};
     use ed25519_dalek::Signer;
+    use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn rpc_request(addr: SocketAddr, body: serde_json::Value) -> serde_json::Value {
@@ -691,13 +692,13 @@ mod tests {
     #[tokio::test]
     async fn hash_lookup_matches_number_lookup_and_pruned_hashes_are_null() {
         let key = signing_key(11);
-        let mut state = funded_state(&key, 1_000_000);
+        let state = funded_state(&key, 1_000_000);
         state.submit_transaction(signed_transfer(&key, 0, 1)).unwrap();
         state.submit_transaction(signed_transfer(&key, 1, 1)).unwrap();
         let first_hash = state.block_at_height(1).unwrap().hash().to_string();
         let second_hash = state.block_at_height(2).unwrap().hash().to_string();
         state.blocks.write().unwrap().remove(0);
-        state.base_height = 1;
+        state.base_height.store(1, Ordering::SeqCst);
         let (addr, handle) = start_test_server(state).await;
         for full in [false, true] {
             let by_number =
@@ -719,12 +720,12 @@ mod tests {
     #[tokio::test]
     async fn fee_history_reports_retained_blocks_and_legacy_fees() {
         let key = signing_key(12);
-        let mut state = funded_state(&key, 1_000_000);
+        let state = funded_state(&key, 1_000_000);
         for nonce in 0..3 {
             state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
         }
         state.blocks.write().unwrap().remove(0);
-        state.base_height = 1;
+        state.base_height.store(1, Ordering::SeqCst);
         let (addr, handle) = start_test_server(state).await;
         let response =
             call_rpc(addr, "eth_feeHistory", serde_json::json!(["0x400", "latest", [0, 50, 100]]))
@@ -964,7 +965,7 @@ mod tests {
     #[test]
     fn a_pruned_state_maps_heights_onto_the_retained_suffix() {
         let key = signing_key(7);
-        let mut state = funded_state(&key, 1_000_000);
+        let state = funded_state(&key, 1_000_000);
         for nonce in 0..3 {
             state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
         }
@@ -979,7 +980,7 @@ mod tests {
             blocks.remove(0);
             blocks.remove(0);
         }
-        state.base_height = 2;
+        state.base_height.store(2, Ordering::SeqCst);
 
         assert_eq!(state.base_height(), 2);
         assert_eq!(state.block_count(), 1);

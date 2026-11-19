@@ -644,7 +644,11 @@ verification, multisig quorum certificate.
 storage.
 **S12.2** External audit of core/consensus/rpc/storage; close every High/Medium.
 **S12.3** Public four-validator testnet; 30 days; no manual ledger repair; publish
-incident log.
+incident log. Gated on SUBHOST-2026-003 fix 3 (automatic retention, Q-036): the
+storage/state half is implemented on `s12/ledger-retention` (`prune_to_height` +
+typed `RefusedBySnapshot` + `retain_from` atomic trim); the node trigger and
+`--retention-blocks` are the remaining consumer slices. Fix 1 (calldata pricing)
+is Q-037 and gates activation separately.
 **S12.4** Bug bounty scope and disclosure policy.
 **S12.5** v1.0 go/no-go against section 2.
 
