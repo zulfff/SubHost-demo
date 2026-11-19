@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-19 · historical baseline `main` = `1043268` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5, S5.1a and S5.3a merged · S2.1–S2.2, S2.3 QC API, S2.4a recovery/P2P and S5.3b implemented on the S2 branch · `Q-001`–`Q-011` agreed
+Status: 2026-11-19 · `main` = `982d3e6` · S0, S1 (through S1.4), S4 (through S4.5), S5.1a/S5.3a merged · S2 timeout/quorum + CLI policy (#46) and S3 certified-history relay (#45) merged · S8 slice 1 merged (#47) · S9 (#48), 002 wallet fix (#49), 003 storage slice (#50), S8.2 mempool events (#51) in review · `Q-001`–`Q-024` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -124,14 +124,14 @@ agent always sees the real state.
 | --- | --- | --- | --- | --- | --- |
 | S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
 | S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
-| S2 | Wire the consensus driver into the node | A | S1 | L | Partial: QC API, durable rounds, local testnet/P2P; timeout/CLI pending |
-| S3 | Fork choice, reorg, and block sync | A | S2 | L | Platform certified-history relay available; native protocol/fork choice/reorg pending |
+| S2 | Wire the consensus driver into the node | A | S1 | L | Timeout/quorum + leader recovery and CLI policy merged (#46); exit-criteria verification pending |
+| S3 | Fork choice, reorg, and block sync | A | S2 | L | Certified-history relay merged (#45); native protocol/fork choice/reorg pending |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
-| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented |
-| S6 | Durable mempool and fee market | B | S0 | M | S6.1a snapshot API in review; node/RPC consumers pending |
+| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented; S5.2 methods in progress |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a snapshot API merged (#44); fee market and node/RPC consumers pending |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
-| S8 | Observability, health, runbooks | B | S0 | M | Planned |
-| S9 | Release engineering | B | S5 | M | Planned |
+| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 merged (#47); S8.2 mempool events in review (#51); tracing/runbooks/alerts pending |
+| S9 | Release engineering | B | S5 | M | PR #48 in review (rebase pending after #47) |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
 | S12 | External audit and public testnet soak | all | S1–S9 | XL | Planned |
