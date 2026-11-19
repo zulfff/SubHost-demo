@@ -25,6 +25,7 @@ gated rules only after their call-sites land, or they fire on a healthy chain.
 | Snapshot age | `subhost_ledger_snapshot_modified_seconds` | **gated** — 0 means unavailable, not an epoch |
 | Connected peers | `subhost_connected_peers` | **gated** — stays 0 until wired |
 | Reorg count | `subhost_reorg_total` | registered at 0, **no increment API** — reorgs unsupported; never alert on it |
+| Pending-file cleanup failures | `subhost_mempool_pending_cleanup_failures_total` | **gated** — registered at 0 and *will* increment once the S6.1b node wiring lands (unlike reorgs, whose 0 is permanent). Enable `SubhostPendingCleanupFailing` with that wiring |
 
 There is **no direct quorum-participation metric**. "No quorum" below is a
 finality-stall proxy, not a measurement of votes; it is gated on
@@ -57,6 +58,14 @@ groups:
         labels: { severity: ticket }
         annotations:
           summary: "{{ $labels.instance }} >5 RPC errors/s for 10m"
+      # Gated: enable only with the S6.1b node wiring. A committed block never
+      # fails because of this; it means mempool.bin is stale, so accepted-but-
+      # unmined transactions may not survive a restart. Ticket, not page.
+      - alert: SubhostPendingCleanupFailing
+        expr: increase(subhost_mempool_pending_cleanup_failures_total[15m]) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: "{{ $labels.instance }} could not rewrite mempool.bin after a committed block"
 
       # --- gated: enable only after the node call-sites land ---
       - alert: SubhostNoQuorum

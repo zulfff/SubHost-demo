@@ -128,7 +128,7 @@ agent always sees the real state.
 | S3 | Fork choice, reorg, and block sync | A | S2 | L | Merged: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57), R-57-01 fix + coherent archive restore (#67). Per Q-013: append-only finality, no finalized reorg |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | Merged: S5.1a auth/bind policy, S5.2 methods (#54), S5.3a middleware + S5.3b node wiring. TLS = documented reverse-proxy mode; rate limit per connection |
-| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks contract in progress (dewi, Q-034), wiring after step 3 (raka); S6.2 steps 1–2 merged (#60/#65), step 3 in progress (bima); S6.3 counters merged (#51), TTL/eviction pending |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks in review (dewi, Q-034), node wiring next (raka); S6.2 steps 1-3 merged (#60/#65/#71); S6.3 counters merged (#51), TTL/eviction pending |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
 | S8 | Observability, health, runbooks | B | S0 | M | Slice 1 health/gauges (#47), mempool events (#51), runbooks + alerts (#66) merged; node runtime hooks (sari, Q-032), RPC spans (yoga, Q-033), OTLP exporter (tania) in progress |
 | S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap loader pending after S6.2 |
@@ -487,15 +487,21 @@ the metrics match a request-count test.
 - S6.1a in review on `s6/mempool-store-contract`: `MempoolStore` supplies a bounded
   signed-transfer snapshot with chain/genesis binding, atomic replacement and
   whole-load validation. Limits are 64 MiB, 10,000 entries and 1 MiB per record.
-- S6.1b remains pending: after journal/ledger reconciliation, filter mined nonces
-  and re-admit under current pool/proposal policy; persist admission candidates
-  before visibility/acknowledgement. Post-commit pending-file cleanup failure
-  must not fail an already durable block commit. CLI opt-in/capacity consumers
-  follow the separate node/state contract. Until then this stage is not complete
-  and the bundled node's accepted pool remains volatile.
+- S6.1b consumer hooks landed on `s6/mempool-reconciliation` (Q-034, additive
+  B-only): `RpcState::with_pending_store`, `publish_pool` (persist before the
+  candidate is live, failure refuses the acknowledgement), `retire_mined` (live
+  pool, best-effort) and `retire_mined_candidate` (pure, no I/O), plus
+  `restore_pending` (mined-nonce filter, cap/budget re-admission in deterministic
+  order, parked underpriced entries preserved per Q-017). Remaining: the five
+  `block.rs` call-site swaps and the one bootstrap restore line (Track A wiring,
+  after S6.2 step 3), then the CLI opt-in/capacity consumers. Until the wiring
+  lands no store is configured and the bundled node's accepted pool stays
+  volatile, so this stage is not complete.
 - Relevant doc: `docs/operations/mempool-persistence.md`.
-- S6.1b must also cap runtime bytes with persistence on or off; count/sender
-  limits and snapshot caps alone do not supply that memory budget.
+- Runtime byte budget landed with the hooks: `MempoolConfig::max_pending_bytes`
+  (default 32 MiB) binds with persistence on or off, evicting in the existing
+  deterministic lowest-priority order; count/sender limits and snapshot caps
+  alone do not supply that memory budget.
 
 **S6.2 Fee market**
 - Replace the fixed gas price with an EIP-1559-style base fee computed from the
