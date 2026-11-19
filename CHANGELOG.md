@@ -94,6 +94,20 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   any KDF allocation, on both the encrypt and decrypt paths. Default-cost
   wallets (N = 2^15, r = 8, p = 1) and legacy files without a `kdf` field still
   load. Closes SUBHOST-2026-002.
+- **Ledger appends no longer re-validate the whole retained history
+  (SUBHOST-2026-003, storage slice).** `LedgerStore` keeps the last fully verified
+  head; a persist that extends it validates only the appended suffix, including a
+  state replay that refuses transactions the committed state cannot apply
+  (replayed or nonce-skipping transactions with otherwise honest commitments,
+  which the old root-only check accepted into a ledger that would fail to load).
+  Commit latency no longer grows with history: the audit PoC measured 57.3x
+  submit-latency growth over 1000 empty blocks on `01a59df`, 1.2x with the fix
+  and 1.0x on an independent re-run (run-to-run baseline spread 38.4x-57.3x;
+  the same evidence set measured 47.5x on the calldata case, 6.7x after).
+  A cache miss (fresh process before load, legacy file, prune, unchanged history)
+  falls back to the previous full validation. Unpriced calldata (Bima/Raka fee
+  contract) and the node-side O(N) block-list clone per commit remain separate
+  follow-ups.
 - Rejected oversized transaction admission/replacement preserves the existing
   pool and ledger state. Actual JSON gossip envelopes are checked against the
   transport budget before publication.

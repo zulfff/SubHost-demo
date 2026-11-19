@@ -232,7 +232,16 @@ Durability and integrity:
   removed prefix;
 - a tampered, truncated, or half-written ledger is rejected, not silently loaded. A
   version 2 `node-state.bin` is still read; the first persist migrates it to segments
-  and keeps it as `node-state.bin.v2-backup`.
+  and keeps it as `node-state.bin.v2-backup`;
+- a persist validates before writing. When the store's verified-head cache matches
+  the committed manifest, only the appended suffix is validated: its link to the
+  head, every commitment, and a full `State::apply_transaction` replay of the suffix
+  on the cached head state, so a transaction the committed state cannot apply (a
+  replay, a skipped nonce) is refused even when its commitments are honest. The
+  offered state root must equal the replayed root. Otherwise — no cache yet, a
+  legacy file, a pruned or rolled-back manifest, an unchanged history — the whole
+  offered history is validated as before. The cache is populated by a successful
+  load and updated only after a manifest commit succeeds.
 
 Determinism:
 
