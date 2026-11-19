@@ -325,6 +325,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   to commit them. The activation runbook §2 now points to it and marks the
   `local-testnet` example as a chain-1337 plaintext demo only.
 
+- **`subhost node --mempool-persist` CLI opt-in (S6.1b consumer, Q-016/Q-038).**
+  Stacks on the `NodeConfig.mempool_persist` field (#84): plain bool flag,
+  default off, no env var, passed straight into the node config. Durability is
+  an explicit operator choice — unset keeps the pool volatile and
+  `mempool.bin` is never read or written. Boot policy A: a corrupt or foreign
+  snapshot refuses boot; the runbook names the recovery path (move the
+  snapshot aside + restart, an explicit operator choice, never auto-delete).
+  Docs: mempool-persistence.md operator section + CLI examples, start-stop.md
+  cross-reference. Capacity and per-sender flags remain an explicit follow-up
+  (ROADMAP S6.1). Parse tests: absent = off, present = on, composes with
+  validator mode.
+
 - **Opt-in node mempool persistence (S6.1b consumer, Q-016/Q-038).**
   `NodeConfig.mempool_persist` (default `false`) attaches an `MempoolStore` at
   `<data_dir>/mempool.bin` during bootstrap and restores the pending pool after
