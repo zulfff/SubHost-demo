@@ -50,14 +50,26 @@ Core, consensus, RPC, storage. Adjacent crates an auditor will also need:
 
 ## Open residuals for the auditor
 
-- **SUBHOST-2026-003 (High, partial):** storage slice fixed; calldata pricing /
-  O(history) replay work amplification remainder is open with Track A (Q-024).
+- **SUBHOST-2026-003 (High, partial — three-fix ladder):**
+  - **Fix 2 (suffix-only validation): MERGED** (#50). Append-time O(history) replay
+    is gone; `segmented::persist` validates only the appended suffix on the verified
+    head.
+  - **Fix 3 (automatic retention): in progress** (Q-036, dewi). `prune_to_height` +
+    `retain_from`; the `retention_blocks` config surface landed (#76); the atomic
+    trim + snapshot-floor refusals are the incoming slice under QA.
+  - **Fix 1 (calldata pricing / intrinsic gas): ladder agreed** (Q-037 L2 floor
+    model, confirmed by nara). Intrinsic gas as a validity floor on `gas_limit`;
+    consumed stays `gas_limit`; conservation unchanged; refunds deferred to S10.
+    Awaiting L2–L4 implementation (bima).
+  The High closes only when fix 1 lands and the pricing + amplification mitigations
+  are re-verified together (Q-024, Q-037).
 - **R-57-01 (Medium):** fixed in #67 (merged) — pruned historical evidence is
   unverifiable-not-fork; decision-table audited, no new halt vector.
 - Roadmap gaps (documented, not findings): per-peer rate limiting / peer scoring
   (S7), encrypted mempool / Dandelion++ / threshold encryption, inactivity leaks,
   weak-subjectivity checkpoints, unbonding, validator-set rotation, encrypted
-  producer key for node start-up (S9.6 bootstrap pending).
+  producer key for node start-up (S9.6: keystore #59 merged; bootstrap API +
+  hardened loader #79 reviewed, pending merge; CLI unlock flag pending).
 
 S12.2 requires closing every High/Medium before the audit can be signed off.
 
@@ -86,13 +98,14 @@ wiped mid-session).
 | --- | --- | --- | --- | --- |
 | SUBHOST-2026-001 | Block gas-cap bypass | High (8.7) | Fixed | `2026-11-18-gas-cap-bypass/`; re-verified on `fa87215` (Q-024) |
 | SUBHOST-2026-002 | Wallet scrypt cost unbounded (abort) | High | Fixed (#49) | `2026-11-18-wallet-kdf-unbounded/`; bounded KDF in `subhost-wallet` |
-| SUBHOST-2026-003 | RPC work amplification / unpriced calldata | High | Partial | `2026-11-19-rpc-work-amplification/`; storage-only slice fixed, calldata pricing open with Track A (Q-024) |
+| SUBHOST-2026-003 | RPC work amplification / unpriced calldata | High | Partial (fix2 merged; fix3 in progress; fix1 agreed) | `2026-11-19-rpc-work-amplification/`; fix2 #50, fix3 Q-036, fix1 Q-037 L2 floor (Q-024) |
 | R-57-01 | Pruning node false-halt on historical certs | Medium | Fixed (#67 merged) | `2026-11-19-pr57-native-sync-review.md` (fix verification) |
 | R-59-01 | Keystore duplicate-field rejection gap | Low | Closed (#59) | `2026-11-19-pr59-keystore-review.md` (re-review) |
 
-**Open items an auditor should prioritize:** the calldata pricing remainder of
-SUBHOST-2026-003. R-57-01 (Medium) is fixed in #67 (pending merge). S12.2 requires
-closing every High/Medium.
+**Open items an auditor should prioritize:** SUBHOST-2026-003 fix 1 (calldata
+pricing, Q-037 L2 floor agreed) and fix 3 (automatic retention, Q-036 in progress);
+fix 2 (suffix validation) is merged. R-57-01 (Medium) is fixed (#67 merged; residual
+note updated in #73). S12.2 requires closing every High/Medium.
 
 ## Security reviews performed (internal QA, not an external audit)
 
@@ -101,6 +114,11 @@ closing every High/Medium.
   catch-up; raised R-57-01.
 - `2026-11-19-pr59-keystore-review.md` — S9.6 encrypted producer keystore (PR #59).
   First pass + re-review; R-59-01 closed; approved.
+- `2026-11-19-pr65-storage-fee-replay-review.md` — S6.2 step 2 storage fee replay
+  (PR #65). Replay+root check, fee conservation, policy binding; approved.
+- `2026-11-20-pr79-producer-bootstrap-review.md` — S9.6 Track A bootstrap + hardened
+  loader (PR #79). Fail-closed supplied-key bootstrap, PoP not bypassed, legacy
+  loader TOCTOU + non-Unix bypass closed; approved.
 - `qa-review-queue.md` — current QA queue and closed items.
 
 ## Known limitations (documented, not undisclosed findings)

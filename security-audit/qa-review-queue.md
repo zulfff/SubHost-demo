@@ -2,40 +2,54 @@
 
 Updated 2026-11-20 (tech-lead direction). Evidence logs under
 `2026-11-19-four-gate-baseline/` are kept intact (only `target/` build dirs were
-cleaned for disk space).
+cleaned; sccache S3 cache makes rebuilds cheap).
 
-## Incoming wave (active)
+## Active / incoming wave
 
 | Item | Branch / PR | Scope | State | QA focus |
 | --- | --- | --- | --- | --- |
-| PR #69 | `s8.1` RPC method spans | metrics middleware spans (Q-033 / Q-020) | OPEN, approved, yoga rebasing | Track B (yoga). Re-review after rebase; span cardinality / no secret labels / overhead. |
-| bima step 3 | (publishes when gates finish) | fee-market / calldata step 3 | pending publish | Track A (bima). Review on publish; ties to SUBHOST-2026-003 remainder. |
-| sari accessor contract + hooks | (incoming) | state accessor contract + hooks | pending | Track A (sari). Contract boundary + hook safety. |
-| tania OTLP | (incoming) | OTLP telemetry export | pending | Track B (tania). Export surface auth / no secret leakage. |
+| PR #79 | `s9/producer-bootstrap-api` | S9.6 Track A bootstrap + hardened loader | OPEN, reviewed approve | Track A. Report: `2026-11-20-pr79-producer-bootstrap-review.md`. Activation-gate item (S9.6). Merge once CI green. |
+| PR #78 | `s8/node-runtime-hooks` | S8 runtime hooks (health/finality/disk gauges) | OPEN | Track A/B. Truthful gauges, no secret labels. |
+| dewi Q-036 retention slice | (incoming) | `prune_to_height` + `retain_from` | pending publish | Track B (dewi). **Verify atomic trim + snapshot-floor refusals** (fix 3 of 003). |
+| raka Q-038 consumer | (incoming) | boot-policy consumer | pending publish | Track A (raka). Boot-policy tests. |
+| sari block/consensus spans | (incoming) | block/consensus telemetry spans | pending publish | Track A (sari). Span cardinality / no secret labels. |
+| yoga credential flag | (incoming) | `subhost node --producer-credential-file` unlock | pending publish | Track B (yoga). **Security-sensitive: unlock path** — fail-closed per ADR-011, no plaintext fallback, no secret in logs. |
 
-## Tracked blocker
+## Tracked blocker — SUBHOST-2026-003 (High), three-fix ladder
 
-- **SUBHOST-2026-003 remainder (High):** calldata pricing / O(history) replay work
-  amplification. Storage slice fixed (#50/#65); the calldata-pricing contract
-  thread is queued to bima (tech-lead). **Must close before public testnet
-  activation (S12.3).** Evidence: `2026-11-19-rpc-work-amplification/`, Q-024.
+- **Fix 2 (suffix-only validation): MERGED** (#50). Append-time O(history) replay gone.
+- **Fix 3 (automatic retention): in progress** (Q-036, dewi). `retention_blocks`
+  config landed (#76); atomic trim + snapshot-floor slice incoming under QA.
+- **Fix 1 (calldata pricing): ladder agreed** (Q-037 L2 floor model, nara confirmed).
+  Intrinsic gas as validity floor on `gas_limit`; consumed stays `gas_limit`;
+  conservation unchanged; refunds deferred to S10. Awaiting L2–L4 (bima).
+- **Must close before public testnet activation (S12.3).** The High closes only when
+  fix 1 lands and pricing + amplification are re-verified together. Evidence:
+  `2026-11-19-rpc-work-amplification/`, Q-024, Q-037.
 
 ## Recently reviewed and merged
 
 | PR | Scope | Outcome |
 | --- | --- | --- |
-| #67 `s3.4/pruned-history-and-backup` | R-57-01 fix + archive restore coherence | MERGED. R-57-01 closed; decision-table audited, no new halt vector. |
+| #73 `qa/s12-r57-residual-note` | R-57-01 residual note fixed | MERGED. |
+| #72 `qa/s12-audit-package` | version security-audit package | MERGED. |
+| #71 `s6/fee-market-v2` | S6.2 step 3 fee-enabled block path | MERGED. |
+| #70 `s8/rpc-finality-disk-contract` | S8 contract accessors | MERGED. |
+| #69 `yoga/rpc-method-spans` | S8.1 RPC method spans | MERGED. |
+| #67 `s3.4/pruned-history-and-backup` | R-57-01 fix + archive restore coherence | MERGED. R-57-01 closed. |
 | #65 `s6/storage-fee-replay` | S6.2 step 2 storage fee replay | MERGED. No blocking issues. |
 | #64 `qa/s12.4-bug-bounty` | S12.4 bounty/disclosure docs | MERGED. |
-| #63 `qa/s12-sync-fork-refresh` | S12.1 threat-model + SECURITY.md reconcile | MERGED. (Follow-up: drop the R-57-01 residual note now that #67 landed.) |
-| #59 `yoga/encrypted-producer-keystore` | S9.6 encrypted producer keystore | MERGED. R-59-01 resolved + CLI tests. |
-| #57 `s3.3/native-sync` | native certified sync + fork accountability | MERGED. R-57-01 raised here, fixed in #67. |
-| #58 `qa/s12.1-threat-model` | S12.1 threat-model refresh | MERGED. |
-| #60 fee-market-api | S6.2 step 1 fee-market core/state API | MERGED. No pre-merge QA needed (tech-lead). |
+| #63 `qa/s12-sync-fork-refresh` | S12.1 threat-model + SECURITY.md reconcile | MERGED. |
+| #59 `yoga/encrypted-producer-keystore` | S9.6 encrypted producer keystore | MERGED. R-59-01 resolved. |
+| #57 `s3.3/native-sync` | native certified sync + fork accountability | MERGED. R-57-01 raised, fixed in #67. |
+| #58 / #60 | S12.1 threat-model / fee-market step 1 | MERGED. |
 
-Reports: `2026-11-19-pr57-native-sync-review.md` (incl. R-57-01 fix verification),
-`2026-11-19-pr59-keystore-review.md`, `2026-11-19-pr65-storage-fee-replay-review.md`.
+Reports: `2026-11-19-pr57-native-sync-review.md` (incl. R-57-01 fix verification +
+decision-table audit), `2026-11-19-pr59-keystore-review.md`,
+`2026-11-19-pr65-storage-fee-replay-review.md`,
+`2026-11-20-pr79-producer-bootstrap-review.md`.
 Audit prep: `AUDIT-PACKAGE.md` (S12.2 prep only; audit + soak human/time-gated).
 
 Gate reference: four-gate baseline on `fa87215`
 (`2026-11-19-four-gate-baseline/fa87215/SUMMARY.md`), deny workaround per Q-029.
+Builds: source `~/.config/subhost/s3-env.sh` (sccache, secret — never commit/print).
