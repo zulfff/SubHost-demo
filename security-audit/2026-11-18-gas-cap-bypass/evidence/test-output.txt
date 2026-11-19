@@ -1,0 +1,13 @@
+   Compiling subhost-rpc v0.1.0 (/home/zulfff/SubHost-demo/crates/subhost-rpc)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.74s
+     Running tests/gas_limit_bypass.rs (target/debug/deps/gas_limit_bypass-cecc7e473efc7658)
+
+running 2 tests
+accepted zero-fee block: gas_used=30000001 gas_limit=30000000
+test zero_fee_zero_balance_block_exceeds_the_cap ... ok
+accepted block: gas_used=40000000 gas_limit=30000000
+restart failed as predicted: ledger is invalid: invalid block sequence at height 1
+test oversized_block_is_accepted_and_then_breaks_restart ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+

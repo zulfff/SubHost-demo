@@ -1,0 +1,34 @@
+PoC SUBHOST-2026-003 re-run on security/ledger-append-suffix-validation
+worktree: /tmp/opencode/wt-storage-append base origin/main 01a59df + suffix-validation fix
+date: 2026-11-19T19:49:21+07:00
+
+== Case A: 1000 blocks, empty calldata, 1 wei per block ==
+block      1  submit       1584 us
+block      2  submit       1431 us
+block      3  submit       1509 us
+block      4  submit       1286 us
+block      5  submit       1272 us
+block    251  submit       1408 us
+block    501  submit       1721 us
+block    751  submit       1634 us
+block   1000  submit       1823 us
+
+blocks=1000 data_len=0 first_us=1584 last_us=1823 growth=1.2x
+attacker_fee_per_block_wei=1 total_fee_wei=1000
+ledger_bytes=579652 height=1000
+VmHWM:	    5884 kB
+VmRSS:	    5884 kB
+
+== Case B: 200 blocks, 131072 calldata bytes, 1 wei per block ==
+block      1  submit       5853 us
+block      2  submit       5721 us
+block      3  submit       5686 us
+block      4  submit       5909 us
+block      5  submit       5867 us
+block    200  submit      39162 us
+
+blocks=200 data_len=131072 first_us=5853 last_us=39162 growth=6.7x
+attacker_fee_per_block_wei=1 total_fee_wei=200
+ledger_bytes=26330852 height=200
+VmHWM:	   81604 kB
+VmRSS:	   55700 kB

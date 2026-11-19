@@ -1,0 +1,46 @@
+Re-verification of SUBHOST-2026-001 against main 982d3e6 (2026-11-19)
+
+Environment: worktree /home/zulfff/subhost-wt/sec-main at 982d3e6, debug test
+profile. The original PoC file was copied unmodified to
+crates/subhost-rpc/tests/gas_limit_bypass_attack.rs (scratch worktree only,
+never committed). The repository regression test
+crates/subhost-rpc/tests/gas_limit_bypass.rs was run as the control.
+
+Full log: evidence/reverify-982d3e6-full.log (durable, inside this folder).
+The run was first executed in /tmp/opencode/sec-main and repeated in the
+durable worktree after /tmp worktrees were deleted mid-session; both runs
+produced identical results (3 regression passes, 2 attack failures with the
+same BlockRejected message).
+
+== control: repository regression test (expects rejection) ==
+
+running 3 tests
+test zero_fee_zero_balance_block_over_the_limit_is_rejected ... ok
+test block_over_the_gas_limit_is_rejected_and_the_ledger_still_loads ... ok
+test block_exactly_at_the_gas_limit_is_accepted ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+== original attack PoC (asserts acceptance; failure means fixed) ==
+
+running 2 tests
+
+thread 'zero_fee_zero_balance_block_exceeds_the_cap' panicked at
+crates/subhost-rpc/tests/gas_limit_bypass_attack.rs:178:10:
+a zero-fee block over the gas cap must be rejected, but was accepted:
+BlockRejected("block 1 uses more than its 30000000 gas limit")
+test zero_fee_zero_balance_block_exceeds_the_cap ... FAILED
+
+thread 'oversized_block_is_accepted_and_then_breaks_restart' panicked at
+crates/subhost-rpc/tests/gas_limit_bypass_attack.rs:99:10:
+accept_block must reject a block over the gas limit, but accepted it:
+BlockRejected("block 1 uses more than its 30000000 gas limit")
+test oversized_block_is_accepted_and_then_breaks_restart ... FAILED
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+Interpretation: both attack cases now return
+RpcError::BlockRejected before any state change, which is the behavior the
+finding's Fix section requires. The gossip path in
+crates/subhost-node/src/lib.rs feeds BlockProposal into the same accept_block,
+so a peer-supplied oversized block is refused at the same chokepoint.

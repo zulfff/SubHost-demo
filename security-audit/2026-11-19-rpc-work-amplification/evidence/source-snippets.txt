@@ -1,0 +1,281 @@
+Source excerpts for SUBHOST-2026-003
+Commit: fd0fc7e11ccb5fe8ebbb2948a68fd20cee4edab4 (branch s5/rpc-metrics)
+
+================================================================
+1. Calldata is accepted and never charged
+================================================================
+
+crates/subhost-rpc/src/methods.rs:20
+    const MAX_REQUEST_BODY_BYTES: u32 = 256 * 1024;
+
+crates/subhost-rpc/src/methods.rs:26
+    pub(crate) const DEFAULT_TX_GAS_LIMIT: Gas = 21_000;
+
+crates/subhost-rpc/src/methods.rs:94-102
+    /// Optional `0x`-prefixed calldata.
+    fn hex_data(value: Option<&serde_json::Value>) -> Result<Vec<u8>, RpcError> {
+        let Some(value) = value else {
+            return Ok(Vec::new());
+        };
+        let text = value.as_str().ok_or(RpcError::InvalidParams)?;
+        let digits = text.strip_prefix("0x").ok_or(RpcError::InvalidParams)?;
+        hex::decode(digits).map_err(|_| RpcError::InvalidParams)
+    }
+
+crates/subhost-rpc/src/methods.rs:215-218
+    // Accept `gas` (spec) and `gasLimit` (widely used) for the same field.
+    let gas_limit = match params.get("gas").or_else(|| params.get("gasLimit")) {
+        Some(value) => hex_quantity(Some(value), DEFAULT_TX_GAS_LIMIT)?,
+        None => DEFAULT_TX_GAS_LIMIT,
+    };
+
+crates/subhost-rpc/src/methods.rs:234
+        data: hex_data(params.get("data").or_else(|| params.get("input")))?,
+
+The caller chooses `gas_limit` directly. A value of 1 is accepted; only 0 is
+rejected. Nothing in this path relates `data.len()` to `gas_limit`.
+
+crates/subhost-mempool/src/lib.rs:21
+    pub max_tx_data_bytes: usize,
+
+crates/subhost-mempool/src/lib.rs:30
+            max_tx_data_bytes: 128 * 1024,
+
+crates/subhost-mempool/src/lib.rs:114-141
+    pub fn admit(&mut self, tx: Transaction) -> Result<Admission, MempoolError> {
+        if tx.data.len() > self.config.max_tx_data_bytes {
+            return Err(MempoolError::DataTooLarge {
+                provided: tx.data.len(),
+                max: self.config.max_tx_data_bytes,
+            });
+        }
+        let hash = tx.hash();
+
+        // Idempotent: the identical transaction is already pending.
+        if self.txs.contains_key(&hash) {
+            return Ok(Admission { hash, accepted: true, displaced: None });
+        }
+
+        if tx.gas_limit == 0 {
+            return Err(MempoolError::InvalidTransaction("gas limit must be > 0".into()));
+        }
+        if tx.gas_price < self.config.min_gas_price {
+            return Err(MempoolError::GasPriceTooLow {
+                provided: tx.gas_price,
+                min: self.config.min_gas_price,
+            });
+        }
+        // A transaction whose fee cannot be represented can never be executed.
+        if tx.total_cost().is_none() {
+            return Err(MempoolError::InvalidTransaction(
+                "gas_price * gas_limit + value overflows".into(),
+            ));
+        }
+
+Only the size ceiling (128 KiB) and `gas_limit > 0` are enforced. `data.len()`
+is not priced.
+
+crates/subhost-state/src/lib.rs:197-240
+    pub fn apply_transaction(&mut self, tx: &Transaction) -> Result<Amount, StateError> {
+        if tx.chain_id != self.chain_id {
+            return Err(StateError::ChainMismatch { expected: self.chain_id, got: tx.chain_id });
+        }
+        if tx.gas_limit == 0 {
+            return Err(StateError::InvalidTransaction("gas limit must be > 0".into()));
+        }
+        ...
+        let fee = tx
+            .fee()
+            .ok_or_else(|| StateError::InvalidTransaction("transaction fee overflows".into()))?;
+
+        match tx.tx_type {
+            TransactionType::Transfer => {
+                let to = tx.to.ok_or_else(|| {
+                    StateError::InvalidTransaction("transfer requires a destination".into())
+                })?;
+                let total = tx.total_cost().ok_or_else(|| {
+                    StateError::InvalidTransaction("transaction cost overflows".into())
+                })?;
+                // Check value + fee up front so a transfer can never succeed and
+                // then leave the fee unpayable.
+                self.ensure_balance(&tx.from, total)?;
+                self.apply_transfer(tx.from, to, tx.value)?;
+                self.debit(tx.from, fee)?;
+            }
+            other => return Err(StateError::UnsupportedTransactionType(other)),
+        }
+
+`fee = gas_price * gas_limit`. The Transfer branch never reads `tx.data`, so
+`data` consumes no gas. One wei of fee (gas_price 1, gas_limit 1) accepts a
+transaction carrying up to 128 KiB.
+
+================================================================
+2. Every accepted transaction is persisted with the full retained history
+================================================================
+
+crates/subhost-rpc/src/block.rs:61-78
+    pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash, RpcError> {
+        let _commit_guard = lock(&self.commit_lock);
+        let requested_hash = tx.hash();
+
+        let mut candidate_pool = read(&self.mempool).clone();
+        let admission = candidate_pool
+            .admit(tx)
+            .map_err(|error| RpcError::TransactionRejected(error.to_string()))?;
+        ...
+        let receipts = self.seal_block(&mut candidate_pool)?;
+        if !receipts.contains_key(&requested_hash) {
+            return Err(RpcError::TransactionRejected(
+                "transaction is not executable against the current state".into(),
+            ));
+        }
+
+        *write(&self.mempool) = candidate_pool;
+        Ok(requested_hash)
+    }
+
+`eth_sendTransaction` seals a block on every accepted submission. No batching
+window exists.
+
+crates/subhost-rpc/src/block.rs:222-230
+        let mut next_blocks = read(&self.blocks).clone();
+        next_blocks.push(block.clone());
+        let mut next_receipts = read(&self.receipts).clone();
+        for (hash, receipt) in &receipts {
+            next_receipts.insert(*hash, receipt.clone());
+        }
+
+        // Durability before visibility: if this fails nothing is swapped in.
+        self.persist(&candidate_state, &next_blocks, &next_receipts)?;
+
+crates/subhost-rpc/src/block.rs:389-405
+    pub(crate) fn persist(
+        &self,
+        state: &State,
+        blocks: &[Block],
+        receipts: &HashMap<Hash, Receipt>,
+    ) -> Result<(), RpcError> {
+        // Sort receipts by height so the persisted file is byte-stable.
+        let mut ordered: Vec<Receipt> = receipts.values().cloned().collect();
+        ordered.sort_by_key(|receipt| receipt.block_height);
+        self.store.persist(&LedgerSnapshot {
+            chain_id: self.chain_id,
+            state: state.snapshot(),
+            blocks: blocks.to_vec(),
+            receipts: ordered,
+        })?;
+        Ok(())
+    }
+
+`blocks` is the whole retained history, so `blocks.to_vec()` copies and passes
+every block on every append.
+
+crates/subhost-storage/src/segmented.rs:616-658
+    pub(crate) fn persist(
+        chain_id: ChainId,
+        data_dir: &Path,
+        snapshot: &LedgerSnapshot,
+        segment_max_bytes: u64,
+        snapshot_interval: u64,
+    ) -> Result<(), StorageError> {
+        let previous = read_previous(chain_id, data_dir)?;
+        let base_height = previous.as_ref().map_or(0, |previous| previous.base_height);
+        let new_height = snapshot.blocks.last().map_or(0, |block| block.header.height);
+        // Validate before any write, against the base the manifest commits to. A
+        // full history offered to a pruned store is rejected here rather than being
+        // silently re-anchored.
+        crate::validate_snapshot_from(snapshot, chain_id, base_height)?;
+        ...
+        for block in snapshot.blocks.iter().skip(start) {
+            ...
+        }
+
+`validate_snapshot_from` runs on every append, before any write, over the full
+history.
+
+crates/subhost-storage/src/lib.rs:336-348
+    fn validate_snapshot_from(
+        snapshot: &LedgerSnapshot,
+        chain_id: ChainId,
+        base_height: u64,
+    ) -> Result<State, StorageError> {
+        if snapshot.chain_id != chain_id || snapshot.state.chain_id != chain_id {
+            return Err(StorageError::ChainMismatch { expected: chain_id, got: snapshot.chain_id });
+        }
+        let state = State::from_snapshot(snapshot.state.clone())
+            .map_err(|error| StorageError::Invalid(error.to_string()))?;
+        validate_chain_from(base_height, &snapshot.blocks, &snapshot.receipts, chain_id, &state)?;
+        Ok(state)
+    }
+
+crates/subhost-storage/src/lib.rs:398-440 (payload of the replay loop)
+    for (index, block) in blocks.iter().enumerate() {
+        ...
+        let mut hashes = Vec::with_capacity(block.transactions.len());
+        let mut commitments = Vec::with_capacity(block.transactions.len());
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            let tx_hash = tx.hash();
+            if tx.chain_id != chain_id
+                || tx.gas_limit == 0
+                || !tx.verify_signature()
+                || !seen_transactions.insert(tx_hash)
+            {
+                return Err(StorageError::Invalid(format!(
+                    "invalid transaction at height {expected_height}"
+                )));
+            }
+            ...
+        }
+        ...
+    }
+
+Every retained transaction is re-hashed and its ed25519 signature is re-verified
+on every append. `Transaction::signing_payload` serializes the whole struct,
+including `data`, so the replayed hash cost scales with calldata bytes.
+
+================================================================
+3. No automatic pruning; the history only grows
+================================================================
+
+crates/subhost-rpc/src/state.rs:157-158
+            blocks: Arc::new(RwLock::new(restored.blocks)),
+            base_height: restored.base_height,
+
+The whole retained history is held in memory and restored into memory on start.
+
+crates/subhost-cli/src/main.rs:993-994
+                .prune(keep_segments)
+                .with_context(|| format!("cannot prune the ledger in {}", data_dir.display()))?;
+
+`prune` is reachable only from the explicit `subhost db prune` subcommand. No
+node startup path, timer, or persistence path calls it. `base_height` therefore
+stays 0 unless an operator runs the command by hand.
+
+================================================================
+4. The documented security properties do not cover this
+================================================================
+
+SECURITY.md:94-99 (known posture, "Blocks may hold many transactions"):
+    One submission seals one block containing every pending transaction that is
+    currently executable, bounded by the 30M block gas limit, with senders
+    visited in address order. The ledger validator enforces per-sender nonce
+    contiguity, per-block signature validity, transaction uniqueness, gas
+    accounting, and the receipt index/cumulative-gas commitments on load.
+
+The documented bound is the 30M block gas limit. A transaction with gas_limit 1
+passes that bound regardless of its calldata size, and "gas accounting" here
+refers to gas_used consistency, not to pricing bytes.
+
+SECURITY.md:122-127 (enforced properties):
+    The ledger is written to a temporary file, fsynced, atomically renamed, and
+    the directory is fsynced. It is only trusted on load after a size check, magic
+    and version check, BLAKE3 checksum, chain binding check, and a full replay of
+    every block and receipt commitment against the restored state.
+
+The documented full replay is "on load". The code additionally replays the full
+history inside `persist` (segmented.rs:629), which is stricter than documented and
+is the source of the per-block O(history) cost.
+
+No line in SECURITY.md, docs/security/threat-model.md, or docs/operations/
+records unmetered calldata, unbounded retained history, or per-append full replay
+as accepted posture.

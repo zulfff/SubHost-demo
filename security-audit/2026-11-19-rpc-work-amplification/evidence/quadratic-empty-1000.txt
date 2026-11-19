@@ -1,0 +1,15 @@
+block      1  submit       1519 us
+block      2  submit       1149 us
+block      3  submit       1110 us
+block      4  submit        986 us
+block      5  submit       1029 us
+block    251  submit      15083 us
+block    501  submit      29492 us
+block    751  submit      42729 us
+block   1000  submit      58311 us
+
+blocks=1000 data_len=0 first_us=1519 last_us=58311 growth=38.4x
+attacker_fee_per_block_wei=1 total_fee_wei=1000
+ledger_bytes=579652 height=1000
+VmHWM:	    6692 kB
+VmRSS:	    6692 kB

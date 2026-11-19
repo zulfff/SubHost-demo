@@ -1,0 +1,57 @@
+SUBHOST-2026-003 post-fix re-verification — independent QA (tania seat, track-b)
+Date: 2026-11-19
+Worktree: /tmp/opencode/wt-qa-pr50, HEAD e96e309d950de8e9d1ba7a53c5ba82ae983effd5
+  (PR #50, security/ledger-append-suffix-validation, base main 982d3e6)
+PoC: security-audit/2026-11-19-rpc-work-amplification/poc, built --release
+  with the repo crates at that HEAD (path deps resolve inside the worktree)
+Binary sha256: 6549853004de7c313441db0a95e3167ad8c6f72566f50db05ad448106a1185da
+
+Result: STORAGE SLICE FIXED (suffix-only validation).
+- Case A (1000 empty blocks): first 2257 us, last 2341 us, growth 1.0x.
+  Baseline on main 01a59df: 57.3x (993 us -> 56892 us).
+- Case B (200 blocks x 131072 calldata bytes): first 7869 us, last 38511 us,
+  growth 4.9x. Baseline on main: 47.5x (5257 us -> 249584 us; report rounds
+  to 46.6x). The residual growth is the documented unpriced-calldata term
+  (Q-017, Bima/Raka), not the persist replay.
+- Ledger size and height unchanged vs baseline (579652 bytes @ 1000 blocks;
+  26330852 bytes @ 200 x 128 KiB), so the fix does not alter the on-disk
+  format. Peak RSS ~5.9 MB / ~81 MB, in line with the baseline.
+
+Full transcript follows.
+---
+PoC SUBHOST-2026-003 re-run — independent QA (tania seat, track-b)
+worktree: /tmp/opencode/wt-qa-pr50  HEAD e96e309d950de8e9d1ba7a53c5ba82ae983effd5 (PR #50, base main 982d3e6)
+binary: /tmp/opencode/wt-qa-main-01a59df/target/release/poc-work-amplification
+sha256: 6549853004de7c313441db0a95e3167ad8c6f72566f50db05ad448106a1185da
+date: 2026-11-19T20:21:09+07:00
+
+== Case A: 1000 blocks, empty calldata, 1 wei per block ==
+block      1  submit       2257 us
+block      2  submit       1963 us
+block      3  submit       1914 us
+block      4  submit       1968 us
+block      5  submit       1935 us
+block    251  submit       2098 us
+block    501  submit       2192 us
+block    751  submit       2224 us
+block   1000  submit       2341 us
+
+blocks=1000 data_len=0 first_us=2257 last_us=2341 growth=1.0x
+attacker_fee_per_block_wei=1 total_fee_wei=1000
+ledger_bytes=579652 height=1000
+VmHWM:	     5944 kB
+VmRSS:	     5940 kB
+
+== Case B: 200 blocks, 131072 calldata bytes, 1 wei per block ==
+block      1  submit       7869 us
+block      2  submit       7121 us
+block      3  submit       7376 us
+block      4  submit       7558 us
+block      5  submit       7909 us
+block    200  submit      38511 us
+
+blocks=200 data_len=131072 first_us=7869 last_us=38511 growth=4.9x
+attacker_fee_per_block_wei=1 total_fee_wei=200
+ledger_bytes=26330852 height=200
+VmHWM:	    81048 kB
+VmRSS:	    55260 kB

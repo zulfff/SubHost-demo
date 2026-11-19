@@ -1,0 +1,83 @@
+[
+  {
+    "gate": "format",
+    "exit_code": 0,
+    "seconds": 1,
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ]
+  },
+  {
+    "gate": "clippy",
+    "exit_code": 0,
+    "seconds": 66,
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--all-features",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ]
+  },
+  {
+    "gate": "tests",
+    "exit_code": 0,
+    "seconds": 290,
+    "command": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--all-features",
+      "--locked"
+    ]
+  },
+  {
+    "gate": "deny",
+    "exit_code": 1,
+    "seconds": 2,
+    "command": [
+      "cargo",
+      "deny",
+      "--all-features",
+      "check"
+    ]
+  },
+  {
+    "gate": "deny-retry",
+    "exit_code": 0,
+    "seconds": 3,
+    "command": [
+      "cargo",
+      "deny",
+      "--config",
+      "/tmp/opencode/deny-qa.toml",
+      "--all-features",
+      "check"
+    ],
+    "note": "db-path override only, advisory DB cached; see report.md"
+  },
+  {
+    "gate": "deny-direct",
+    "exit_code": 0,
+    "seconds": 4,
+    "command": [
+      "cargo-deny",
+      "--all-features",
+      "check"
+    ],
+    "env": {
+      "RUSTUP_HOME": "/usr/local/rustup",
+      "CARGO_HOME": "/home/zulfff/.cargo",
+      "CARGO": "/usr/local/cargo/bin/cargo"
+    },
+    "note": "binary invoked directly, bypassing /usr/local/bin/cargo wrapper; see report.md"
+  }
+]
