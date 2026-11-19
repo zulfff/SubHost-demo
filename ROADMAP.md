@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-19 · `main` = `c3a5945` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S2: phased rounds, RFC 9380 BLS, view change + node policy (ADR-008), safety regressions (#62); remaining assurance is external (S12) · S3: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57) · S6.1a (#44) and S6.2 step 1 core/state API (#60, ADR-010) merged, storage slice in review (#65) · S8 slice 1 (#47) and mempool events (#51) merged · S9.1–S9.5 (#48) merged, S9.6 keystore (#59) merged · S12.1 threat model (#58) merged · `Q-001`–`Q-031` agreed except Q-012/Q-025 (open, `blocks: none`)
+Status: 2026-11-19 · `main` = `14eab7f` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S3 follow-ups: R-57-01 fixed + coherent archive restore (#67) · S6.2 steps 1–2 merged (#60/#65, ADR-010), step 3 node/RPC wiring in progress (bima); S6.1b hooks contract in progress (dewi, Q-034) · S8 slice 1 (#47), mempool events (#51), runbooks + alerts (#66) merged; node hooks (sari), RPC spans (yoga), OTLP exporter (tania) in progress · S9.1–S9.5 (#48) and S9.6 keystore Track B (#59) merged; Track A bootstrap loader pending after S6.2 · S12.1 threat model (#58) + sync/fork reconcile (#63) + S12.4 bounty policy (#64) merged; audit prep in progress; external audit + 30-day soak remain human/time-gated · `Q-001`–`Q-034` agreed except Q-012 (open, `blocks: none`)
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -125,16 +125,16 @@ agent always sees the real state.
 | S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
 | S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
 | S2 | Wire the consensus driver into the node | A | S1 | L | Merged: phased rounds, RFC 9380 BLS, authenticated view change, node policy (ADR-008, #46); safety regressions #62. Remaining assurance is external (S12) |
-| S3 | Fork choice, reorg, and block sync | A | S2 | L | Merged: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive + classifier consumption (#57). Per Q-013: append-only finality, no finalized reorg |
+| S3 | Fork choice, reorg, and block sync | A | S2 | L | Merged: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57), R-57-01 fix + coherent archive restore (#67). Per Q-013: append-only finality, no finalized reorg |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | Merged: S5.1a auth/bind policy, S5.2 methods (#54), S5.3a middleware + S5.3b node wiring. TLS = documented reverse-proxy mode; rate limit per connection |
-| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44), S6.1b pending; S6.2 step 1 merged (#60, ADR-010), storage slice in progress (dewi), node/RPC wiring next (bima); S6.3 counters merged (#51), TTL/eviction pending |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks contract in progress (dewi, Q-034), wiring after step 3 (raka); S6.2 steps 1–2 merged (#60/#65), step 3 in progress (bima); S6.3 counters merged (#51), TTL/eviction pending |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
-| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 health/gauges merged (#47); mempool events merged (#51); OTLP tracing, RPC spans, remaining runbooks/alerts pending |
-| S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore in review (#59, CLI tests requested); Track A bootstrap loader pending after S6.2 |
+| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 health/gauges (#47), mempool events (#51), runbooks + alerts (#66) merged; node runtime hooks (sari, Q-032), RPC spans (yoga, Q-033), OTLP exporter (tania) in progress |
+| S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap loader pending after S6.2 |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
-| S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 threat model merged (#58); public testnet activation in progress (Q-012); audit, soak, bounty, go/no-go pending |
+| S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 threat model (#58) + sync/fork reconcile (#63) + S12.4 bounty policy (#64) merged; R-57-01 fixed (#67); audit prep in progress (nara); public testnet activation in progress (Q-012); external audit + 30-day soak + go/no-go remain human/time-gated |
 
 Size is relative effort, not calendar time. S10 alone is larger than S0–S9 combined.
 
