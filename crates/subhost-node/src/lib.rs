@@ -695,8 +695,6 @@ struct ProducedRound {
     vote: Option<Vote>,
 }
 
-/// Append a verified `(block, QC)` to the node-owned archive.
-///
 /// Refuse a restored archive that cannot belong to this ledger.
 ///
 /// A certificate is archived just before the ledger commit, so one item of lead
@@ -739,6 +737,8 @@ fn check_archive_matches_ledger(
     Ok(())
 }
 
+/// Append a verified `(block, QC)` to the node-owned archive.
+///
 /// Q-013: the certificate is durable before the ledger append, and serving
 /// later re-checks the block hash against the committed ledger.
 fn archive_commit(
