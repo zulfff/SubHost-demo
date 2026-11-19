@@ -93,6 +93,11 @@ wires when the S6.3 expiry lifecycle lands.
 
 ## Sample alert rules (S8.5)
 
+The canonical, expanded rule set — including a no-quorum finality-stall proxy
+and a table of which metrics are live versus still gated on node call-sites —
+is in [alerts.md](alerts.md). The snippet below is the original quick summary;
+prefer `alerts.md` so the two do not drift.
+
 ```yaml
 groups:
   - name: subhost
