@@ -328,6 +328,30 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   paths, gauge seeding and gauge movement only on `Pruned`. Documented in
   `docs/operations/observability.md` and the `alerts.md` live-vs-gated table.
   Stacked on the Q-036 retention mechanism (PR #87).
+- **Calldata pricing floor: core policy and version-3 header codec (Q-037 L2,
+  ADR-015, SUBHOST-2026-003).** `subhost-core` gains a genesis-bound
+  `CalldataPolicy` (pinned version 1, flat gas-per-byte) whose pure
+  `check_floor` makes intrinsic calldata gas a validity floor on the signed
+  `gas_limit`: under-intrinsic transactions are refused with a distinct
+  `FeeError::UnderIntrinsic`, never clamped or topped up; all arithmetic is
+  checked. The same pure check refuses calldata above the protocol maximum
+  even when the gas floor is met (`FeeError::CalldataTooLarge`), so the cap
+  is consensus validity on every enforcing path, not just the local mempool
+  cap. Policy validation refuses a zero rate and any rate that prices the
+  protocol-maximum transaction (`MAX_TX_DATA_BYTES`, 128 KiB) out of the
+  genesis block gas limit. `GenesisConfig` gains an optional `calldata_policy`
+  bound into the consensus context: legacy six-element and fee-only
+  seven-element tuples stay byte-identical; priced chains append the
+  Option-encoded fee policy and the schedule. Version-3 headers keep the
+  version-2 13-field layout — the version word alone names the validity rule
+  and is inside every signature/QC commitment. The codec accepts {1, 2, 3} in
+  binary and JSON and refuses unknown versions on both serialize and
+  deserialize; a fee-era JSON document without `base_fee_per_gas` is refused,
+  not defaulted. `FeePolicy::next_context` keeps fee continuity across the
+  fork (v3 successor from a v2 parent; v1 still refused). Accept-only: nothing
+  produces version 3 or enforces the floor until the L4 activation wiring;
+  L3 (Track B) mirrors the binding in the manifest and dispatches replay from
+  the header version.
 
 - **Public genesis prep script (Q-012/Q-037).** Added
   `scripts/testnet/prepare-public-genesis.sh`: generates the four distinct

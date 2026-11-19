@@ -14,7 +14,7 @@ use subhost_consensus::{
 };
 use subhost_core::{
     encode_canonical, Address, Block, BlockHeader, Hash, Transaction, TransactionSignature,
-    TransactionType, ValidatorSignature,
+    TransactionType, ValidatorSignature, CALLDATA_HEADER_VERSION,
 };
 use subhost_network::{NetworkMessage, MAX_WIRE_BYTES};
 
@@ -32,7 +32,12 @@ fn full_block(budget: usize) -> Block {
     let digest = Hash::new([u8::MAX; 32]);
     let mut block = Block {
         header: BlockHeader {
-            version: u32::MAX,
+            // Widest VALID version: the accept-only codec (Q-037 L2) refuses to
+            // encode versions above CALLDATA_HEADER_VERSION, so this size-only
+            // sentinel must use the highest encodable version, not u32::MAX.
+            // bincode encodes the version as a fixed-width u32, so the value
+            // does not change framing size; every other field keeps its max.
+            version: CALLDATA_HEADER_VERSION,
             chain_id: u64::MAX,
             height: u64::MAX - 1,
             timestamp: u64::MAX,

@@ -128,13 +128,13 @@ agent always sees the real state.
 | S3 | Fork choice, reorg, and block sync | A | S2 | L | Merged: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57), R-57-01 fix + coherent archive restore (#67). Per Q-013: append-only finality, no finalized reorg |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | Merged: S5.1a auth/bind policy, S5.2 methods (#54), S5.3a middleware + S5.3b node wiring. TLS = documented reverse-proxy mode; rate limit per connection |
-| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038 + yoga flag); S6.2 steps 1-3 merged (#60/#65/#71); S6.3 counters merged (#51), TTL/eviction pending; Q-036 retention slice in progress (dewi) |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038 + yoga flag); S6.2 steps 1-3 merged (#60/#65/#71); S6.3 counters merged (#51), TTL/eviction pending; Q-036 retention slice in progress (dewi); Q-037 calldata ladder L2 in review (bima, ADR-015), L3 next (dewi), L4 after L3 (bima) |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
 | S8 | Observability, health, runbooks | B | S0 | M | Slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74) merged; node runtime hooks in review (#78, approved); block/consensus spans next (sari); peer count gated on network accessor (raka) |
 | S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap API + hardened legacy loader in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
-| S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep runbook (#77) merged; R-57-01 fixed (#67/#73); activation gated on Q-037 calldata ladder (L0–L5 in progress) + S9.6 completion; external audit + 30-day soak + go/no-go remain human/time-gated |
+| S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep runbook (#77) merged; R-57-01 fixed (#67/#73); S9.6 complete (#79/#85); activation gated on Q-037 calldata ladder L2–L4 (L0/L1 merged, L2 in review, L3 dewi, L4 bima) + nara re-verification of SUBHOST-2026-003; external audit + 30-day soak + go/no-go remain human/time-gated |
 
 Size is relative effort, not calendar time. S10 alone is larger than S0–S9 combined.
 
@@ -539,6 +539,24 @@ the metrics match a request-count test.
 **S6.3 Eviction and metrics**
 - Count admitted, replaced, evicted, expired; expose a pool-depth gauge per sender
   bucket.
+
+**Q-037 Calldata pricing ladder (SUBHOST-2026-003, ADR-015)**
+- Intrinsic calldata gas as a validity floor on the signed `gas_limit`
+  (flat 16 gas/byte devnet schedule); consumption/debit/receipts/settlement
+  stay `gas_limit`. Pure `CalldataPolicy::check_floor` in core so admission,
+  selection and replay enforce independently; distinct
+  `FeeError::UnderIntrinsic`, invalid-never-clamped.
+- Landing order: L0 interim byte-cap refusal + L1 Q-034 commit-path wiring
+  (raka, #80) **merged**; L2 core policy/genesis
+  binding/v3 accept-only codec (`s6/calldata-floor-api`, bima) in review;
+  L3 manifest binding + replay validity dispatch (dewi); L4 activation
+  wiring and first v3 production (bima); L5 CLI flag + docs (yoga).
+- Version-3 headers keep the v2 13-field layout; the version word names the
+  validity rule inside the hash/signatures/QCs. Genesis context keeps legacy
+  and fee-only tuples byte-identical; priced chains append the Option-encoded
+  fee policy + schedule. Fee continuity: v3 successor from a v2 parent.
+- Activation gate (nara): L2–L4 merged, regressions green, S9.6 merged
+  (done), and her re-verification of SUBHOST-2026-003 as Fixed.
 
 **Exit criteria:** restarting a node does not lose accepted-but-unmined
 transactions; the base fee moves under load and returns to the floor when idle.

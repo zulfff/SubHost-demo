@@ -78,6 +78,11 @@ impl FeePolicy {
     /// the genesis-bound limit, invalid parent gas usage, and a parent base
     /// fee outside the policy bounds — never a defaulted or wrapped fee.
     ///
+    /// Fee continuity across the calldata fork (Q-037): a version 3 block may
+    /// derive its fee from a **version 2 parent** — the fork changes the
+    /// validity rule, not the fee schedule. A version 1 parent is still
+    /// refused.
+    ///
     /// Exact floor arithmetic without a wide-integer dependency: with
     /// `target = limit / 2`, `b = parent base fee`, `delta = |gas_used -
     /// target| <= target`, `q = b / target`, `r = b % target`,
@@ -212,6 +217,21 @@ pub enum FeeError {
 
     #[error("gas used {got} exceeds the transaction gas limit {limit}")]
     InvalidGasUsed { got: Gas, limit: Gas },
+
+    #[error("calldata policy version {0} is not supported")]
+    UnsupportedCalldataVersion(u32),
+
+    #[error("calldata gas per byte must be nonzero")]
+    ZeroCalldataRate,
+
+    #[error("calldata rate {gas_per_byte} times the maximum transaction size exceeds the block gas limit {block_gas_limit}")]
+    CalldataRateTooHigh { gas_per_byte: u64, block_gas_limit: Gas },
+
+    #[error("transaction gas limit {gas_limit} is below the intrinsic calldata gas {required}")]
+    UnderIntrinsic { gas_limit: Gas, required: Gas },
+
+    #[error("calldata size {len} exceeds the protocol maximum {max}")]
+    CalldataTooLarge { len: usize, max: usize },
 }
 
 impl Transaction {
@@ -388,6 +408,24 @@ mod tests {
             policy.next_context(&parent(0, policy.max_base_fee_per_gas + 1), limit),
             Err(FeeError::ParentFeeOutOfBounds(policy.max_base_fee_per_gas + 1))
         );
+    }
+
+    #[test]
+    fn next_context_keeps_fee_continuity_across_the_calldata_fork() {
+        let policy = policy();
+        let limit = BLOCK_GAS_LIMIT;
+        // The transition case dewi asked to pin: a v3 successor derives its
+        // fee from a v2 parent (full block at base 8 rises to 9).
+        let v2_parent = parent(limit, 8);
+        assert_eq!(v2_parent.version, FEE_HEADER_VERSION);
+        assert_eq!(policy.next_context(&v2_parent, limit).unwrap().base_fee_per_gas, 9);
+        // And from a v3 parent once the fork is live.
+        let v3_parent =
+            BlockHeader { version: crate::CALLDATA_HEADER_VERSION, ..v2_parent.clone() };
+        assert_eq!(policy.next_context(&v3_parent, limit).unwrap().base_fee_per_gas, 9);
+        // A v1 parent stays refused on either side of the fork.
+        let v1_parent = BlockHeader { version: 1, base_fee_per_gas: 0, ..v2_parent };
+        assert_eq!(policy.next_context(&v1_parent, limit), Err(FeeError::LegacyParent(1)));
     }
 
     #[test]
