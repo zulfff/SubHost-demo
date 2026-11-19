@@ -44,12 +44,16 @@ with persist/prune under the existing commit lock.
 Mempool lifecycle counting (S8.2, Q-026): `Mempool::admit` buffers typed
 events in the pool itself; the submit path's candidate clone carries the
 buffer, so a rejected candidate drops its events and only the committed
-write-back can publish them. `Mempool::flush_events(&Metrics)` drains the
-buffer, called from the B-owned `eth_sendTransaction` dispatch after a
-successful submit — no Track A source edit, exactly-once and rollback-safe.
-`subhost-mempool` depends on `subhost-metrics` for the enum and flush only;
-the pool stores no registry handle. `expired` stays at 0 until an expiry
-path exists (S6.3).
+write-back can publish them. The B-owned `eth_sendTransaction` dispatch
+drains the live pool after a successful submit, unconditionally: with a
+registry `Mempool::flush_events` records, without one `Mempool::drain_events`
+discards, so a registry-less embedder neither grows the buffer nor publishes
+stale history on a later first flush. The counters track pool-committed
+admissions; the demo seal error path may return Err with the candidate pool
+already swapped in (pre-existing Track A inconsistency, A follow-up). No
+Track A source edit. `subhost-mempool` depends on `subhost-metrics` for the
+enum and drain/flush only; the pool stores no registry handle. `expired`
+stays at 0 until an expiry path exists (S6.3).
 
 ## Consequences
 

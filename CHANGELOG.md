@@ -235,8 +235,8 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 - **Mempool lifecycle counters wired (S8.2, Q-026).** `Mempool::admit` buffers
   typed `MempoolEvent`s inside the pool; the submit path's candidate clone
-  carries them, so rejected candidates drop their events and only committed
-  admissions count. `Mempool::flush_events` drains the buffer into
+  carries them, so rejected candidates drop their events and only
+  pool-committed admissions count. `Mempool::flush_events` drains the buffer into
   `subhost_mempool_transactions_total`, called by the `eth_sendTransaction`
   handler after a successful submit. The drain is unconditional: without a
   registry, `Mempool::drain_events` discards the buffer, so it never grows and
