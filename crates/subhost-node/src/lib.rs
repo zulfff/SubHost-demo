@@ -264,11 +264,20 @@ impl Node {
 
         if fresh {
             if let Some(genesis) = &genesis {
-                if !genesis.allocations.is_empty() {
+                // A fee-enabled ledger needs its height-0 state anchor persisted
+                // before the first v2 block, even with no allocations: storage
+                // refuses a v2 append with no committed snapshot and no verified
+                // head (Q-030). `seed_accounts` always persists, so an empty
+                // allocation set still writes the anchor.
+                if !genesis.allocations.is_empty() || genesis.fee_policy.is_some() {
                     state.seed_accounts(
                         genesis.allocations.iter().map(|(address, balance)| (*address, *balance)),
                     )?;
-                    info!(accounts = genesis.allocations.len(), "applied genesis allocations");
+                    if genesis.allocations.is_empty() {
+                        info!("persisted the genesis state anchor for the fee-enabled ledger");
+                    } else {
+                        info!(accounts = genesis.allocations.len(), "applied genesis allocations");
+                    }
                 }
             }
         } else {
