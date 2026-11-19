@@ -79,9 +79,12 @@ them. The `eth_sendTransaction` handler drains the live pool's buffer after a
 successful submit, recording into the registry when one is attached and
 discarding otherwise (`Mempool::drain_events`), so a server without metrics
 cannot grow the buffer. The counters therefore track **pool-committed
-admissions**, not ledger commits: the demo seal error path can return an
-error after the candidate pool was swapped in (a pre-existing Track A
-commit-path inconsistency, tracked as A follow-up). Idempotent resubmissions
+admissions**, not ledger commits: on the demo receipts-missing path
+`seal_block` can commit the block to the ledger and then return an error
+before the candidate pool is written back (`block.rs`); the live pool keeps
+the mined transactions and the buffered events drop, since the handler
+flushes only on `Ok` (a pre-existing Track A commit-path inconsistency,
+tracked as A follow-up). Idempotent resubmissions
 and lower-price rejections buffer nothing; mined removals are not lifecycle
 events.
 

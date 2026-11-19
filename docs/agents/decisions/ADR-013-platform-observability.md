@@ -49,8 +49,10 @@ drains the live pool after a successful submit, unconditionally: with a
 registry `Mempool::flush_events` records, without one `Mempool::drain_events`
 discards, so a registry-less embedder neither grows the buffer nor publishes
 stale history on a later first flush. The counters track pool-committed
-admissions; the demo seal error path may return Err with the candidate pool
-already swapped in (pre-existing Track A inconsistency, A follow-up). No
+admissions; on the demo receipts-missing path `seal_block` can commit the
+block to the ledger, then return Err before the candidate pool is written
+back — the live pool keeps the mined transactions and the buffered events
+drop (pre-existing Track A inconsistency, A follow-up). No
 Track A source edit. `subhost-mempool` depends on `subhost-metrics` for the
 enum and drain/flush only; the pool stores no registry handle. `expired`
 stays at 0 until an expiry path exists (S6.3).
