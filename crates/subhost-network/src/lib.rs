@@ -32,6 +32,10 @@ pub const TOPIC: &str = "subhost-txs";
 pub const MAX_TRANSMIT_BYTES: usize = 4 * 1024 * 1024;
 /// Application envelope limit, leaving room for signed gossipsub framing.
 pub const MAX_WIRE_BYTES: usize = MAX_TRANSMIT_BYTES - 1024;
+
+/// Hard cap on the certified items one `Blocks` response may carry, and on the
+/// span one `GetBlocks` request may ask for.
+pub const MAX_SYNC_ITEMS: usize = 128;
 /// Capacity of the inbound and outbound channels.
 const CHANNEL_CAPACITY: usize = 1_000;
 
@@ -148,6 +152,18 @@ pub enum NetworkMessage {
     ViewChange { data: Vec<u8> },
     /// A complete authenticated target-view certificate for lagging peers.
     TimeoutCertificate { data: Vec<u8> },
+    /// Ask a peer for a bounded ascending range of certified history.
+    ///
+    /// `from` and `to` are inclusive heights, both above the genesis. A peer
+    /// answers with at most [`MAX_SYNC_ITEMS`] parent-linked items and may answer
+    /// with a shorter prefix when its archive does not reach `to`.
+    GetBlocks { from: u64, to: u64 },
+    /// Certified history in ascending height order.
+    ///
+    /// Each item is a canonical `(block, QC)` pair. A receiver verifies and
+    /// applies items in order and keeps only a validated prefix, so a truncated
+    /// or invalid suffix can never move the tip past a missing certificate.
+    Blocks { items: Vec<Vec<u8>> },
 }
 
 impl NetworkMessage {
@@ -184,6 +200,48 @@ impl NetworkMessage {
                 })?
             }
             Self::Vote { signature, .. } => signature.len(),
+            Self::GetBlocks { from, to } => {
+                if *from == 0 {
+                    return Err(NetworkError::InvalidMessage(
+                        "sync range must start at height 1 or later".into(),
+                    ));
+                }
+                let span = to.checked_sub(*from).ok_or_else(|| {
+                    NetworkError::InvalidMessage("sync range ends before it starts".into())
+                })?;
+                if span >= MAX_SYNC_ITEMS as u64 {
+                    return Err(NetworkError::InvalidMessage(format!(
+                        "sync range of {} heights exceeds the {MAX_SYNC_ITEMS} item limit",
+                        span + 1
+                    )));
+                }
+                // A range request carries only two integers; it needs no payload
+                // or envelope budget check beyond the bounds above.
+                return Ok(());
+            }
+            Self::Blocks { items } => {
+                if items.is_empty() {
+                    return Err(NetworkError::InvalidMessage("empty block range".into()));
+                }
+                if items.len() > MAX_SYNC_ITEMS {
+                    return Err(NetworkError::InvalidMessage(format!(
+                        "block range of {} items exceeds the {MAX_SYNC_ITEMS} item limit",
+                        items.len()
+                    )));
+                }
+                let mut total = 0usize;
+                for item in items {
+                    if item.is_empty() {
+                        return Err(NetworkError::InvalidMessage(
+                            "empty certified item in block range".into(),
+                        ));
+                    }
+                    total = total.checked_add(item.len()).ok_or_else(|| {
+                        NetworkError::InvalidMessage("block range size overflow".into())
+                    })?;
+                }
+                total
+            }
         };
         if payload_len == 0 {
             return Err(NetworkError::InvalidMessage("empty payload".into()));
@@ -630,6 +688,51 @@ mod tests {
             (vec![1; MAX_TRANSMIT_BYTES], vec![([1; 20], vec![2; 96])]),
         ] {
             assert!(NetworkMessage::BlockCommit { view: 1, data, signatures }.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn sync_range_requests_are_bounded() {
+        assert!(NetworkMessage::GetBlocks { from: 1, to: 1 }.validate().is_ok());
+        assert!(NetworkMessage::GetBlocks { from: 1, to: MAX_SYNC_ITEMS as u64 }
+            .validate()
+            .is_ok());
+        assert!(
+            NetworkMessage::GetBlocks { from: 0, to: 4 }.validate().is_err(),
+            "genesis is never requested as catch-up history"
+        );
+        assert!(
+            NetworkMessage::GetBlocks { from: 5, to: 4 }.validate().is_err(),
+            "an inverted range must not be relayed"
+        );
+        assert!(
+            NetworkMessage::GetBlocks { from: 1, to: MAX_SYNC_ITEMS as u64 + 1 }
+                .validate()
+                .is_err(),
+            "a range wider than the item cap must not be relayed"
+        );
+    }
+
+    #[test]
+    fn block_ranges_are_bounded_and_never_empty() {
+        assert!(NetworkMessage::Blocks { items: vec![vec![1]] }.validate().is_ok());
+        assert!(NetworkMessage::Blocks { items: Vec::new() }.validate().is_err());
+        assert!(
+            NetworkMessage::Blocks { items: vec![Vec::new()] }.validate().is_err(),
+            "an empty certified item must not be relayed"
+        );
+        assert!(
+            NetworkMessage::Blocks { items: vec![vec![1]; MAX_SYNC_ITEMS + 1] }.validate().is_err(),
+            "a response wider than the item cap must not be relayed"
+        );
+
+        for message in [
+            NetworkMessage::GetBlocks { from: 7, to: 9 },
+            NetworkMessage::Blocks { items: vec![vec![1, 2], vec![3]] },
+        ] {
+            let encoded = serde_json::to_vec(&message).unwrap();
+            let decoded: NetworkMessage = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, message);
         }
     }
 

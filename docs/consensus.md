@@ -77,8 +77,20 @@ repeated prepared blocks and proof signatures in full timeout envelopes and the
 16 MiB journal. Node sets support 1 through 64 validators. Oversized admission
 or replacement preserves the existing pool and committed state.
 
-Native historical sync is S3: latest-commit gossip repairs only the next block,
-and ledger replay does not yet authenticate every historical QC. Transaction
+Native historical sync is implemented in S3.3: a node archives the newest 4096
+certified block/QC pairs it committed and answers bounded `GetBlocks`/`Blocks`
+ranges, so a peer missing more than the next block backfills and verifies every
+certificate and state transition in order (ADR-007). A certificate past a gap is
+buffered (bounded, 64 entries) and applied once its ancestors commit; the range
+request is derived from an authenticated certificate, and a catch-up that makes no
+contiguous progress for 30 s releases signing rather than staying mute. A gap
+beyond the retained window still needs a snapshot or a fresh testnet.
+
+A conflicting authenticated final certificate is a durable incident: the node
+writes `fork-incidents.bin` beside the voting journal, halts, and reports readiness
+as not alive until an operator resolves it. A restart re-halts from that file
+before signing, so a mute validator never silently returns. Duplicate and
+unauthenticated evidence change no obligation and never halt. Transaction
 gossip and peer abuse controls are S7; submit the same transaction to potential
 leaders until that stage lands. Pending transactions remain volatile until S6.
 The timer assumes eventual delivery within its configured capped bound.

@@ -283,21 +283,32 @@ separate storage/execution contract and cannot be advertised as finalized reorg.
 
 | Task | Status |
 | --- | --- |
-| S3.1–S3.2 | Consensus classifier + halt signal (ADR-007); node buffering and readiness gating land with S3.3 |
-| S3.1 node buffering | Pending, Track A node side with S3.3 (raka): bounded candidate store, readiness gating |
-| S3.3–S3.4 | In progress on `s3.3/native-sync` (raka) |
+| S3.1–S3.2 | Consensus classifier + halt merged (ADR-007); node consumption implemented on `s3.3/native-sync` (raka) |
+| S3.1 node buffering | Implemented: bounded node-owned candidate store fed by `classify_final_evidence`, drained ascending after backfill |
+| S3.2 node consumption | Implemented: durable `fork-incidents.bin`, halt propagation, readiness suppression, re-halt on restart |
+| S3.3–S3.4 | Implemented on `s3.3/native-sync` (raka): bounded range sync, catch-up stall budget, node archive; backup inclusion remains |
 | S3.5 | Planned |
 
 **S3.1 Candidate selection**
 - Buffer bounded authenticated H+1 candidates by block hash and unknown-parent
   certified successors while requesting their missing certified ancestors.
+  Implemented node-side as 64 entries keyed by height: first pair per height
+  wins, the lowest is evicted, and the pump drains ready entries ascending after
+  every commit. Buffered state is in memory only.
 - Apply only an execution-valid child with a valid final Commit QC. Prepared
   replacement remains governed by the highest lock in the authenticated timeout
   certificate.
+- The gap request is derived from an authenticated certificate, and a catch-up
+  with no contiguous progress for 30 s releases signing, so a peer cannot pin a
+  validator mute.
 
 **S3.2 Finalized fork accountability**
 - Verify both conflicting final certificates before recording a bounded durable
   incident and stopping signing/readiness. Fake/invalid evidence cannot halt.
+  Implemented: `fork-incidents.bin` beside the voting journal (context-bound,
+  checksummed, newest 8 records), `halt`, and `consensus_alive: false`. Bootstrap
+  re-halts from the newest record before the first tick; clearing is an operator
+  action, not a code path.
 - Identical blocks with different valid QCs are duplicate evidence, not forks;
   do not alter active vote/view obligations merely on duplicate certification.
 - Certified history remains append-only; balances, nonces and receipts preserve
@@ -329,6 +340,8 @@ archive byte cap stops ingestion. See `docs/operations/certified-sync.md`.
   ledger, reconcile crash suffixes with the newest journal, refuse corruption.
 - Retain the latest 4096 actual certificates. Include archive, ledger, genesis,
   producer identity and newest signing journal in coherent backups.
+  (Archive + ledger + genesis + producer identity are bound and reconciled by
+  this slice; the backup layout itself is a separate storage/ops slice.)
 - LedgerStore remains append-only under the agreed contract; speculative rollback
   requires a separate Platform storage contract.
 

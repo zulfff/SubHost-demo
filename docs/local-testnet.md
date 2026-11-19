@@ -56,7 +56,9 @@ out of four validators cannot write a block.
 
 Followers retry the hub endpoint if it is initially unavailable or restarts,
 with backoff capped at 30 seconds. A peer missing the latest next block can
-receive its certified commit. There is no historical backfill for a longer gap.
+receive its certified commit; a longer gap is filled from a peer's retained
+certified history with bounded `GetBlocks`/`Blocks` ranges (newest 4096 blocks,
+ADR-007).
 
 ## Restart and backup
 

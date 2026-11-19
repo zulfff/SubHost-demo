@@ -124,9 +124,14 @@ fn validator_mode_boots_with_the_default_producer_key() {
 
     let driver = node.consensus().expect("a validator node must own a driver");
     let mut driver = driver.lock().unwrap();
-    assert!(produce_once_inner(node.state(), &mut driver, node.consensus_journal.as_deref())
-        .unwrap()
-        .is_some());
+    assert!(produce_once_inner(
+        node.state(),
+        &mut driver,
+        node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
+    )
+    .unwrap()
+    .is_some());
     drop(driver);
 
     let block = node.state().block_at_height(1).unwrap();
@@ -343,6 +348,352 @@ fn restarting_a_validator_restores_the_committed_height_and_view() {
     assert_eq!(restarted.state().block_height(), 2);
     assert_eq!(restarted.state().block_at_height(2).unwrap().header.parent_hash, first_hash);
     assert_eq!(restarted.state().committed_view(), Some(2));
+}
+
+#[test]
+fn a_lagging_validator_backfills_certified_history_and_restarts_at_the_synced_tip() {
+    let (dirs, nodes) = validator_nodes(1);
+    let producer = &nodes[0];
+    for nonce in 0..3 {
+        producer.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 10)).unwrap();
+        produce_for_test(producer).unwrap();
+    }
+    assert_eq!(producer.state().block_height(), 3);
+    assert_eq!(
+        producer.certified_history.as_ref().map(|history| history.lock().unwrap().len()),
+        Some(3),
+        "every committed certificate is archived before serving"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    for file in [GENESIS_FILE_NAME, PRODUCER_KEY_FILE_NAME] {
+        std::fs::copy(dirs[0].path().join(file), dir.path().join(file)).unwrap();
+    }
+    let lagging =
+        Node::bootstrap(NodeConfig { validator: true, ..test_config(dir.path()) }).unwrap();
+    assert_eq!(lagging.state().block_height(), 0, "the replica starts behind");
+
+    let (items, applied) = {
+        let history = producer.certified_history.as_ref().unwrap();
+        let served = serve_certified_range(producer.state(), history, 1, 3).unwrap().unwrap();
+        let NetworkMessage::Blocks { items } = served else {
+            panic!("serving certified history must answer with a block range");
+        };
+        let mut driver = lagging.consensus().unwrap().lock().unwrap();
+        let mut candidates = CandidateBuffer::default();
+        let mut commit = node_commit(&lagging, &mut candidates);
+        let applied =
+            apply_certified_range(lagging.state(), &mut driver, &mut commit, &items).unwrap();
+        (items.len(), applied)
+    };
+    assert_eq!(items, 3);
+    assert_eq!(applied, 3);
+    assert_eq!(lagging.state().block_height(), 3);
+    assert_eq!(lagging.state().tip_hash(), producer.state().tip_hash());
+    assert_eq!(lagging.state().state_root(), producer.state().state_root());
+
+    let config = lagging.config().clone();
+    assert_eq!(
+        lagging.certified_history.as_ref().unwrap().lock().unwrap().tip(),
+        Some(3),
+        "adopted history is archived for the next peer"
+    );
+    drop(lagging);
+    let reopened = Node::bootstrap(config).unwrap();
+    assert_eq!(reopened.state().block_height(), 3);
+    assert_eq!(reopened.state().tip_hash(), producer.state().tip_hash());
+}
+
+/// Two validators that share a genesis and producer key but commit different
+/// blocks at height 1. Both certificates are authentic, so the pair is a real
+/// finality contradiction rather than junk.
+fn diverged_validators() -> (Vec<tempfile::TempDir>, Node, Node) {
+    let (dirs, nodes) = validator_nodes(1);
+    let first = nodes.into_iter().next().unwrap();
+    first.state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+    produce_for_test(&first).unwrap();
+    assert_eq!(first.state().block_height(), 1);
+
+    let dir = tempfile::tempdir().unwrap();
+    for file in [GENESIS_FILE_NAME, PRODUCER_KEY_FILE_NAME] {
+        std::fs::copy(dirs[0].path().join(file), dir.path().join(file)).unwrap();
+    }
+    let second =
+        Node::bootstrap(NodeConfig { validator: true, ..test_config(dir.path()) }).unwrap();
+    second.state().submit_transaction(signed_transfer(&signing_key(7), 0, 777)).unwrap();
+    produce_for_test(&second).unwrap();
+    assert_eq!(second.state().block_height(), 1);
+    assert_ne!(first.state().tip_hash(), second.state().tip_hash());
+
+    (dirs, first, second)
+}
+
+#[test]
+fn conflicting_final_evidence_is_persisted_halts_and_survives_restart() {
+    let (_dirs, local, remote) = diverged_validators();
+    let local_hash = local.state().tip_hash();
+    let message = {
+        let driver = remote.consensus().unwrap().lock().unwrap();
+        certified_tip_message(remote.state(), &driver).expect("the remote tip is certified")
+    };
+
+    let mut candidates = CandidateBuffer::default();
+    let mut driver = local.consensus().unwrap().lock().unwrap();
+    let mut commit = node_commit(&local, &mut candidates);
+    let before_view = driver.view();
+    handle_consensus_message_inner(local.state(), &mut driver, message, &mut commit).unwrap();
+
+    assert!(driver.halted().is_some(), "contradictory finality must halt signing");
+    assert_eq!(driver.view(), before_view, "a halt changes no vote obligation");
+    assert_eq!(local.state().tip_hash(), local_hash, "the ledger is never rolled back");
+    assert_eq!(local.fork_log.as_ref().unwrap().lock().unwrap().latest().unwrap().height, 1);
+    assert!(!local.metrics.health().consensus_alive);
+    drop(driver);
+
+    let config = local.config().clone();
+    drop(local);
+    let restarted = Node::bootstrap(config).unwrap();
+    let driver = restarted.consensus().unwrap().lock().unwrap();
+    assert!(driver.halted().is_some(), "a durable incident re-halts before the first signed view");
+    assert_eq!(restarted.state().block_height(), 1);
+    assert_eq!(restarted.state().tip_hash(), local_hash);
+    assert!(!restarted.metrics.health().consensus_alive);
+}
+
+#[test]
+fn historical_contradiction_is_a_conflict_but_a_matching_hash_is_not() {
+    let (_dirs, local, remote) = diverged_validators();
+    // Give the local node a second block so the remote height-1 certificate is
+    // below its final tip and the classifier returns `Historical`.
+    local.state().submit_transaction(signed_transfer(&signing_key(7), 1, 20)).unwrap();
+    produce_for_test(&local).unwrap();
+    assert_eq!(local.state().block_height(), 2);
+
+    let remote_block = remote.state().block_at_height(1).unwrap();
+    let remote_certificate = {
+        let history = remote.certified_history.as_ref().unwrap();
+        let served = serve_certified_range(remote.state(), history, 1, 1).unwrap().unwrap();
+        let NetworkMessage::Blocks { items } = served else { panic!("expected a range") };
+        let (block_bytes, qc_bytes) = certified_history::decode_item(&items[0]).unwrap();
+        let block = decode_block(block_bytes).unwrap();
+        let qc: QuorumCertificate = decode_consensus(qc_bytes).unwrap();
+        assert_eq!(block.hash(), remote_block.hash());
+        NetworkMessage::BlockCommit {
+            view: qc.view,
+            data: encode_block(&block),
+            signatures: qc
+                .signatures
+                .iter()
+                .map(|(address, signature)| (*address.as_bytes(), signature.clone()))
+                .collect(),
+        }
+    };
+
+    // The local ledger holds a different block at height 1: a conflict below the tip.
+    let mut candidates = CandidateBuffer::default();
+    let mut driver = local.consensus().unwrap().lock().unwrap();
+    let mut commit = node_commit(&local, &mut candidates);
+    handle_consensus_message_inner(local.state(), &mut driver, remote_certificate, &mut commit)
+        .unwrap();
+    assert!(driver.halted().is_some(), "a historical mismatch is contradictory evidence");
+    assert_eq!(local.state().block_height(), 2, "the append-only ledger keeps its tip");
+    drop(driver);
+
+    // Re-announcing the local node's own certificate at a lower height matches
+    // the ledger and must never halt.
+    let (_dirs2, nodes) = validator_nodes(1);
+    let node = &nodes[0];
+    for nonce in 0..2 {
+        node.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 10)).unwrap();
+        produce_for_test(node).unwrap();
+    }
+    let own = {
+        let history = node.certified_history.as_ref().unwrap();
+        let served = serve_certified_range(node.state(), history, 1, 1).unwrap().unwrap();
+        let NetworkMessage::Blocks { items } = served else { panic!("expected a range") };
+        let (block_bytes, qc_bytes) = certified_history::decode_item(&items[0]).unwrap();
+        let qc: QuorumCertificate = decode_consensus(qc_bytes).unwrap();
+        NetworkMessage::BlockCommit {
+            view: qc.view,
+            data: block_bytes.to_vec(),
+            signatures: qc
+                .signatures
+                .iter()
+                .map(|(address, signature)| (*address.as_bytes(), signature.clone()))
+                .collect(),
+        }
+    };
+    let mut candidates = CandidateBuffer::default();
+    let mut driver = node.consensus().unwrap().lock().unwrap();
+    let mut commit = node_commit(node, &mut candidates);
+    handle_consensus_message_inner(node.state(), &mut driver, own, &mut commit).unwrap();
+    assert!(driver.halted().is_none(), "matching historical evidence is a duplicate");
+    assert_eq!(node.fork_log.as_ref().unwrap().lock().unwrap().len(), 0);
+}
+
+#[test]
+fn junk_or_duplicate_evidence_never_halts_signing() {
+    let (_dirs, nodes) = validator_nodes(1);
+    let node = &nodes[0];
+    node.state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+    produce_for_test(node).unwrap();
+
+    let own_tip = {
+        let driver = node.consensus().unwrap().lock().unwrap();
+        certified_tip_message(node.state(), &driver).unwrap()
+    };
+    // Its own certificate again: a duplicate is not a fork.
+    deliver_for_test(node, own_tip).unwrap();
+    assert!(node.consensus().unwrap().lock().unwrap().halted().is_none());
+    assert_eq!(node.fork_log.as_ref().unwrap().lock().unwrap().len(), 0);
+
+    // An unauthenticated certificate is a plain rejection, never an incident.
+    let forged = {
+        let driver = node.consensus().unwrap().lock().unwrap();
+        let mut message = certified_tip_message(node.state(), &driver).unwrap();
+        if let NetworkMessage::BlockCommit { ref mut signatures, .. } = message {
+            for (_, signature) in signatures.iter_mut() {
+                *signature = vec![0xff; 96];
+            }
+        }
+        message
+    };
+    assert!(deliver_for_test(node, forged).is_err());
+    assert!(node.consensus().unwrap().lock().unwrap().halted().is_none());
+    assert_eq!(node.fork_log.as_ref().unwrap().lock().unwrap().len(), 0);
+}
+
+#[test]
+fn a_buffered_candidate_applies_once_its_ancestors_backfill() {
+    let (dirs, nodes) = validator_nodes(1);
+    let producer = &nodes[0];
+    for nonce in 0..3 {
+        producer.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 10)).unwrap();
+        produce_for_test(producer).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    for file in [GENESIS_FILE_NAME, PRODUCER_KEY_FILE_NAME] {
+        std::fs::copy(dirs[0].path().join(file), dir.path().join(file)).unwrap();
+    }
+    let lagging =
+        Node::bootstrap(NodeConfig { validator: true, ..test_config(dir.path()) }).unwrap();
+
+    let tip_three = {
+        let history = producer.certified_history.as_ref().unwrap();
+        let served = serve_certified_range(producer.state(), history, 3, 3).unwrap().unwrap();
+        let NetworkMessage::Blocks { items } = served else { panic!("expected a range") };
+        let (block_bytes, qc_bytes) = certified_history::decode_item(&items[0]).unwrap();
+        let block = decode_block(block_bytes).unwrap();
+        let qc: QuorumCertificate = decode_consensus(qc_bytes).unwrap();
+        NetworkMessage::BlockCommit {
+            view: qc.view,
+            data: encode_block(&block),
+            signatures: qc
+                .signatures
+                .iter()
+                .map(|(address, signature)| (*address.as_bytes(), signature.clone()))
+                .collect(),
+        }
+    };
+
+    // Sari's review: an unauthenticated announcement must not create catch-up
+    // state, so a forged far-ahead commit cannot pin the validator mute.
+    let mut forged = tip_three.clone();
+    if let NetworkMessage::BlockCommit { ref mut signatures, .. } = forged {
+        for (_, signature) in signatures.iter_mut() {
+            *signature = vec![0xff; 96];
+        }
+    }
+    {
+        let mut candidates = CandidateBuffer::default();
+        let mut commit = node_commit(&lagging, &mut candidates);
+        let mut driver = lagging.consensus().unwrap().lock().unwrap();
+        assert!(handle_consensus_message_inner(lagging.state(), &mut driver, forged, &mut commit)
+            .is_err());
+        assert!(commit.candidates.highest().is_none());
+        assert_eq!(driver.height(), 0);
+    }
+    assert!(!lagging.catching_up.load(Ordering::SeqCst));
+
+    let mut candidates = CandidateBuffer::default();
+    let mut commit = node_commit(&lagging, &mut candidates);
+    let mut driver = lagging.consensus().unwrap().lock().unwrap();
+    handle_consensus_message_inner(lagging.state(), &mut driver, tip_three, &mut commit).unwrap();
+    assert_eq!(driver.height(), 0, "a candidate past a gap is not applied");
+    assert_eq!(commit.candidates.highest(), Some(3));
+
+    // Backfill only heights 1-2: the buffered height 3 applies from the store.
+    let history = producer.certified_history.as_ref().unwrap();
+    let NetworkMessage::Blocks { items } =
+        serve_certified_range(producer.state(), history, 1, 2).unwrap().unwrap()
+    else {
+        panic!("expected a range")
+    };
+    assert_eq!(
+        apply_certified_range(lagging.state(), &mut driver, &mut commit, &items).unwrap(),
+        2
+    );
+    assert_eq!(driver.height(), 2, "the range alone stops before the buffered item");
+    assert_eq!(drain_candidates(lagging.state(), &mut driver, &mut commit).unwrap(), 1);
+    assert_eq!(driver.height(), 3);
+    assert_eq!(lagging.state().tip_hash(), producer.state().tip_hash());
+    assert!(commit.candidates.highest().is_none(), "the store is drained");
+
+    // The journal and archive advanced with the drain, so a restart resumes at 3.
+    let config = lagging.config().clone();
+    drop(driver);
+    drop(lagging);
+    let reopened = Node::bootstrap(config).unwrap();
+    assert_eq!(reopened.state().block_height(), 3);
+    assert_eq!(reopened.consensus().unwrap().lock().unwrap().height(), 3);
+}
+
+#[test]
+fn a_stalled_catch_up_releases_signing_after_its_budget() {
+    let catching_up = AtomicBool::new(true);
+    let mut sync = SyncState::default();
+    sync.begin(50);
+    assert_eq!(sync.target, Some(50));
+    assert!(!sync.expire(&catching_up), "a fresh run is allowed to make progress");
+
+    // Contiguous progress keeps the run alive indefinitely.
+    sync.progressed_at =
+        Some(std::time::Instant::now() - CATCH_UP_STALL - std::time::Duration::from_secs(1));
+    sync.progressed();
+    assert!(!sync.expire(&catching_up));
+
+    // No progress within the budget drops the unserved range and resumes signing.
+    sync.progressed_at =
+        Some(std::time::Instant::now() - CATCH_UP_STALL - std::time::Duration::from_secs(1));
+    assert!(sync.expire(&catching_up));
+    assert!(!catching_up.load(Ordering::SeqCst));
+    assert!(sync.target.is_none());
+    assert!(sync.request(0).is_none(), "an expired run must not keep requesting");
+    assert!(!sync.expire(&catching_up), "expiry is idempotent");
+}
+
+#[test]
+fn sync_requests_and_served_windows_are_bounded() {
+    let mut sync = SyncState {
+        target: Some(1_000),
+        requested_at: None,
+        progressed_at: Some(std::time::Instant::now()),
+    };
+    let NetworkMessage::GetBlocks { from, to } = sync.request(10).unwrap() else {
+        panic!("a gap request must be a GetBlocks message");
+    };
+    assert_eq!(from, 11);
+    assert_eq!(to, 10 + subhost_network::MAX_SYNC_ITEMS as u64);
+    assert!(sync.request(1_000).is_none(), "no request once the tip is reached");
+    assert!(sync.retry(1_000).is_none());
+
+    let (_dirs, nodes) = validator_nodes(1);
+    let node = &nodes[0];
+    node.state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+    produce_for_test(node).unwrap();
+    let history = node.certified_history.as_ref().unwrap();
+    assert!(serve_certified_range(node.state(), history, 2, 9).unwrap().is_none());
+    assert!(serve_certified_range(node.state(), history, 1, 9).unwrap().is_some());
 }
 
 #[test]
@@ -616,6 +967,7 @@ pub(super) fn produce_for_test(node: &Node) -> Result<Option<ProducedRound>, Nod
         node.state(),
         &mut node.consensus().unwrap().lock().unwrap(),
         node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
     )
 }
 
@@ -623,12 +975,28 @@ pub(super) fn deliver_for_test(
     node: &Node,
     message: NetworkMessage,
 ) -> Result<Option<Vote>, NodeError> {
+    let mut candidates = CandidateBuffer::default();
+    let mut commit = node_commit(node, &mut candidates);
     handle_consensus_message_inner(
         node.state(),
         &mut node.consensus().unwrap().lock().unwrap(),
         message,
-        node.consensus_journal.as_deref(),
+        &mut commit,
     )
+}
+
+/// The commit context a running pump would build for this node.
+pub(super) fn node_commit<'a>(
+    node: &'a Node,
+    candidates: &'a mut CandidateBuffer,
+) -> CommitContext<'a> {
+    CommitContext {
+        journal: node.consensus_journal.as_deref(),
+        history: node.certified_history.as_deref(),
+        fork_log: node.fork_log.as_deref(),
+        candidates,
+        metrics: Some(&node.metrics),
+    }
 }
 
 pub(super) fn proposal_for_test(proposal: &DriverProposal) -> NetworkMessage {

@@ -178,6 +178,11 @@ impl ConsensusJournal {
         Ok((journal, driver))
     }
 
+    /// Path of the voting journal; sibling archives live in the same directory.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(crate) fn save(&self, driver: &ConsensusDriver) -> Result<(), NodeError> {
         self.write(driver.checkpoint(), None)
     }

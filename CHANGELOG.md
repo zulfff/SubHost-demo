@@ -290,6 +290,30 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   overflow-checked, and direct tests cover the halted Commit-vote and
   view-change refusals.
 
+- **Native certified history and bounded block sync (S3.3, ADR-007).** A
+  validator node archives every certified `(block, QC)` it commits in a
+  genesis-bound, checksummed file beside the voting journal (newest 4096 items),
+  serves it only when the retained ledger holds the same block hash, and a node
+  that sees a certified tip beyond its next height requests the missing range
+  with the new `GetBlocks`/`Blocks` messages (appended at the end of the enum,
+  hard cap 128 items). Adopted items follow the live commit ordering with a
+  driver clone and a per-commit journal save; signing is suppressed by a
+  node-owned `catching_up` flag until the tip is reached. No `LedgerStore`, RPC,
+  CLI, or `subhost-consensus` change. See the S3.3 amendment in
+  `docs/agents/decisions/ADR-007-native-certified-fork-accountability.md`.
+
+- **Node consumption of the final-evidence classifier (S3.1/S3.2).** Every
+  inbound `BlockCommit` now goes through `classify_final_evidence` before it can
+  touch state. A certificate past a gap is buffered in a bounded node-owned store
+  (64 entries keyed by height, lowest evicted) and applied in ascending order
+  once its ancestors commit; the gap request is only ever derived from an
+  authenticated certificate, so a forged announcement cannot start catch-up.
+  Contradictory evidence is written to `fork-incidents.bin` (context-bound,
+  checksummed, newest 8 records), halts the driver, and publishes readiness as
+  not alive. A restart re-halts from that file before the first signed view.
+  A catch-up with no contiguous progress for 30 s drops the target and resumes
+  signing instead of staying mute. No consensus-crate or journal-format change.
+
 - **Platform observability API (S8, ADR-013).** `Metrics::set_health` publishes
   one coherent `HealthStatus` snapshot; the exporter serves `/health/live`
   (and legacy `/health`) as liveness-only and `/health/ready` as 200 only when
