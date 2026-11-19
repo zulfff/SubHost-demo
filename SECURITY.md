@@ -58,12 +58,19 @@ abuse controls remain S7. This prototype still needs independent protocol review
 audit/soak gates. Unsigned demo genesis requires explicit `--single-writer`.
 See `docs/consensus.md`.
 
-**The producer key is an unencrypted file.** `<data_dir>/producer.key` holds one
-hex-encoded 32-byte BLS scalar with mode `0600`, and the node refuses to load it if
-group or others can read it. It is not the wallet keystore and it is not encrypted,
-so anyone who copies the file can produce blocks as that validator. That is
-acceptable for a testnet and not for production; `ROADMAP.md` S9.6 replaces it with
-an encrypted keystore. Back the file up as carefully as the identity it represents.
+**Producer key: encrypted keystore available; legacy plaintext path remains.**
+S9.6 is complete (#59, #79, #85): `subhost producer create` (or `migrate` for an
+existing key) writes `<data_dir>/producer.keystore.json`, a scrypt-derived
+AES-256-GCM keystore, and `subhost node --validator --producer-credential-file FILE`
+unlocks it at start-up. The unlock is fail-closed: no plaintext fallback, no key
+generation, owner-only bounded credential read, and the unlocked key passes the
+same genesis/proof-of-possession validation as a file-loaded one. Without the
+credential flag the node still loads the legacy `<data_dir>/producer.key`
+(hex-encoded 32-byte BLS scalar); that loader is hardened (owner-only mode,
+symlink and special-file refusal, bounded read) but the key is unencrypted, so
+anyone who copies the file can produce blocks as that validator. Use the
+encrypted keystore for production; back the keystore and its credential up as
+carefully as the identity they represent.
 
 **Gossip has bounded historical catch-up but no peer scoring.** Validator nodes
 exchange producer-authenticated proposals, verified votes and QC-certified next
