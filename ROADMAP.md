@@ -479,6 +479,14 @@ looking traffic.
 
 ### S8 — Observability, health, runbooks (Track B)
 
+| Task | Status |
+| --- | --- |
+| S8.2/S8.3 Platform API | In review on `s8/platform-observability` (ADR-013, Q-020) |
+| S8.2/S8.3 node runtime hooks | Pending Track A, after the Platform API lands |
+| S8.1 OTLP tracing, RPC spans | Pending, later S8 slices |
+| S8.4 Runbooks | Partial: `docs/operations/observability.md`; remaining runbooks pending |
+| S8.5 Alerts | Sample rules shipped in `docs/operations/observability.md` |
+
 **S8.1 Tracing** — OpenTelemetry OTLP export behind a feature flag; spans for
 `accept_block`, `seal_block`, consensus steps, and RPC methods.
 **S8.2 Metrics** — height, finalized height, peer count, QC latency, reorg count,

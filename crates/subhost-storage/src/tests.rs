@@ -1267,3 +1267,83 @@ fn a_pruned_segment_corruption_is_still_rejected() {
     fs::write(&path, bytes).unwrap();
     assert!(matches!(store.load(), Err(StorageError::ChecksumMismatch)));
 }
+
+#[test]
+fn ephemeral_and_fresh_stores_report_empty_disk_metadata() {
+    let ephemeral = LedgerStore::ephemeral(1).unwrap();
+    assert_eq!(
+        ephemeral.disk_stats().unwrap(),
+        LedgerDiskStats { active_file_bytes: 0, snapshot_modified: None }
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    assert_eq!(
+        store.disk_stats().unwrap(),
+        LedgerDiskStats { active_file_bytes: 0, snapshot_modified: None }
+    );
+}
+
+#[test]
+fn disk_stats_measure_only_the_files_the_manifest_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 3, 1, 1);
+
+    let manifest = manifest_value(dir.path());
+    let mut expected = fs::metadata(segmented::manifest_path(dir.path())).unwrap().len();
+    for segment in manifest["segments"].as_array().unwrap() {
+        let name = segment["file"].as_str().unwrap();
+        let path = dir.path().join(LEDGER_DIR_NAME).join("segments").join(name);
+        expected += fs::metadata(path).unwrap().len();
+    }
+    let snapshot_name = manifest["snapshot"]["file"].as_str().unwrap();
+    let snapshot = dir.path().join(LEDGER_DIR_NAME).join(snapshot_name);
+    expected += fs::metadata(&snapshot).unwrap().len();
+
+    let stats = store.disk_stats().unwrap();
+    assert_eq!(stats.active_file_bytes, expected);
+    assert_eq!(stats.snapshot_modified, fs::metadata(&snapshot).unwrap().modified().ok());
+
+    // Orphans and backups the manifest does not name must not count.
+    fs::write(segment_path(dir.path(), 99), b"orphan segment").unwrap();
+    fs::write(snapshot_path(dir.path(), 1), b"stale snapshot").unwrap();
+    fs::write(dir.path().join(LEDGER_BACKUP_FILE_NAME), b"legacy backup").unwrap();
+    assert_eq!(store.disk_stats().unwrap(), stats);
+}
+
+#[test]
+fn disk_stats_report_missing_active_data_instead_of_a_false_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 3, 1, 1);
+
+    fs::remove_file(segment_path(dir.path(), 2)).unwrap();
+    assert!(matches!(store.disk_stats(), Err(StorageError::Io { .. })));
+}
+
+#[test]
+fn disk_stats_report_an_invalid_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 2, 1, 1);
+
+    let mut value = manifest_value(dir.path());
+    value["head_height"] = serde_json::json!(99);
+    write_manifest_value(dir.path(), &value);
+    assert!(matches!(store.disk_stats(), Err(StorageError::Manifest(_))));
+}
+
+#[test]
+fn legacy_ledger_disk_stats_report_the_file_without_a_snapshot_timestamp() {
+    let dir = tempfile::tempdir().unwrap();
+    let (snapshot, _) = ledger(2);
+    let path = dir.path().join(LEDGER_FILE_NAME);
+    fs::write(&path, legacy::encode(&snapshot)).unwrap();
+    // A backup next to it must not count.
+    fs::write(dir.path().join(LEDGER_BACKUP_FILE_NAME), b"backup").unwrap();
+
+    let stats = open(dir.path()).disk_stats().unwrap();
+    assert_eq!(stats.active_file_bytes, fs::metadata(&path).unwrap().len());
+    assert_eq!(stats.snapshot_modified, None);
+}
