@@ -63,7 +63,9 @@ not block/QC authentication.
   Backups (`node-state.bin.v2-backup`) and orphan files are excluded.
 - A missing named file or an invalid manifest is an error, never a false zero.
 - Ephemeral and fresh stores report empty metadata; a legacy single-file
-  ledger reports that file's size and `snapshot_modified: None`.
+  ledger reports that file's size and `snapshot_modified: None`. A legacy
+  file deleted after open also reports empty metadata (fresh vs deleted is
+  indistinguishable without extra state); segmented stores error instead.
 - The caller serializes measurement with persist/prune under the node's
   commit lock.
 

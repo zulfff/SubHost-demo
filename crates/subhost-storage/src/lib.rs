@@ -337,6 +337,9 @@ impl LedgerStore {
     /// the node's commit lock so the manifest and the files it names are read
     /// coherently. An ephemeral or fresh store reports empty metadata; a legacy
     /// single-file ledger reports that file's size and no snapshot timestamp.
+    /// Legacy edge: a ledger file deleted after open is indistinguishable from
+    /// a fresh store without extra state, so it also reports empty metadata
+    /// (segmented stores error on a missing named file instead).
     pub fn disk_stats(&self) -> Result<LedgerDiskStats, StorageError> {
         let Some(path) = &self.path else {
             return Ok(LedgerDiskStats { active_file_bytes: 0, snapshot_modified: None });
