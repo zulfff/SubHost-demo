@@ -94,8 +94,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   state replay that refuses transactions the committed state cannot apply
   (replayed or nonce-skipping transactions with otherwise honest commitments,
   which the old root-only check accepted into a ledger that would fail to load).
-  Commit latency no longer grows with history: the audit PoC measured 52.6x
-  submit-latency growth over 1000 empty blocks on `01a59df`, 1.2x with the fix.
+  Commit latency no longer grows with history: the audit PoC measured 57.3x
+  submit-latency growth over 1000 empty blocks on `01a59df`, 1.2x with the fix
+  and 1.0x on an independent re-run (run-to-run baseline spread 38.4x-57.3x;
+  the same evidence set measured 47.5x on the calldata case, 6.7x after).
   A cache miss (fresh process before load, legacy file, prune, unchanged history)
   falls back to the previous full validation. Unpriced calldata (Bima/Raka fee
   contract) and the node-side O(N) block-list clone per commit remain separate
