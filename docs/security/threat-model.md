@@ -28,7 +28,7 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
 > **Not implemented:** peer scoring and per-peer abuse controls, and transaction
 > gossip (S7); an encrypted mempool, Dandelion++ routing, threshold encryption,
 > inactivity leaks, weak-subjectivity checkpoints, an unbonding period,
-> validator-set rotation, an encrypted producer key for node start-up (S9.6),
+> validator-set rotation,
 > on-chain governance, EVM or WASM execution, zk proofs, a Merkle Patricia Trie,
 > non-membership proofs, multisig light clients, oracle or MEV defences, an HSM
 > program, per-IP rate limiting, in-process TLS, and authentication on the metrics
@@ -273,9 +273,10 @@ ledger behind newer signing state, or a missing or damaged journal on an existin
 validator ledger, is refused pending recovery.
 
 **Residual risk**: Checksums detect corruption and naive edits, not an attacker who
-can rewrite the whole directory consistently. The producer key is unencrypted and
-readable by the node's user, and the state tree proves membership only, so account
-absence cannot be proven.
+can rewrite the whole directory consistently. On the legacy path the producer key
+is unencrypted and readable by the node's user; the encrypted keystore (S9.6)
+protects it at rest, but a running node still holds the unlocked key. The state
+tree proves membership only, so account absence cannot be proven.
 
 ### Economic attacks
 
@@ -345,9 +346,13 @@ Validator or user private keys stolen.
 **Impact**: Unauthorized transactions, slashing evasion
 
 **Mitigation**:
-- The producer key is a single hex-encoded BLS scalar in
-  `<data_dir>/producer.key`, mode `0600`, refused if group or others can read it;
-  it is not encrypted (S9.6 replaces it with an encrypted keystore).
+- The producer key can live in an encrypted keystore (S9.6, #59/#79/#85):
+  `producer.keystore.json` uses scrypt-derived AES-256-GCM, unlocked at start-up
+  via an owner-only credential file, fail-closed with no plaintext fallback or
+  key generation. The legacy path remains a single hex-encoded BLS scalar in
+  `<data_dir>/producer.key`, mode `0600`, refused if group or others can read it,
+  symlinked, oversized, or not a regular file; it is unencrypted, so prefer the
+  keystore for production.
 - Wallet keystores use scrypt + AES-256-GCM; file-supplied scrypt costs are
   bounded before allocation (at most 256 MiB of memory and 2^22 work units), so a
   crafted wallet file cannot abort the process.

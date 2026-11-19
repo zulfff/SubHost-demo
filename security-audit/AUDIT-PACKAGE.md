@@ -17,17 +17,17 @@ Core, consensus, RPC, storage. Adjacent crates an auditor will also need:
 
 ## Start here (posture and design)
 
-- `SECURITY.md` — authoritative, code-verified current posture and the enforced
+- `SECURITY.md`: authoritative, code-verified current posture and the enforced
   security properties (a regression in any is a genuine vulnerability).
-- `docs/security/threat-model.md` — threats, mitigations, residual risks, and the
+- `docs/security/threat-model.md`: threats, mitigations, residual risks, and the
   implemented/not-implemented boundary.
-- `docs/security/bug-bounty.md` — research scope, safe harbor, disclosure policy
+- `docs/security/bug-bounty.md`: research scope, safe harbor, disclosure policy
   (no funded bounty).
-- `docs/consensus.md` — phased prepare/commit consensus, timeouts/locks, recovery,
+- `docs/consensus.md`: phased prepare/commit consensus, timeouts/locks, recovery,
   native certified sync (S3.3), and remaining stages.
 - `docs/architecture.md`, `docs/operations/certified-sync.md`,
   `docs/operations/producer-keystore.md`.
-- Decisions: `docs/agents/decisions/` — full index below.
+- Decisions: `docs/agents/decisions/`: full index below.
 
 ## ADR index (origin/main)
 
@@ -50,7 +50,7 @@ Core, consensus, RPC, storage. Adjacent crates an auditor will also need:
 
 ## Open residuals for the auditor
 
-- **SUBHOST-2026-003 (High, partial — three-fix ladder):**
+- **SUBHOST-2026-003 (High, partial: three-fix ladder):**
   - **Fix 2 (suffix-only validation): MERGED** (#50). Append-time O(history) replay
     is gone; `segmented::persist` validates only the appended suffix on the verified
     head.
@@ -63,13 +63,15 @@ Core, consensus, RPC, storage. Adjacent crates an auditor will also need:
     Awaiting L2–L4 implementation (bima).
   The High closes only when fix 1 lands and the pricing + amplification mitigations
   are re-verified together (Q-024, Q-037).
-- **R-57-01 (Medium):** fixed in #67 (merged) — pruned historical evidence is
+- **R-57-01 (Medium):** fixed in #67 (merged); pruned historical evidence is
   unverifiable-not-fork; decision-table audited, no new halt vector.
 - Roadmap gaps (documented, not findings): per-peer rate limiting / peer scoring
   (S7), encrypted mempool / Dandelion++ / threshold encryption, inactivity leaks,
-  weak-subjectivity checkpoints, unbonding, validator-set rotation, encrypted
-  producer key for node start-up (S9.6: keystore #59 merged; bootstrap API +
-  hardened loader #79 reviewed, pending merge; CLI unlock flag pending).
+  weak-subjectivity checkpoints, unbonding, validator-set rotation. Encrypted
+  producer key for node start-up (S9.6) is **complete**: keystore #59, bootstrap
+  API + hardened loader #79, CLI unlock flag #85 (all merged). The legacy
+  plaintext loader remains the default without the credential flag (hardened,
+  but unencrypted at rest).
 
 S12.2 requires closing every High/Medium before the audit can be signed off.
 
@@ -79,11 +81,11 @@ Four gates: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-target
 --all-features -- -D warnings`, `cargo test --workspace --all-features`,
 `cargo-deny --all-features check`.
 
-- `2026-11-19-four-gate-baseline/fa87215/` — green baseline (34 suites, 479 tests),
+- `2026-11-19-four-gate-baseline/fa87215/`: green baseline (34 suites, 479 tests),
   with `SUMMARY.md`, per-gate logs, and `run.txt`.
-- `2026-11-19-four-gate-baseline/982d3e6/` — green baseline at the prior tip.
-- `2026-11-19-four-gate-baseline/a210f29/` — stale local-`main` run, labelled.
-- `2026-11-19-four-gate-baseline/run-gates.sh` — reproducible runner.
+- `2026-11-19-four-gate-baseline/982d3e6/`: green baseline at the prior tip.
+- `2026-11-19-four-gate-baseline/a210f29/`: stale local-`main` run, labelled.
+- `2026-11-19-four-gate-baseline/run-gates.sh`: reproducible runner.
 
 Environment caveat (Q-029): `/usr/local/bin/cargo` is a wrapper forcing a
 read-only `CARGO_HOME`; run deny via the direct binary
@@ -109,17 +111,23 @@ note updated in #73). S12.2 requires closing every High/Medium.
 
 ## Security reviews performed (internal QA, not an external audit)
 
-- `2026-11-19-pr57-native-sync-review.md` — S3.3 native sync + fork accountability
+- `2026-11-19-pr57-native-sync-review.md`: S3.3 native sync + fork accountability
   (PR #57). Verified fail-closed classification, ledger-anchored serving, bounded
   catch-up; raised R-57-01.
-- `2026-11-19-pr59-keystore-review.md` — S9.6 encrypted producer keystore (PR #59).
+- `2026-11-19-pr59-keystore-review.md`: S9.6 encrypted producer keystore (PR #59).
   First pass + re-review; R-59-01 closed; approved.
-- `2026-11-19-pr65-storage-fee-replay-review.md` — S6.2 step 2 storage fee replay
+- `2026-11-19-pr65-storage-fee-replay-review.md`: S6.2 step 2 storage fee replay
   (PR #65). Replay+root check, fee conservation, policy binding; approved.
-- `2026-11-20-pr79-producer-bootstrap-review.md` — S9.6 Track A bootstrap + hardened
+- `2026-11-20-pr79-producer-bootstrap-review.md`: S9.6 Track A bootstrap + hardened
   loader (PR #79). Fail-closed supplied-key bootstrap, PoP not bypassed, legacy
   loader TOCTOU + non-Unix bypass closed; approved.
-- `qa-review-queue.md` — current QA queue and closed items.
+- `2026-11-20-pr84-mempool-persist-review.md`: opt-in mempool persistence consumer
+  (PR #84, Q-016/Q-038). Opt-in default-off, genesis-bound, fail-closed boot on
+  foreign/corrupt snapshot; approved with R-84-01 (Low, CLI-flag doc divergence).
+- `2026-11-20-pr85-credential-flag-review.md`: S9.6 completion, node
+  `--producer-credential-file` unlock (PR #85). Fail-closed unlock, owner-only
+  bounded credential, no fallback/keygen, #79 PoP path; approved. S9.6 complete.
+- `qa-review-queue.md`: current QA queue and closed items.
 
 ## Known limitations (documented, not undisclosed findings)
 
@@ -128,9 +136,10 @@ metrics/faucet; single-key IBC light client (no rotation/multisig/non-membership
 membership-only state proofs; no per-peer rate limiting / peer scoring (S7);
 encrypted mempool / Dandelion++ / threshold encryption not implemented; no
 inactivity leaks / weak-subjectivity checkpoints / unbonding / validator-set
-rotation; encrypted producer key for node start-up pending (S9.6, keystore crate
-landed but bootstrap not wired). See `SECURITY.md` "Known security posture" and
-the threat-model not-implemented list.
+rotation; the legacy plaintext producer-key loader remains the default without
+`--producer-credential-file` (S9.6 encrypted keystore is complete and recommended
+for production, but the legacy path is unencrypted at rest). See `SECURITY.md`
+"Known security posture" and the threat-model not-implemented list.
 
 ## What this package does NOT establish
 
