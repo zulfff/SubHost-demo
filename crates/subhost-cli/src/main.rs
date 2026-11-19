@@ -160,6 +160,16 @@ enum Commands {
         /// Permit a non-loopback bind. Requires --rpc-auth-token-file.
         #[arg(long, requires = "rpc_auth_token_file")]
         rpc_allow_public: bool,
+
+        /// Automatic ledger retention in blocks (Q-036). Unset = off.
+        /// Accepted now; the prune trigger lands with the S12.3 retention
+        /// slice, so until then this has no effect on a running node and
+        /// `subhost db prune` remains the only prune path. The newest
+        /// snapshot is the hard floor: the real bound is snapshot cadence + N.
+        /// Values below 4096 warn at boot once the trigger lands (degraded
+        /// sync-serving role).
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        retention_blocks: Option<u64>,
     },
 
     /// Manage local wallets.
@@ -478,6 +488,7 @@ fn main() -> Result<()> {
                 rpc_auth_token_file,
                 rpc_rate_limit,
                 rpc_allow_public,
+                retention_blocks,
             } => {
                 run_node(
                     validator,
@@ -496,6 +507,7 @@ fn main() -> Result<()> {
                     rpc_auth_token_file,
                     rpc_rate_limit,
                     rpc_allow_public,
+                    retention_blocks,
                 )
                 .await
             }
@@ -1007,6 +1019,7 @@ async fn run_node(
     rpc_auth_token_file: Option<PathBuf>,
     rpc_rate_limit: Option<u32>,
     rpc_allow_public: bool,
+    retention_blocks: Option<u64>,
 ) -> Result<()> {
     let data_dir = match data_dir {
         Some(dir) => dir,
@@ -1045,6 +1058,8 @@ async fn run_node(
         config.view_timeout_ms = timeout;
     }
     config.producer_key_file = producer_key_file;
+    // Q-036: accepted now, inert until the node-side prune trigger lands.
+    config.retention_blocks = retention_blocks;
     config.network = network;
     validate_node_policy(&config)?;
     // ADR-011: with a credential, boot from the unlocked keystore key; the
@@ -1598,6 +1613,41 @@ mod tests {
             cli.command,
             Commands::Node { single_writer: true, view_timeout_ms: Some(5000), .. }
         ));
+    }
+
+    #[test]
+    fn retention_blocks_flag_parses_positive_values_and_defaults_off() {
+        // Q-036 Q5: unset = off (None), any n >= 1 accepted, 0/negative refused.
+        let cli = Cli::try_parse_from(["subhost", "node", "--single-writer"]).unwrap();
+        assert!(matches!(cli.command, Commands::Node { retention_blocks: None, .. }));
+
+        let cli = Cli::try_parse_from([
+            "subhost",
+            "node",
+            "--single-writer",
+            "--retention-blocks",
+            "50000",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Commands::Node { retention_blocks: Some(50000), .. }));
+
+        // Aggressive lean values are allowed (Q-036 Q7); the boot warning below
+        // 4096 belongs to the node trigger slice, not the parser.
+        let cli =
+            Cli::try_parse_from(["subhost", "node", "--single-writer", "--retention-blocks", "1"])
+                .unwrap();
+        assert!(matches!(cli.command, Commands::Node { retention_blocks: Some(1), .. }));
+
+        for bad in ["0", "-1", "not-a-number"] {
+            assert!(Cli::try_parse_from([
+                "subhost",
+                "node",
+                "--single-writer",
+                "--retention-blocks",
+                bad,
+            ])
+            .is_err());
+        }
     }
 
     #[test]

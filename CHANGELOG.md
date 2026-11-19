@@ -302,6 +302,17 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **`subhost node --retention-blocks` configuration flag (Q-036 Q5, S12.3).**
+  Stacks on the `NodeConfig.retention_blocks` field (#76): clap `u64` range
+  `1..`, unset = off, no env var, passed straight into the node config. The
+  flag is accepted now but **inert** until the node-side prune trigger lands;
+  `subhost db prune --keep-segments` remains the only prune path until then.
+  Runbook: `docs/operations/ledger-repair.md` gains the automatic-retention
+  section (snapshot floor = cadence + N, failure never halts, boot warning
+  below 4096 with the degraded sync-serving role, validator/observer-only
+  safety scope), and `start-stop.md` cross-references it. Parse tests cover
+  unset/positive/lean values and refusal of 0, negatives and non-numbers.
+
 - **Public genesis prep script (Q-012/Q-037).** Added
   `scripts/testnet/prepare-public-genesis.sh`: generates the four distinct
   encrypted producer keystores (`subhost producer create`) plus owner-only
