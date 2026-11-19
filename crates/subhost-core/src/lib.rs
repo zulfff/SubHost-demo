@@ -3,10 +3,18 @@
 //! Everything here is deliberately transport- and storage-agnostic: hashes,
 //! addresses, the block/transaction/receipt shapes, and the genesis document.
 
-use serde::{Deserialize, Serialize};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::SerializeTuple;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+pub mod fee;
 pub mod merkle;
+
+pub use fee::{
+    settle_block_fees, BlockFeeSettlement, FeeBreakdown, FeeContext, FeeError, FeePolicy,
+    FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER, FEE_HEADER_VERSION,
+};
 
 /// Length of a [`struct@Hash`] in bytes (BLAKE3-256).
 pub const HASH_SIZE: usize = 32;
@@ -123,7 +131,13 @@ pub type Gas = u64;
 pub type ChainId = u64;
 
 /// Canonical block header. The header hash is the block hash.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Version 1 keeps the exact legacy 12-field binary layout. Version 2
+/// (fee-enabled chains, Q-017) appends `base_fee_per_gas` as a 13th field;
+/// the field is part of the hash and therefore of every signature and QC
+/// commitment over the block. A version 1 header always carries
+/// `base_fee_per_gas == 0` in memory and never encodes the field.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeader {
     pub version: u32,
     pub chain_id: ChainId,
@@ -137,11 +151,251 @@ pub struct BlockHeader {
     pub gas_used: Gas,
     pub gas_limit: Gas,
     pub extra_data: Vec<u8>,
+    /// Recorded only by version >= 2 headers; zero on legacy headers.
+    pub base_fee_per_gas: Amount,
 }
 
 impl BlockHeader {
     pub fn hash(&self) -> Hash {
         Hash::from_data(&encode_canonical(self))
+    }
+}
+
+/// Binary layout: a fixed tuple, 12 elements for version 1 and 13 for
+/// version 2. bincode's tuple access is length-based with no completeness
+/// check, so the decoder may stop after 12 elements for a legacy header and
+/// leave the rest of the stream to the next record. JSON uses named fields
+/// instead, with the base fee as a decimal string (u128-safe).
+impl Serialize for BlockHeader {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.version < FEE_HEADER_VERSION && self.base_fee_per_gas != 0 {
+            return Err(serde::ser::Error::custom("a legacy header cannot carry a base fee"));
+        }
+        if serializer.is_human_readable() {
+            if self.version >= FEE_HEADER_VERSION {
+                HeaderJsonV2::from(self).serialize(serializer)
+            } else {
+                HeaderJsonV1::from(self).serialize(serializer)
+            }
+        } else {
+            let fields = if self.version >= FEE_HEADER_VERSION { 13 } else { 12 };
+            let mut tuple = serializer.serialize_tuple(fields)?;
+            tuple.serialize_element(&self.version)?;
+            tuple.serialize_element(&self.chain_id)?;
+            tuple.serialize_element(&self.height)?;
+            tuple.serialize_element(&self.timestamp)?;
+            tuple.serialize_element(&self.parent_hash)?;
+            tuple.serialize_element(&self.state_root)?;
+            tuple.serialize_element(&self.tx_root)?;
+            tuple.serialize_element(&self.receipt_root)?;
+            tuple.serialize_element(&self.validator)?;
+            tuple.serialize_element(&self.gas_used)?;
+            tuple.serialize_element(&self.gas_limit)?;
+            tuple.serialize_element(&self.extra_data)?;
+            if self.version >= FEE_HEADER_VERSION {
+                tuple.serialize_element(&self.base_fee_per_gas)?;
+            }
+            tuple.end()
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BlockHeader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let json = HeaderJson::deserialize(deserializer)?;
+            return json.into_header();
+        }
+        deserializer.deserialize_tuple(13, HeaderVisitor)
+    }
+}
+
+struct HeaderVisitor;
+
+impl<'de> Visitor<'de> for HeaderVisitor {
+    type Value = BlockHeader;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a version 1 or 2 block header tuple")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        fn next<'de, A: SeqAccess<'de>, T: Deserialize<'de>>(seq: &mut A) -> Result<T, A::Error> {
+            seq.next_element()?.ok_or_else(|| de::Error::custom("truncated block header"))
+        }
+        let version: u32 = next(&mut seq)?;
+        if version != 1 && version != FEE_HEADER_VERSION {
+            return Err(de::Error::custom(format!("unsupported header version {version}")));
+        }
+        let header = BlockHeader {
+            version,
+            chain_id: next(&mut seq)?,
+            height: next(&mut seq)?,
+            timestamp: next(&mut seq)?,
+            parent_hash: next(&mut seq)?,
+            state_root: next(&mut seq)?,
+            tx_root: next(&mut seq)?,
+            receipt_root: next(&mut seq)?,
+            validator: next(&mut seq)?,
+            gas_used: next(&mut seq)?,
+            gas_limit: next(&mut seq)?,
+            extra_data: next(&mut seq)?,
+            base_fee_per_gas: 0,
+        };
+        if version >= FEE_HEADER_VERSION {
+            let base_fee: Amount = seq
+                .next_element()?
+                .ok_or_else(|| de::Error::custom("version 2 header is missing base_fee_per_gas"))?;
+            return Ok(BlockHeader { base_fee_per_gas: base_fee, ..header });
+        }
+        Ok(header)
+    }
+}
+
+/// Named-field JSON shape of a legacy header: the exact pre-fee field set.
+#[derive(Serialize, Deserialize)]
+struct HeaderJsonV1 {
+    version: u32,
+    chain_id: ChainId,
+    height: BlockHeight,
+    timestamp: Timestamp,
+    parent_hash: Hash,
+    state_root: Hash,
+    tx_root: Hash,
+    receipt_root: Hash,
+    validator: Address,
+    gas_used: Gas,
+    gas_limit: Gas,
+    extra_data: Vec<u8>,
+}
+
+/// Named-field JSON shape of a fee-enabled header. The base fee is a decimal
+/// string so `u128` survives the round trip, like genesis allocations.
+#[derive(Serialize, Deserialize)]
+struct HeaderJsonV2 {
+    version: u32,
+    chain_id: ChainId,
+    height: BlockHeight,
+    timestamp: Timestamp,
+    parent_hash: Hash,
+    state_root: Hash,
+    tx_root: Hash,
+    receipt_root: Hash,
+    validator: Address,
+    gas_used: Gas,
+    gas_limit: Gas,
+    extra_data: Vec<u8>,
+    #[serde(with = "fee_amount_decimal")]
+    base_fee_per_gas: Amount,
+}
+
+/// Try the fee-enabled shape first; a legacy document lacks the base-fee
+/// field and falls back to the 12-field shape.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HeaderJson {
+    V2(HeaderJsonV2),
+    V1(HeaderJsonV1),
+}
+
+impl HeaderJson {
+    fn into_header<D: de::Error>(self) -> Result<BlockHeader, D> {
+        match self {
+            Self::V2(json) => {
+                if json.version < FEE_HEADER_VERSION {
+                    return Err(de::Error::custom("a legacy header cannot carry a base fee"));
+                }
+                Ok(BlockHeader {
+                    version: json.version,
+                    chain_id: json.chain_id,
+                    height: json.height,
+                    timestamp: json.timestamp,
+                    parent_hash: json.parent_hash,
+                    state_root: json.state_root,
+                    tx_root: json.tx_root,
+                    receipt_root: json.receipt_root,
+                    validator: json.validator,
+                    gas_used: json.gas_used,
+                    gas_limit: json.gas_limit,
+                    extra_data: json.extra_data,
+                    base_fee_per_gas: json.base_fee_per_gas,
+                })
+            }
+            Self::V1(json) => Ok(BlockHeader {
+                version: json.version,
+                chain_id: json.chain_id,
+                height: json.height,
+                timestamp: json.timestamp,
+                parent_hash: json.parent_hash,
+                state_root: json.state_root,
+                tx_root: json.tx_root,
+                receipt_root: json.receipt_root,
+                validator: json.validator,
+                gas_used: json.gas_used,
+                gas_limit: json.gas_limit,
+                extra_data: json.extra_data,
+                base_fee_per_gas: 0,
+            }),
+        }
+    }
+}
+
+impl From<&BlockHeader> for HeaderJsonV1 {
+    fn from(header: &BlockHeader) -> Self {
+        Self {
+            version: header.version,
+            chain_id: header.chain_id,
+            height: header.height,
+            timestamp: header.timestamp,
+            parent_hash: header.parent_hash,
+            state_root: header.state_root,
+            tx_root: header.tx_root,
+            receipt_root: header.receipt_root,
+            validator: header.validator,
+            gas_used: header.gas_used,
+            gas_limit: header.gas_limit,
+            extra_data: header.extra_data.clone(),
+        }
+    }
+}
+
+impl From<&BlockHeader> for HeaderJsonV2 {
+    fn from(header: &BlockHeader) -> Self {
+        Self {
+            version: header.version,
+            chain_id: header.chain_id,
+            height: header.height,
+            timestamp: header.timestamp,
+            parent_hash: header.parent_hash,
+            state_root: header.state_root,
+            tx_root: header.tx_root,
+            receipt_root: header.receipt_root,
+            validator: header.validator,
+            gas_used: header.gas_used,
+            gas_limit: header.gas_limit,
+            extra_data: header.extra_data.clone(),
+            base_fee_per_gas: header.base_fee_per_gas,
+        }
+    }
+}
+
+/// Decimal-string codec for `Amount` in human-readable documents.
+mod fee_amount_decimal {
+    use super::Amount;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub(super) fn serialize<S: Serializer>(
+        value: &Amount,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Amount, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -408,6 +662,11 @@ pub struct GenesisConfig {
     pub block_time_ms: u64,
     pub gas_limit: Gas,
     pub genesis_time: Timestamp,
+    /// Fee market policy (S6.2, Q-017). Absent means legacy fixed-gas-price
+    /// rules, never an implicit upgrade; fee-enabled chains start from a
+    /// fresh genesis. Omitted from legacy documents so they stay byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_policy: Option<FeePolicy>,
 }
 
 impl Default for GenesisConfig {
@@ -419,6 +678,7 @@ impl Default for GenesisConfig {
             block_time_ms: DEFAULT_BLOCK_TIME_MS,
             gas_limit: BLOCK_GAS_LIMIT,
             genesis_time: unix_timestamp(),
+            fee_policy: None,
         }
     }
 }
@@ -432,14 +692,29 @@ impl GenesisConfig {
         let mut allocations: Vec<_> =
             self.allocations.iter().map(|(address, balance)| (*address, *balance)).collect();
         allocations.sort_unstable();
-        Hash::from_data(&encode_canonical(&(
-            self.chain_id,
-            &self.initial_validators,
-            allocations,
-            self.block_time_ms,
-            self.gas_limit,
-            self.genesis_time,
-        )))
+        // Legacy policy absence keeps the exact pre-fee six-field tuple, so
+        // existing bindings are byte-identical. A policy appends its canonical
+        // encoding as a seventh element; the two layouts never coexist on one
+        // chain because fee-enabled chains require a fresh genesis.
+        match &self.fee_policy {
+            None => Hash::from_data(&encode_canonical(&(
+                self.chain_id,
+                &self.initial_validators,
+                allocations,
+                self.block_time_ms,
+                self.gas_limit,
+                self.genesis_time,
+            ))),
+            Some(policy) => Hash::from_data(&encode_canonical(&(
+                self.chain_id,
+                &self.initial_validators,
+                allocations,
+                self.block_time_ms,
+                self.gas_limit,
+                self.genesis_time,
+                encode_canonical(policy),
+            ))),
+        }
     }
 
     /// Structural validation applied on every load and before every save.
@@ -456,6 +731,11 @@ impl GenesisConfig {
         }
         if self.gas_limit == 0 {
             return Err(CoreError::InvalidGenesis("gas limit must be > 0".into()));
+        }
+        if let Some(policy) = &self.fee_policy {
+            policy
+                .validate(self.gas_limit)
+                .map_err(|error| CoreError::InvalidGenesis(format!("fee policy: {error}")))?;
         }
         let mut seen = std::collections::HashSet::with_capacity(self.initial_validators.len());
         for validator in &self.initial_validators {
@@ -620,6 +900,7 @@ mod tests {
                 gas_used: 0,
                 gas_limit: BLOCK_GAS_LIMIT,
                 extra_data: Vec::new(),
+                base_fee_per_gas: 0,
             },
             transactions: vec![transaction()],
             signatures: Vec::new(),
@@ -722,6 +1003,7 @@ mod tests {
                 gas_used: 0,
                 gas_limit: BLOCK_GAS_LIMIT,
                 extra_data: Vec::new(),
+                base_fee_per_gas: 0,
             },
             transactions: vec![first.clone(), second.clone()],
             signatures: Vec::new(),
@@ -872,5 +1154,151 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         assert!(GenesisConfig::load(&path).is_err());
         assert!(GenesisConfig::load(&dir.path().join("missing.json")).is_err());
+    }
+
+    /// The exact pre-fee binary layout, encoded independently of the header's
+    /// own Serialize impl: a 12-element tuple in field order.
+    fn legacy_tuple(header: &BlockHeader) -> Vec<u8> {
+        bincode::serialize(&(
+            header.version,
+            header.chain_id,
+            header.height,
+            header.timestamp,
+            header.parent_hash,
+            header.state_root,
+            header.tx_root,
+            header.receipt_root,
+            header.validator,
+            header.gas_used,
+            header.gas_limit,
+            &header.extra_data,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_header_bytes_are_unchanged() {
+        let header = sample_block().header;
+        assert_eq!(header.version, 1);
+        assert_eq!(encode_canonical(&header), legacy_tuple(&header));
+        let decoded: BlockHeader = bincode::deserialize(&legacy_tuple(&header)).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(decoded.base_fee_per_gas, 0);
+    }
+
+    #[test]
+    fn legacy_header_stops_after_twelve_elements() {
+        // A record following the header must decode intact: the version-1
+        // decoder may not consume bytes beyond its 12 fields.
+        let header = sample_block().header;
+        let stream = bincode::serialize(&(&header, 0xdead_beef_u64)).unwrap();
+        let (decoded, tail): (BlockHeader, u64) = bincode::deserialize(&stream).unwrap();
+        assert_eq!(decoded, header);
+        assert_eq!(tail, 0xdead_beef);
+    }
+
+    #[test]
+    fn v2_header_appends_the_base_fee_and_changes_the_hash() {
+        let v1 = sample_block().header;
+        let v2 = BlockHeader { version: 2, base_fee_per_gas: 8, ..v1.clone() };
+        let mut expected = legacy_tuple(&v1);
+        // Patch the version byte pair (bincode u32 LE) and append the fee.
+        expected[0..4].copy_from_slice(&2u32.to_le_bytes());
+        expected.extend_from_slice(&8u128.to_le_bytes());
+        assert_eq!(encode_canonical(&v2), expected);
+        assert_ne!(v1.hash(), v2.hash(), "the fee is part of the commitment");
+        let decoded: BlockHeader = bincode::deserialize(&encode_canonical(&v2)).unwrap();
+        assert_eq!(decoded, v2);
+    }
+
+    #[test]
+    fn malformed_headers_are_refused() {
+        let v1 = sample_block().header;
+        // Version 2 with the fee field missing.
+        let mut truncated = legacy_tuple(&v1);
+        truncated[0..4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(bincode::deserialize::<BlockHeader>(&truncated).is_err());
+        // Unknown version.
+        let mut unknown = legacy_tuple(&v1);
+        unknown[0..4].copy_from_slice(&3u32.to_le_bytes());
+        assert!(bincode::deserialize::<BlockHeader>(&unknown).is_err());
+        // A legacy header cannot carry a fee in memory.
+        let inconsistent = BlockHeader { base_fee_per_gas: 1, ..v1 };
+        assert!(bincode::serialize(&inconsistent).is_err());
+    }
+
+    #[test]
+    fn header_json_round_trips_both_versions() {
+        let v1 = sample_block().header;
+        let json = serde_json::to_string(&v1).unwrap();
+        assert!(!json.contains("base_fee"), "legacy JSON keeps the exact field set");
+        assert_eq!(serde_json::from_str::<BlockHeader>(&json).unwrap(), v1);
+
+        let v2 = BlockHeader { version: 2, base_fee_per_gas: u128::MAX / 3, ..v1.clone() };
+        let json = serde_json::to_string(&v2).unwrap();
+        assert!(json.contains(&format!("\"{}\"", u128::MAX / 3)), "u128 as decimal string");
+        assert_eq!(serde_json::from_str::<BlockHeader>(&json).unwrap(), v2);
+        // A legacy document with a stray fee field is refused, not absorbed.
+        let stray = json.replace("\"version\":2", "\"version\":1");
+        assert!(serde_json::from_str::<BlockHeader>(&stray).is_err());
+    }
+
+    fn fee_policy() -> FeePolicy {
+        FeePolicy {
+            initial_base_fee_per_gas: 8,
+            min_base_fee_per_gas: 1,
+            max_base_fee_per_gas: Amount::MAX / u128::from(BLOCK_GAS_LIMIT),
+            elasticity_multiplier: FEE_ELASTICITY_MULTIPLIER,
+            change_denominator: FEE_CHANGE_DENOMINATOR,
+        }
+    }
+
+    #[test]
+    fn legacy_genesis_context_is_byte_identical() {
+        let mut genesis = GenesisConfig { genesis_time: 1_700_000_000, ..Default::default() };
+        genesis.allocations.insert(Address::new([5; ADDRESS_SIZE]), 42);
+        assert!(genesis.fee_policy.is_none());
+        let mut allocations: Vec<_> = genesis.allocations.iter().map(|(a, b)| (*a, *b)).collect();
+        allocations.sort_unstable();
+        let legacy = Hash::from_data(&encode_canonical(&(
+            genesis.chain_id,
+            &genesis.initial_validators,
+            allocations,
+            genesis.block_time_ms,
+            genesis.gas_limit,
+            genesis.genesis_time,
+        )));
+        assert_eq!(genesis.consensus_context(), legacy);
+
+        // The policy binds into the context and changes it.
+        genesis.fee_policy = Some(fee_policy());
+        assert_ne!(genesis.consensus_context(), legacy);
+        let mut other = fee_policy();
+        other.min_base_fee_per_gas = 2;
+        other.initial_base_fee_per_gas = 9;
+        genesis.fee_policy = Some(other);
+        assert_ne!(genesis.consensus_context(), legacy);
+    }
+
+    #[test]
+    fn genesis_fee_policy_json_is_optional_and_validated() {
+        let mut genesis = GenesisConfig { genesis_time: 1_700_000_000, ..Default::default() };
+        let legacy_json = serde_json::to_string(&genesis).unwrap();
+        assert!(!legacy_json.contains("fee_policy"), "legacy documents stay byte-stable");
+        assert_eq!(serde_json::from_str::<GenesisConfig>(&legacy_json).unwrap(), genesis);
+
+        genesis.fee_policy = Some(fee_policy());
+        assert!(genesis.validate().is_ok());
+        let json = serde_json::to_string(&genesis).unwrap();
+        assert_eq!(serde_json::from_str::<GenesisConfig>(&json).unwrap(), genesis);
+
+        let mut bad = fee_policy();
+        bad.elasticity_multiplier = 4;
+        genesis.fee_policy = Some(bad);
+        assert!(genesis.validate().is_err());
+        // Odd gas limit is refused through the policy too.
+        genesis.fee_policy = Some(fee_policy());
+        genesis.gas_limit = BLOCK_GAS_LIMIT + 1;
+        assert!(genesis.validate().is_err());
     }
 }
