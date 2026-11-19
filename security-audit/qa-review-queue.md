@@ -1,34 +1,73 @@
 # QA review queue: seat nara (track-b)
 
-Updated 2026-11-20 (tech-lead direction). Evidence logs under
-`2026-11-19-four-gate-baseline/` are kept intact (only `target/` build dirs were
-cleaned; sccache S3 cache makes rebuilds cheap).
+Updated 2026-11-21 (tech-lead direction: #89 merged, R-RET-01 Fixed, #78/#87
+records folded in). Evidence logs under `2026-11-19-four-gate-baseline/` are
+kept intact (only `target/` build dirs were cleaned; sccache S3 cache makes
+rebuilds cheap).
 
 ## Active / incoming wave
 
 | Item | Branch / PR | Scope | State | QA focus |
 | --- | --- | --- | --- | --- |
-| PR #84 | `s6.1b/mempool-persist-node` | opt-in mempool persistence consumer (Q-016/Q-038) | OPEN, reviewed approve | Track A (raka). Report: `2026-11-20-pr84-mempool-persist-review.md`. Opt-in default-off, genesis-bound, fail-closed boot (foreign/corrupt snapshot refuses). R-84-01 Low: `--mempool-persist` CLI flag promised in doc comment but not wired. Merge once cargo gates green. |
-| PR #78 | `s8/node-runtime-hooks` | S8 runtime hooks (health/finality/disk gauges) | OPEN | Track A/B. Truthful gauges, no secret labels. |
-| dewi Q-036 retention slice | (incoming) | `prune_to_height` + `retain_from` | pending publish (tech-lead pre-reviewed correct) | Track B (dewi). **Verify atomic trim + snapshot-floor refusals** (fix 3 of 003). |
-| sari block/consensus spans | (incoming) | block/consensus telemetry spans | pending publish | Track A (sari). Span cardinality / no secret labels. |
+| L2 calldata floor (bima) | `s6/calldata-floor-api`, final head `94aa940` | `CalldataPolicy::check_floor`, genesis binding, v3 accept-only codec (Q-037, ADR-015) | Pre-review APPROVE; R-L2-01 closed (`8a5f995` docs), R-L2-02 closed (`56690b7` length rule + boundary test); rebased onto `3148a4e`, patch identity verified; PR opens on green | Track A. Accept-only until L4. nara four-gate run detached at `94aa940` (`/tmp/opencode/l2-final-gates/`), results on completion. |
+| PR #88 | `s8/otlp-cli-wiring` (`fd005b8`) | S8.1 OTLP CLI wiring (Q-035) | OPEN, formal review APPROVE, no blocking | Track B (tania). Opt-in default byte-identical, non-fatal fallback, guard in runtime. Info: https for remote collectors; no auth-header field yet. Independent `--all-features` gates queued behind the activation-critical runs. |
+| PR #84 | `s6.1b/mempool-persist-node` | opt-in mempool persistence consumer (Q-016/Q-038) | OPEN, APPROVE + re-review; tech-lead mechanical rebase per ADR-016 (head `eb61fce`, patch identity independently verified: 0-line interdiff vs approved `1641df7`); gates running | Track A (raka, session unresponsive, escalated). Report: `2026-11-20-pr84-mempool-persist-review.md`. R-84-01 Low closes when yoga's stacked `--mempool-persist` flag PR lands. |
+| yoga retention flag | `yoga/retention-blocks-flag` (`a05b2d2`) | `--retention-blocks` CLI + runbook | Pre-review APPROVE (config-only, inert until the node trigger) | Track B. Q5/Q7 honored; boot warning <4096 belongs to the trigger slice. |
+| yoga mempool-persist flag | `yoga/mempool-persist-flag` (`057633d`) | `--mempool-persist` CLI | Stacked on #84; pre-review done; PR pending | Track B. Closes R-84-01. Rebase per ADR-016 consequence note after #84 merges. |
+| tania Q4 prune metrics | `s8/ledger-prune-metrics` | `subhost_ledger_prune_total{outcome}`, `subhost_ledger_base_height` | Stacked; dewi reviewed, no objection; rebase onto main after #87 merge | Track B. Three bounded labels, no `failed` outcome; gauge seeded from atomic base. |
+| raka node trigger | (pending) | prune-after-commit loop consuming `retain_from` | Blocked on session availability (escalated by tech-lead). **Prerequisite satisfied:** R-RET-01 fix merged (#89) before any trigger exists | Track A. Review against Q-036 contract: prune after commit, failure never halts, boot warning below 4096, demo single-writer caveat. |
+| sari block/consensus spans | (incoming) | block/consensus telemetry spans | pending publish | Track A. Span cardinality / no secret labels. |
 
 ## Tracked blocker: SUBHOST-2026-003 (High), three-fix ladder
 
 - **Fix 2 (suffix-only validation): MERGED** (#50). Append-time O(history) replay gone.
-- **Fix 3 (automatic retention): in progress** (Q-036, dewi). `retention_blocks`
-  config landed (#76); atomic trim + snapshot-floor slice incoming under QA.
-- **Fix 1 (calldata pricing): ladder agreed** (Q-037 L2 floor model, nara confirmed).
-  Intrinsic gas as validity floor on `gas_limit`; consumed stays `gas_limit`;
-  conservation unchanged; refunds deferred to S10. Awaiting L2–L4 (bima).
+- **Fix 3 (automatic retention): MERGED** (#87, `93aeadc`) **+ R-RET-01 fixed**
+  (#89, `3148a4e`). Mechanism verified: snapshot-floor refusals write nothing,
+  whole-segment trim + coverage invariant, manifest-before-cleanup atomicity,
+  commit-lock serialization, fail-safe head cache. **No production caller yet:**
+  the node trigger slice is pending (raka), so nothing prunes automatically on
+  main today. Reports: `2026-11-21-pr87-ledger-retention-review.md`,
+  `2026-11-21-pr89-ret-height-self-check-review.md`.
+- **Fix 1 (calldata pricing): L2 pre-reviewed, both findings closed** (Q-037,
+  ADR-015). R-L2-01 (ADR/ROADMAP overclaim) fixed in `8a5f995`; R-L2-02
+  (protocol length cap as consensus validity) fixed in `56690b7`:
+  `check_floor` refuses `data.len() > MAX_TX_DATA_BYTES` before the gas
+  comparison, boundary-tested. Final head `94aa940` awaits PR + gates + merge;
+  L3 (dewi) and L4 (bima) follow. Tech-lead L4 ruling: `header_version()` = 3
+  whenever a calldata policy is bound; no v2 production on a bound genesis.
 - **Must close before public testnet activation (S12.3).** The High closes only when
   fix 1 lands and pricing + amplification are re-verified together. Evidence:
   `2026-11-19-rpc-work-amplification/`, Q-024, Q-037.
+
+## Independent gate runs (nara)
+
+| Baseline | fmt | clippy | test | deny | Note |
+| --- | --- | --- | --- | --- | --- |
+| L2 `b75c40d` | OK | OK | killed (143) | OK | Superseded: heads moved to `94aa940`. SIGTERM was collateral of an over-broad `pkill` (acknowledged in Q-037-track-a), not a code failure. |
+| retention `11e009a` | OK | killed (143) | n/a | n/a | Superseded: merged retention files byte-identical to `93aeadc`; covered by the `671dc02` run. |
+| retfix `671dc02` (= merged #87+#89) | OK | running | running | running | Detached; completion ping authoritative. Logs `/tmp/opencode/retfix-gates/`. |
+| L2 final `94aa940` | OK | running | running | running | Detached, four OK markers + exit line. Logs `/tmp/opencode/l2-final-gates/`. |
+| OTLP `fd005b8` (#88) | queued | queued | queued | queued | `--all-features`, behind the activation-critical runs. |
+
+Gate practice (2026-11-20/21): a killed gate (exit 143 / abrupt log end) is
+never green; re-run detached (`setsid nohup`), verify FMT_OK / CLIPPY_OK /
+TEST_OK / DENY_OK plus the exit line before treating a run as green. The
+sccache server was restarted after an S3-timeout wedge; a one-off cache
+connection error around the restart means re-run, not fail. Env note:
+`/usr/local/bin/cargo` is a root wrapper forcing `CARGO_HOME=/usr/local/cargo`
+(registry cache write warnings); nara runs call `/usr/local/cargo/bin/cargo`
+directly with `CARGO_HOME=$HOME/.cargo`, same pattern as the deny workaround
+(Q-029): `RUSTUP_HOME=/usr/local/rustup CARGO_HOME=$HOME/.cargo
+CARGO=/usr/local/cargo/bin/cargo ~/.local/bin/cargo-deny --all-features check`.
 
 ## Recently reviewed and merged
 
 | PR | Scope | Outcome |
 | --- | --- | --- |
+| #89 `fix/ret-height-self-check` | R-RET-01 fix: height self-check in `block_at_height` | MERGED (`3148a4e`). APPROVE; R-RET-01 Fixed; verified on main. |
+| #87 `s12/ledger-retention` | height-based online ledger retention (003 fix 3) | MERGED (`93aeadc`). APPROVE + R-RET-01 (Medium, fixed in #89). |
+| #86 `qa/s96-complete-records` | S9.6 complete, records for #84/#85, posture sync | MERGED. |
+| #78 `s8/node-runtime-hooks` | S8 runtime hooks (health/finality/disk gauges) | MERGED (`36c41d5`). Retroactive spot-check note, no blocking issues; merged without dedicated pre-review (gap closed by the note). |
 | #85 `yoga/node-producer-credential` | S9.6 completion: `--producer-credential-file` unlock | MERGED. No blocking; S9.6 complete (#59 + #79 + #85). |
 | #82 `qa/audit-residuals-refresh` | audit residuals (003 ladder) + queue refresh | MERGED. |
 | #80 `s6.1b/pending-store-wiring` | S6.1b pending store commit-path wiring (Q-034) | MERGED. |
@@ -52,7 +91,10 @@ decision-table audit), `2026-11-19-pr59-keystore-review.md`,
 `2026-11-19-pr65-storage-fee-replay-review.md`,
 `2026-11-20-pr79-producer-bootstrap-review.md`,
 `2026-11-20-pr84-mempool-persist-review.md`,
-`2026-11-20-pr85-credential-flag-review.md`.
+`2026-11-20-pr85-credential-flag-review.md`,
+`2026-11-21-pr78-runtime-hooks-note.md`,
+`2026-11-21-pr87-ledger-retention-review.md`,
+`2026-11-21-pr89-ret-height-self-check-review.md`.
 Audit prep: `AUDIT-PACKAGE.md` (S12.2 prep only; audit + soak human/time-gated).
 
 Gate reference: four-gate baseline on `fa87215`

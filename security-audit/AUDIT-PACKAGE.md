@@ -54,15 +54,24 @@ Core, consensus, RPC, storage. Adjacent crates an auditor will also need:
   - **Fix 2 (suffix-only validation): MERGED** (#50). Append-time O(history) replay
     is gone; `segmented::persist` validates only the appended suffix on the verified
     head.
-  - **Fix 3 (automatic retention): in progress** (Q-036, dewi). `prune_to_height` +
-    `retain_from`; the `retention_blocks` config surface landed (#76); the atomic
-    trim + snapshot-floor refusals are the incoming slice under QA.
-  - **Fix 1 (calldata pricing / intrinsic gas): ladder agreed** (Q-037 L2 floor
-    model, confirmed by nara). Intrinsic gas as a validity floor on `gas_limit`;
+  - **Fix 3 (automatic retention): MERGED** (#87, `93aeadc`) **with R-RET-01
+    fixed** (#89, `3148a4e`). Snapshot-floor refusals write nothing, whole-segment
+    trim with coverage invariant, manifest-before-cleanup atomicity, commit-lock
+    serialization, fail-safe head cache. **No production caller yet:** the node
+    trigger slice is pending (raka), so nothing prunes automatically on main.
+    Reports: `2026-11-21-pr87-ledger-retention-review.md`,
+    `2026-11-21-pr89-ret-height-self-check-review.md`.
+  - **Fix 1 (calldata pricing / intrinsic gas): L2 pre-reviewed, findings
+    closed** (Q-037, ADR-015). Intrinsic gas as a validity floor on `gas_limit`;
     consumed stays `gas_limit`; conservation unchanged; refunds deferred to S10.
-    Awaiting L2–L4 implementation (bima).
+    R-L2-01 (docs overclaim) and R-L2-02 (protocol length cap in `check_floor`)
+    both fixed; final head `94aa940` awaits PR, gates and merge. L3 (dewi) and
+    L4 (bima) follow; accept-only until L4 binds the policy.
   The High closes only when fix 1 lands and the pricing + amplification mitigations
   are re-verified together (Q-024, Q-037).
+- **R-RET-01 (Medium):** fixed in #89 (merged); height self-check in
+  `block_at_height` so a concurrent online trim can never serve a wrong block;
+  regression test pins the stale-base window. Landed before any node trigger.
 - **R-57-01 (Medium):** fixed in #67 (merged); pruned historical evidence is
   unverifiable-not-fork; decision-table audited, no new halt vector.
 - Roadmap gaps (documented, not findings): per-peer rate limiting / peer scoring
@@ -100,13 +109,16 @@ wiped mid-session).
 | --- | --- | --- | --- | --- |
 | SUBHOST-2026-001 | Block gas-cap bypass | High (8.7) | Fixed | `2026-11-18-gas-cap-bypass/`; re-verified on `fa87215` (Q-024) |
 | SUBHOST-2026-002 | Wallet scrypt cost unbounded (abort) | High | Fixed (#49) | `2026-11-18-wallet-kdf-unbounded/`; bounded KDF in `subhost-wallet` |
-| SUBHOST-2026-003 | RPC work amplification / unpriced calldata | High | Partial (fix2 merged; fix3 in progress; fix1 agreed) | `2026-11-19-rpc-work-amplification/`; fix2 #50, fix3 Q-036, fix1 Q-037 L2 floor (Q-024) |
+| SUBHOST-2026-003 | RPC work amplification / unpriced calldata | High | Partial (fix2 merged; fix3 merged, trigger pending; fix1 L2 reviewed, L3/L4 pending) | `2026-11-19-rpc-work-amplification/`; fix2 #50, fix3 #87+#89, fix1 Q-037 L2 floor (Q-024) |
+| R-RET-01 | Online retention stale-base wrong-block serving | Medium | Fixed (#89 merged) | `2026-11-21-pr87-ledger-retention-review.md`, `2026-11-21-pr89-ret-height-self-check-review.md` |
 | R-57-01 | Pruning node false-halt on historical certs | Medium | Fixed (#67 merged) | `2026-11-19-pr57-native-sync-review.md` (fix verification) |
 | R-59-01 | Keystore duplicate-field rejection gap | Low | Closed (#59) | `2026-11-19-pr59-keystore-review.md` (re-review) |
 
 **Open items an auditor should prioritize:** SUBHOST-2026-003 fix 1 (calldata
-pricing, Q-037 L2 floor agreed) and fix 3 (automatic retention, Q-036 in progress);
-fix 2 (suffix validation) is merged. R-57-01 (Medium) is fixed (#67 merged; residual
+pricing, Q-037 L2 reviewed with both findings closed; L3/L4 pending). Fix 3
+(automatic retention) is merged (#87) with R-RET-01 fixed (#89), but the node
+trigger slice is still pending, so retention is not active on main yet; fix 2
+(suffix validation) is merged. R-57-01 (Medium) is fixed (#67 merged; residual
 note updated in #73). S12.2 requires closing every High/Medium.
 
 ## Security reviews performed (internal QA, not an external audit)
@@ -127,6 +139,15 @@ note updated in #73). S12.2 requires closing every High/Medium.
 - `2026-11-20-pr85-credential-flag-review.md`: S9.6 completion, node
   `--producer-credential-file` unlock (PR #85). Fail-closed unlock, owner-only
   bounded credential, no fallback/keygen, #79 PoP path; approved. S9.6 complete.
+- `2026-11-21-pr78-runtime-hooks-note.md`: S8 runtime hooks (PR #78, merged).
+  Retroactive spot-check (merged without dedicated pre-review): bounded latency
+  map, truthful health semantics, fail-safe disk gauges; no blocking issues.
+- `2026-11-21-pr87-ledger-retention-review.md`: height-based online ledger
+  retention (PR #87, merged). 003 fix 3; snapshot floor, atomicity, commit-lock
+  serialization verified; approved with R-RET-01 (Medium, fixed in #89).
+- `2026-11-21-pr89-ret-height-self-check-review.md`: R-RET-01 fix (PR #89,
+  merged). Height self-check verified on main; both interleavings safe,
+  regression test pins the race window; approved, R-RET-01 Fixed.
 - `qa-review-queue.md`: current QA queue and closed items.
 
 ## Known limitations (documented, not undisclosed findings)
