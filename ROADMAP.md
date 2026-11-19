@@ -563,7 +563,7 @@ looking traffic.
 | S8.2/S8.3 node runtime hooks | Partial: block height + health wired; finalized height, QC latency, disk stats and peer count still pending Track A (see `docs/operations/alerts.md`) |
 | S8.2 mempool event wiring | Merged (#51, Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
 | S8.1 RPC spans | Landed (Q-033, #69): per-call spans in the RPC metrics middleware, privacy-boundary tested |
-| S8.1 OTLP export | Pending (tania, Q-035): opt-in provider consuming the emitted spans |
+| S8.1 OTLP export | Provider published (tania, Q-035, `subhost-telemetry` `otlp` feature); binary wiring + Track A block/consensus spans pending |
 | S8.4 Runbooks | Complete: start/stop, key rotation, ledger repair, incident investigation + checklist (this PR); backup/restore, upgrade, certified-sync, mempool-persistence already present |
 | S8.5 Alerts | Canonical sample rules in `docs/operations/alerts.md` (height stall, no-quorum proxy, disk growth + live/gated metric table); `observability.md` keeps a summary |
 
