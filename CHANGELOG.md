@@ -289,6 +289,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Public testnet activation prep runbook (Q-012, gated by Q-037).** Added
+  `docs/operations/public-testnet-activation.md`: the activation gate (Q-037
+  calldata-pricing ladder step **L4** merged+verified AND the S9.6 encrypted
+  bootstrap loader), a fresh four-validator genesis template (chain 31338,
+  distinct keys, regenerated RFC 9380 PoP, no legacy fallback), deployment
+  revision pinning, redundant certified-history archives + private RPC tokens,
+  the running-proofs plan mapped to the fixed-suite tests, the 503 re-enable
+  steps, and the S12.3 soak/abort rules. Prep-only — activation waits on the
+  gate; no keys or tokens are committed. Docs only.
+
 - **Opt-in OTLP tracing export provider (S8.1, Q-020/Q-035).** `subhost-telemetry`
   gains an `otlp` feature; default builds carry no OpenTelemetry dependency and
   behave exactly as before. `otlp::init_with_otlp` installs a
