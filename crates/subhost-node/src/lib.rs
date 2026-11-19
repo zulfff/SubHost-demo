@@ -225,6 +225,15 @@ impl Node {
 
         let store = LedgerStore::open(chain_id, &config.data_dir)?;
         let fresh = !store.exists();
+        // Bind the policy to the store *before* `with_store` loads it: a
+        // restored version-2 ledger replays and settles with that policy, and
+        // the first persist records it in the manifest (Q-030). Offline tools
+        // supply nothing and use the recorded policy.
+        let fee_policy = genesis.as_ref().and_then(|genesis| genesis.fee_policy.clone());
+        let store = match &fee_policy {
+            Some(policy) => store.with_fee_policy(policy.clone())?,
+            None => store,
+        };
         let mut state = RpcState::with_store(store)?.with_consensus_context(protocol_context);
         // Honour the genesis block gas limit end to end: the fee policy is
         // validated against it and every produced/accepted header carries it.
@@ -235,7 +244,7 @@ impl Node {
         // A fee-enabled genesis owns the fee rules for this chain; the node
         // refuses to extend a legacy ledger with it. Absent policy keeps the
         // legacy fixed-price behaviour byte-for-byte.
-        if let Some(policy) = genesis.as_ref().and_then(|genesis| genesis.fee_policy.clone()) {
+        if let Some(policy) = fee_policy {
             state = state.with_fee_policy(policy)?;
         }
         if let Some(limit) = proposal_limit {

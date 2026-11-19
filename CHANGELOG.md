@@ -389,7 +389,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   A fee-enabled node refuses a restored legacy ledger instead of rewriting it.
   A fresh fee-enabled genesis persists its height-0 state anchor even with no
   allocations, which storage requires before the first v2 append (Q-030), and
-  the genesis block gas limit is honoured end to end.
+  the genesis block gas limit is honoured end to end. The policy is bound to
+  `LedgerStore` before `RpcState::with_store` loads it, so a restored v2 ledger
+  replays and settles with the recorded policy and the node's own persist path
+  verifies the producer credit.
   Legacy chains keep byte-identical headers, bindings and burn rules.
 
 - **Release engineering and checked optimized tests (S9).** Added exact tag/version

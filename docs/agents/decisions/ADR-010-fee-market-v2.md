@@ -122,9 +122,12 @@ must use a fresh data directory.
   policy could not extend. A restored ledger refuses a genesis limit that
   differs from its recorded headers; a default genesis is byte-identical.
 
-- Full-history replay verification is not in this slice; a restored fee-enabled
-  ledger is checked for extendability, not re-executed. Track B's storage PR
-  supplies the replay gate.
+- Replay verification is supplied by step 2 (Track B, `s6/storage-fee-replay`):
+  both re-executing paths settle v2 blocks before comparing roots, and a v2
+  history with no committed state anchor is refused. Step 3 binds the policy to
+  `LedgerStore` before `RpcState::with_store`, so the node's own load and persist
+  paths use it; `RpcState::with_fee_policy` additionally checks extendability
+  (policy bounds and gas-limit frame) rather than re-executing history itself.
 - The demo synchronous path can still seal a block and then report a failure
   for an unrelated reason (the seal-then-Err family). The underpriced include
   case is now refused up front; the remaining inconsistency is a recorded

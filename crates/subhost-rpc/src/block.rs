@@ -1443,13 +1443,17 @@ mod tests {
         let reopened = RpcState::with_data_dir(1, legacy_dir.path()).unwrap();
         assert!(matches!(reopened.with_fee_policy(fee_policy()), Err(RpcError::BlockRejected(_))));
 
-        // A fee-enabled ledger restarts under the same policy.
+        // A fee-enabled ledger restarts under the same policy. A durable store
+        // needs its height-0 anchor persisted first (Q-030); an empty seed is
+        // exactly what the node does for a fee-enabled genesis with no
+        // allocations.
         let fee_dir = tempfile::tempdir().unwrap();
         {
             let state = RpcState::with_data_dir(1, fee_dir.path())
                 .unwrap()
                 .with_fee_policy(fee_policy())
                 .unwrap();
+            state.seed_accounts([]).unwrap();
             let block = state.build_block().unwrap().unwrap();
             state.accept_block(block).unwrap();
         }
@@ -1458,5 +1462,54 @@ mod tests {
             .with_fee_policy(fee_policy())
             .expect("a v2 ledger is extendable");
         assert_eq!(reopened.block_height(), 1);
+    }
+
+    #[test]
+    fn durable_fee_enabled_chain_persists_and_restores_a_real_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let tx_key = signing_key(7);
+        let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+        let (alice_secret, _) = BLSScheme::keygen();
+        let alice = Address::new([9; 20]);
+        let registry = registry(&[(alice, &alice_secret)]);
+        let producer = RpcState::with_data_dir(1, dir.path())
+            .unwrap()
+            .with_fee_policy(fee_policy())
+            .unwrap()
+            .with_authority(
+                BlockAuthority::new(registry.clone(), alice, alice_secret.clone()).unwrap(),
+            );
+        producer.seed_accounts([(sender, 2_000_000)]).unwrap();
+
+        // Two non-empty v2 blocks, each paying a real tip. The second persist
+        // extends the verified head, so it takes the re-executing suffix path
+        // that refuses an unsettled replay.
+        let mut expected_fee = 8;
+        for nonce in 0..2 {
+            producer.submit_transaction(priced_transfer(&tx_key, nonce, 10, 10)).unwrap();
+            let block = producer.build_block().unwrap().unwrap();
+            assert_eq!(block.header.version, FEE_HEADER_VERSION);
+            assert_eq!(block.header.base_fee_per_gas, expected_fee);
+            let qc = certificate(&block, &[(alice, &alice_secret)]);
+            producer.commit_qc(block, &qc).unwrap();
+            expected_fee -= 1;
+        }
+        let gas = Amount::from(DEFAULT_TX_GAS_LIMIT);
+        // Tips are (10-8) and (10-7) per gas unit: the base fee fell between them.
+        assert_eq!(producer.balance(&alice), 5 * gas);
+        assert_eq!(producer.block_height(), 2);
+
+        // Restart: the recorded policy replays and settles the same history, so
+        // the credited tip survives and the next fee derives from the restored
+        // tip.
+        let reopened = RpcState::with_data_dir(1, dir.path())
+            .unwrap()
+            .with_fee_policy(fee_policy())
+            .unwrap()
+            .with_validators(registry);
+        assert_eq!(reopened.block_height(), 2);
+        assert_eq!(reopened.balance(&alice), 5 * gas);
+        assert_eq!(reopened.balance(&sender), 2_000_000 - 20 - 20 * gas);
+        assert_eq!(reopened.build_block().unwrap().unwrap().header.base_fee_per_gas, 6);
     }
 }

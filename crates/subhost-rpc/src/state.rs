@@ -256,7 +256,12 @@ impl RpcState {
                 ))
             })?;
         }
-        self.fee_policy = Some(policy);
+        self.fee_policy = Some(policy.clone());
+        // The store validates every persist, so it needs the same policy. The
+        // node binds it before `with_store` for a restored ledger; this keeps
+        // in-memory stores and any later attachment on the same footing.
+        // Clones share the verified-head cache, so replacing the handle is safe.
+        self.store = self.store.clone().with_fee_policy(policy)?;
         Ok(self)
     }
 

@@ -1418,11 +1418,11 @@ fn a_fee_policy_refuses_to_extend_a_legacy_data_directory() {
         Err(error) => error,
         Ok(_) => panic!("bootstrap must refuse this genesis/ledger combination"),
     };
-    assert!(
-        matches!(error, NodeError::Rpc(subhost_rpc::RpcError::BlockRejected(ref message))
-            if message.contains("legacy ledger")),
-        "the refusal must name the legacy ledger, got: {error}"
-    );
+    // Either layer may speak first: the store binds the policy before the RPC
+    // state does, so the refusal can come from storage's binding rule or from
+    // `RpcState::with_fee_policy`. Both must name the legacy incompatibility.
+    let text = error.to_string();
+    assert!(text.contains("legacy"), "the refusal must name the legacy ledger, got: {text}");
 }
 
 #[test]
