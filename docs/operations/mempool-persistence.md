@@ -119,11 +119,9 @@ subhost node --validator --data-dir DIR
 
 The flag composes with all node modes (validator, single-writer demo,
 observer); it chooses durability only. Capacity and per-sender configuration
-flags are an explicit follow-up slice (ROADMAP S6.1), not part of this opt-in.
-
-Capacity and per-sender flags are an explicit follow-up; the opt-in chooses
-durability only, and `Mempool` already enforces count, per-sender and runtime
-byte limits with persistence on or off.
+flags are an explicit follow-up slice (ROADMAP S6.1), not part of this opt-in;
+`Mempool` already enforces count, per-sender and runtime byte limits with
+persistence on or off.
 
 ## Compatibility and operator boundaries
 
