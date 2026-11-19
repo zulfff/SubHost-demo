@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-19 · historical baseline `main` = `1043268` · S0.1–S0.3, S1.1–S1.4, S4.1–S4.5, S5.1a and S5.3a merged · S2.1–S2.2, S2.3 QC API, S2.4a recovery/P2P and S5.3b implemented on the S2 branch · `Q-001`–`Q-011` agreed
+Status: 2026-11-19 · `main` = `982d3e6` · S0, S1 (through S1.4), S4 (through S4.5), S5.1a/S5.3a merged · S2 timeout/quorum + CLI policy (#46) and S3 certified-history relay (#45) merged · S8 slice 1 merged (#47) · S9 (#48), 002 wallet fix (#49), 003 storage slice (#50), S8.2 mempool events (#51) in review · `Q-001`–`Q-024` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -124,14 +124,14 @@ agent always sees the real state.
 | --- | --- | --- | --- | --- | --- |
 | S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
 | S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
-| S2 | Wire the consensus driver into the node | A | S1 | L | Partial: QC API, durable rounds, local testnet/P2P; timeout/CLI pending |
-| S3 | Fork choice, reorg, and block sync | A | S2 | L | Platform certified-history relay available; native protocol/fork choice/reorg pending |
+| S2 | Wire the consensus driver into the node | A | S1 | L | Timeout/quorum + leader recovery and CLI policy merged (#46); exit-criteria verification pending |
+| S3 | Fork choice, reorg, and block sync | A | S2 | L | Certified-history relay merged (#45); native protocol/fork choice/reorg pending |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
-| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented |
-| S6 | Durable mempool and fee market | B | S0 | M | S6.1a snapshot API in review; node/RPC consumers pending |
+| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented; S5.2 methods in progress |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a snapshot API merged (#44); fee market and node/RPC consumers pending |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
-| S8 | Observability, health, runbooks | B | S0 | M | Planned |
-| S9 | Release engineering | B | S5 | M | Planned |
+| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 merged (#47); S8.2 mempool events in review (#51); tracing/runbooks/alerts pending |
+| S9 | Release engineering | B | S5 | M | PR #48 in review (rebase pending after #47) |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
 | S12 | External audit and public testnet soak | all | S1–S9 | XL | Planned |
@@ -481,9 +481,9 @@ looking traffic.
 
 | Task | Status |
 | --- | --- |
-| S8.2/S8.3 Platform API | In review on `s8/platform-observability` (ADR-013, Q-020) |
+| S8.2/S8.3 Platform API | Merged (PR #47, ADR-013, Q-020) |
 | S8.2/S8.3 node runtime hooks | Pending Track A, after the Platform API lands |
-| S8.2 mempool event wiring | Pending Track B: `record_mempool_event` call sites in `subhost-mempool` (S6.3 lifecycle), next S8 slice |
+| S8.2 mempool event wiring | In review on `s8/mempool-event-wiring` (Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
 | S8.1 OTLP tracing, RPC spans | Pending, later S8 slices |
 | S8.4 Runbooks | Partial: `docs/operations/observability.md`; remaining runbooks pending |
 | S8.5 Alerts | Sample rules shipped in `docs/operations/observability.md` |
@@ -499,6 +499,22 @@ ledger repair, reorg investigation, incident checklist.
 **S8.5 Alerts** — sample Prometheus rules for height stall, no-quorum, disk growth.
 
 ### S9 — Release engineering (Track B)
+
+| Task | Status |
+| --- | --- |
+| S9.1 | RC/RPC-semver and tag consistency policy implemented; workspace remains 0.1.0 until reviewed version activation |
+| S9.2–S9.5 | Implemented on `s9/release-engineering`; local checks/CI review in progress |
+| S9.6 | Separate encrypted-keystore work under Q-018/ADR-011 |
+
+The pipeline prepares Linux x86_64 binaries, SBOMs, checksum/Sigstore artifacts
+and scanned signed OCI images after all seven CI gates. Candidate image scans
+precede registry publication. Test profile optimization retains assertions and
+overflow checks. No release tag or deployment is performed by this stage.
+Limits: independent full binary rebuild equality remains unverified; runtime OS
+updates may change rebuilt image content; configure a protected `release`
+environment before publication. External audit and 30-day soak remain S12 gates,
+and stable v1 publication is refused without their maintainer approval.
+See `docs/release.md` and `docs/operations/upgrade.md` (ADR-014).
 
 **S9.1 Versioning** — move to `1.0.0-rc.N`; document semver for the JSON-RPC surface.
 **S9.2 Release workflow** — tag → build → test → sign (cosign/sigstore) → SBOM

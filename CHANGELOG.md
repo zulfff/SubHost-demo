@@ -88,6 +88,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **Wallet files could abort the process through their scrypt cost parameters.**
+  `KdfParams::validate` now refuses file-supplied costs above 256 MiB of memory
+  (`128 * N * r`) or 2^22 work units (`N * r * p`) with checked arithmetic before
+  any KDF allocation, on both the encrypt and decrypt paths. Default-cost
+  wallets (N = 2^15, r = 8, p = 1) and legacy files without a `kdf` field still
+  load. Closes SUBHOST-2026-002.
 - **Ledger appends no longer re-validate the whole retained history
   (SUBHOST-2026-003, storage slice).** `LedgerStore` keeps the last fully verified
   head; a persist that extends it validates only the appended suffix, including a
@@ -232,6 +238,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Release engineering and checked optimized tests (S9).** Added exact tag/version
+  validation, an immutable compiler-image binary build, deterministic archives
+  and SHA256 inventories, pinned CycloneDX/Sigstore tooling, reusable locked CI,
+  pre-publication image scanning, and an unprivileged read-only deployment
+  template. Test builds use optimization level 1 while retaining debug assertions
+  and overflow checks. Upgrade/rollback boundaries are documented; no stable
+  release, audit completion or independent full rebuild claim is implied.
+
 - **Platform observability API (S8, ADR-013).** `Metrics::set_health` publishes
   one coherent `HealthStatus` snapshot; the exporter serves `/health/live`
   (and legacy `/health`) as liveness-only and `/health/ready` as 200 only when
@@ -246,6 +260,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   are Track A follow-up work; until they land the gauges read defaults and
   readiness stays 503. Operator guide and sample alerts:
   `docs/operations/observability.md`.
+
+- **Mempool lifecycle counters wired (S8.2, Q-026).** `Mempool::admit` buffers
+  typed `MempoolEvent`s inside the pool; the submit path's candidate clone
+  carries them, so rejected candidates drop their events and only
+  pool-committed admissions count. `Mempool::flush_events` drains the buffer into
+  `subhost_mempool_transactions_total`, called by the `eth_sendTransaction`
+  handler after a successful submit. The drain is unconditional: without a
+  registry, `Mempool::drain_events` discards the buffer, so it never grows and
+  a registry attached later counts only subsequent admissions. `expired`
+  remains registered at 0 until the S6.3 TTL path exists. `subhost-mempool`
+  now depends on `subhost-metrics`
+  (enum + flush only; no registry handle is stored in the pool).
 
 - **Corrected BLS authentication for the testnet.** RFC 9380 G2 hashing replaces
   the scalar-hash construction that allowed arbitrary signatures to be rescaled

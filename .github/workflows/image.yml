@@ -1,0 +1,56 @@
+name: Image hygiene
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: Image build and scan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          load: true
+          tags: subhost:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Verify unprivileged runtime identity
+        run: |
+          test "$(docker inspect --format '{{.Config.User}}' subhost:ci)" = subhost
+          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true subhost:ci subhost --version
+      - name: Verify shipped Rust dependency inventories
+        run: |
+          container=$(docker create subhost:ci)
+          trap 'docker rm -v "$container" >/dev/null' EXIT
+          docker cp "$container:/usr/share/subhost/sbom" ./image-sbom
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          expected = {'subhost': 'subhost-cli', 'subhost-faucet': 'subhost-faucet',
+                      'subhost-explorer': 'subhost-explorer', 'subhost-bench': 'subhost-bench'}
+          for binary, crate in expected.items():
+              bom = json.loads((Path('image-sbom') / (binary + '.cdx.json')).read_text())
+              assert bom['bomFormat'] == 'CycloneDX' and bom['components']
+              assert bom['metadata']['component']['name'] == crate
+          PY
+      - uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          version: v0.76.2
+          image-ref: subhost:ci
+          scanners: vuln
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"

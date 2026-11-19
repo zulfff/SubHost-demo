@@ -3987,6 +3987,7 @@ dependencies = [
  "blake3",
  "ed25519-dalek",
  "subhost-core",
+ "subhost-metrics",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",

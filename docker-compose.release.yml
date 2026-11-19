@@ -1,0 +1,50 @@
+# A private RPC observer using an explicitly selected immutable published image.
+# Prepare the genesis/data directory and credential file as documented in docs/release.md.
+services:
+  node:
+    image: ${SUBHOST_IMAGE:?Set SUBHOST_IMAGE to a verified ghcr.io image digest}
+    command:
+      - subhost
+      - node
+      - --data-dir
+      - /data
+      - --listen
+      - 0.0.0.0:8545
+      - --rpc-allow-public
+      - --rpc-auth-token-file
+      - /run/secrets/rpc-token
+      - --rpc-rate-limit
+      - "50"
+      - --metrics-addr
+      - 0.0.0.0:9090
+      - --p2p-listen
+      - /ip4/0.0.0.0/tcp/30333
+      - --no-mdns
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    tmpfs: [/tmp:rw,noexec,nosuid,size=64m]
+    volumes:
+      - ${SUBHOST_DATA_DIR:?Set SUBHOST_DATA_DIR to a prepared genesis/data directory}:/data
+    secrets: [rpc-token]
+    environment:
+      RUST_LOG: info
+      SUBHOST_LOG_FORMAT: json
+      SUBHOST_RPC_AUTH_TOKEN_FILE: /run/secrets/rpc-token
+    ports:
+      - "127.0.0.1:8545:8545"
+      - "127.0.0.1:9090:9090"
+      - "30333:30333"
+    restart: unless-stopped
+    healthcheck:
+      test: [CMD, subhost, query, chain, --rpc-url, "http://127.0.0.1:8545"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+secrets:
+  rpc-token:
+    file: ${SUBHOST_RPC_TOKEN_FILE:?Set SUBHOST_RPC_TOKEN_FILE to an owner-only token file}

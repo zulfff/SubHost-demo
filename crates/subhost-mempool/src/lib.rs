@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use subhost_core::{Address, Hash, Nonce, Transaction};
+use subhost_metrics::{MempoolEvent, Metrics};
 use tracing::debug;
 
 mod persistence;
@@ -82,6 +83,11 @@ pub struct Mempool {
     txs: HashMap<Hash, Transaction>,
     /// sender -> (nonce -> tx hash), keeping the per-sender nonce view cheap.
     by_sender: HashMap<Address, BTreeMap<Nonce, Hash>>,
+    /// Lifecycle events buffered since the last flush. The submit path admits
+    /// into a cloned candidate pool and drops the clone when a later step
+    /// fails, so events must travel with the pool and only reach the registry
+    /// once the candidate is committed; see [`Mempool::flush_events`].
+    events: Vec<MempoolEvent>,
 }
 
 impl Default for Mempool {
@@ -103,7 +109,7 @@ impl Mempool {
 
     pub fn try_new(config: MempoolConfig) -> Result<Self, MempoolError> {
         config.validate()?;
-        Ok(Self { config, txs: HashMap::new(), by_sender: HashMap::new() })
+        Ok(Self { config, txs: HashMap::new(), by_sender: HashMap::new(), events: Vec::new() })
     }
 
     pub fn config(&self) -> &MempoolConfig {
@@ -160,6 +166,9 @@ impl Mempool {
                 return Ok(Admission { hash: existing_hash, accepted: false, displaced: None });
             }
             displaced = self.txs.remove(&existing_hash);
+            if displaced.is_some() {
+                self.events.push(MempoolEvent::Replaced);
+            }
             if let Some(nonces) = self.by_sender.get_mut(&sender) {
                 nonces.remove(&nonce);
             }
@@ -174,6 +183,9 @@ impl Mempool {
         // (3) Global capacity: drop the cheapest transaction before inserting.
         if self.txs.len() >= self.config.max_pending {
             let evicted = self.evict_lowest_priority()?;
+            if evicted.is_some() {
+                self.events.push(MempoolEvent::Evicted);
+            }
             if displaced.is_none() {
                 displaced = evicted;
             }
@@ -181,9 +193,33 @@ impl Mempool {
 
         self.by_sender.entry(sender).or_default().insert(nonce, hash);
         self.txs.insert(hash, tx);
+        self.events.push(MempoolEvent::Admitted);
         debug!(%sender, nonce, pool_size = self.txs.len(), "mempool admitted transaction");
 
         Ok(Admission { hash, accepted: true, displaced })
+    }
+
+    /// Drain buffered lifecycle events into the registry.
+    ///
+    /// Call this only on the committed pool, after a candidate was swapped in:
+    /// events buffered in a dropped candidate vanish with it, so a rejected
+    /// submit never counts. Draining is idempotent and safe to call from any
+    /// request that observes a successful commit; the pool write lock keeps
+    /// concurrent drains from counting an event twice.
+    pub fn flush_events(&mut self, metrics: &Metrics) {
+        for event in self.events.drain(..) {
+            metrics.record_mempool_event(event);
+        }
+    }
+
+    /// Discard buffered lifecycle events without recording them.
+    ///
+    /// The no-registry counterpart of [`Self::flush_events`]: a pool whose
+    /// owner has no metrics must still drain on every flush, so the buffer
+    /// cannot grow unbounded and a registry attached later never publishes
+    /// admissions that predate it.
+    pub fn drain_events(&mut self) {
+        self.events.clear();
     }
 
     /// Drop a transaction once it is mined or expired.
@@ -558,5 +594,93 @@ mod tests {
         // `new` must never hand back an unusable pool.
         let clamped = Mempool::new(MempoolConfig { max_pending: 0, ..Default::default() });
         assert_eq!(clamped.config().max_pending, MempoolConfig::default().max_pending);
+    }
+
+    #[test]
+    fn lifecycle_events_buffer_until_flush_and_drain_once() {
+        let metrics = Metrics::new().unwrap();
+        let mut pool = Mempool::default();
+        pool.add(tx(1, 0, 10)).unwrap();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 0"));
+        pool.flush_events(&metrics);
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+    }
+
+    #[test]
+    fn drain_without_a_registry_discards_and_never_publishes_history() {
+        let mut pool = Mempool::default();
+        pool.add(tx(1, 0, 10)).unwrap();
+        pool.add(tx(2, 0, 10)).unwrap();
+        assert_eq!(pool.events.len(), 2);
+        pool.drain_events();
+        assert!(pool.events.is_empty(), "the buffer must not grow without a registry");
+        pool.drain_events();
+
+        // A registry attached later sees only admissions that follow it.
+        let metrics = Metrics::new().unwrap();
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 0"));
+        pool.add(tx(3, 0, 10)).unwrap();
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+    }
+
+    #[test]
+    fn replacement_and_eviction_buffer_typed_events() {
+        let metrics = Metrics::new().unwrap();
+        let mut pool = Mempool::new(MempoolConfig { max_pending: 2, ..Default::default() });
+        pool.add(tx(1, 0, 10)).unwrap();
+        pool.add(tx(2, 0, 5)).unwrap();
+        // Replace-by-fee on the occupied (sender, nonce) slot.
+        pool.admit(tx(1, 0, 20)).unwrap();
+        // Full pool: the cheapest transaction (sender 2) is capacity-evicted.
+        let admission = pool.admit(tx(3, 0, 30)).unwrap();
+        assert_eq!(admission.displaced.unwrap().gas_price, 5);
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 4"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"replaced\"} 1"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"evicted\"} 1"));
+    }
+
+    #[test]
+    fn dropped_candidate_events_never_reach_the_registry() {
+        let metrics = Metrics::new().unwrap();
+        let mut live = Mempool::default();
+        let mut candidate = live.clone();
+        candidate.add(tx(1, 0, 10)).unwrap();
+        // A rejected submit discards its candidate clone, events included.
+        drop(candidate);
+        live.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 0"));
+
+        // The committed path publishes exactly its own events.
+        let mut candidate = live.clone();
+        candidate.add(tx(2, 0, 10)).unwrap();
+        live = candidate;
+        live.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+    }
+
+    #[test]
+    fn idempotent_and_rejected_admissions_buffer_nothing() {
+        let metrics = Metrics::new().unwrap();
+        let mut pool = Mempool::default();
+        let first = tx(1, 0, 10);
+        pool.admit(first.clone()).unwrap();
+        pool.admit(first).unwrap();
+        assert!(!pool.admit(tx(1, 0, 5)).unwrap().accepted);
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"replaced\"} 0"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"evicted\"} 0"));
     }
 }

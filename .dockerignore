@@ -11,6 +11,9 @@ scripts/
 .editorconfig
 deny.toml
 docker-compose.yml
+docker-compose.release.yml
+dist/
+**/bom.json
 
 # Never ship secrets or local ledgers into an image.
 .env
@@ -19,3 +22,9 @@ wallets/
 node-state.bin
 genesis.json
 faucet-wallet.json
+**/producer.key
+**/producer.keystore
+**/mempool.bin
+**/ledger/
+**/genesis.json
+security-audit/

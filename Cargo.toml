@@ -124,3 +124,10 @@ strip = true
 opt-level = 3
 debug = false
 lto = "fat"
+
+# Pairing-heavy 100-QC recovery tests must exercise the unchanged protocol on
+# practical CI timescales. Keep every development safety check while optimizing.
+[profile.test]
+opt-level = 1
+debug-assertions = true
+overflow-checks = true

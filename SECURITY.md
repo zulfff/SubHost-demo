@@ -136,7 +136,9 @@ A regression in any of these is a genuine vulnerability and worth reporting.
   persist cannot leave memory ahead of disk.
 - Wallet files use scrypt (N = 2^15, r = 8, p = 1) with AES-256-GCM, are written
   atomically with `0600` permissions, and are rejected on load if the stored
-  address does not match the decrypted key.
+  address does not match the decrypted key. File-supplied scrypt costs are
+  bounded before any allocation: at most 256 MiB of memory (`128 * N * r`) and
+  2^22 work units (`N * r * p`), so a crafted wallet cannot abort the process.
 - Secret material is zeroized on drop and after use.
 - X25519 shared secrets are contributory-checked; low-order and all-zero peer keys
   are rejected.

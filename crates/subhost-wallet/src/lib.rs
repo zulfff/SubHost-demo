@@ -65,10 +65,30 @@ impl Default for KdfParams {
     }
 }
 
+/// Upper bounds for a file-supplied scrypt cost. The defaults need 32 MiB and
+/// 2^18 work units; the ceilings leave room to raise the cost later while
+/// refusing files whose allocation would abort the process (SUBHOST-2026-002).
+const MAX_KDF_MEMORY_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_KDF_WORK: u64 = 1 << 22;
+
 impl KdfParams {
-    /// Reject parameters that would be unusable or trivially cheap to brute force.
+    /// Reject parameters that are unusable, trivially cheap to brute force, or
+    /// whose memory (`128 * N * r`) and work (`N * r * p`) exceed fixed
+    /// ceilings. The checks run before `scrypt` allocates anything.
     fn validate(&self) -> Result<scrypt::Params, WalletError> {
-        if self.log_n < 14 {
+        if self.log_n < 14 || self.r == 0 || self.p == 0 {
+            return Err(WalletError::WeakKdfParameters);
+        }
+        let n = 1u64.checked_shl(self.log_n as u32).ok_or(WalletError::WeakKdfParameters)?;
+        let memory = 128u64
+            .checked_mul(n)
+            .and_then(|value| value.checked_mul(self.r as u64))
+            .ok_or(WalletError::WeakKdfParameters)?;
+        let work = n
+            .checked_mul(self.r as u64)
+            .and_then(|value| value.checked_mul(self.p as u64))
+            .ok_or(WalletError::WeakKdfParameters)?;
+        if memory > MAX_KDF_MEMORY_BYTES || work > MAX_KDF_WORK {
             return Err(WalletError::WeakKdfParameters);
         }
         scrypt::Params::new(self.log_n, self.r, self.p, SECRET_KEY_BYTES)
@@ -290,7 +310,7 @@ pub enum WalletError {
     #[error("key derivation failed")]
     KeyDerivationFailed,
 
-    #[error("scrypt parameters are below the minimum accepted cost")]
+    #[error("scrypt parameters are outside the accepted cost bounds")]
     WeakKdfParameters,
 
     #[error("encryption failed")]
@@ -492,6 +512,76 @@ mod tests {
             Err(WalletError::WeakKdfParameters)
         ));
         assert!(KdfParams::default().validate().is_ok());
+    }
+
+    #[test]
+    fn file_supplied_kdf_cost_above_the_ceilings_is_refused_before_allocation() {
+        // ~1 TiB of ROMix memory: validate must refuse it, not let scrypt abort.
+        let huge_memory = KdfParams { log_n: 30, r: 8, p: 1 };
+        assert!(matches!(huge_memory.validate(), Err(WalletError::WeakKdfParameters)));
+        assert!(matches!(
+            encrypt_private_key(&[1u8; 32], PASSWORD, huge_memory),
+            Err(WalletError::WeakKdfParameters)
+        ));
+
+        // ~128 GB asked through the parallelism factor instead of N.
+        let huge_work = KdfParams { log_n: 14, r: 1, p: 1_000_000_000 };
+        assert!(matches!(huge_work.validate(), Err(WalletError::WeakKdfParameters)));
+
+        // p alone can exceed the work ceiling at an otherwise ordinary N and r.
+        let p_only = KdfParams { log_n: 15, r: 8, p: 64 };
+        assert!(matches!(p_only.validate(), Err(WalletError::WeakKdfParameters)));
+
+        // One step above the memory ceiling.
+        let over_memory = KdfParams { log_n: 19, r: 8, p: 1 };
+        assert!(matches!(over_memory.validate(), Err(WalletError::WeakKdfParameters)));
+
+        // Checked arithmetic must refuse combinations that overflow u64.
+        let overflow = KdfParams { log_n: 63, r: u32::MAX, p: u32::MAX };
+        assert!(matches!(overflow.validate(), Err(WalletError::WeakKdfParameters)));
+        let shift_overflow = KdfParams { log_n: 64, r: 8, p: 1 };
+        assert!(matches!(shift_overflow.validate(), Err(WalletError::WeakKdfParameters)));
+
+        // Zero r/p are refused before scrypt sees them.
+        assert!(matches!(
+            KdfParams { log_n: 15, r: 0, p: 1 }.validate(),
+            Err(WalletError::WeakKdfParameters)
+        ));
+        assert!(matches!(
+            KdfParams { log_n: 15, r: 8, p: 0 }.validate(),
+            Err(WalletError::WeakKdfParameters)
+        ));
+    }
+
+    #[test]
+    fn a_crafted_wallet_file_with_an_explosive_kdf_cost_is_refused_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        Wallet::new(PASSWORD).unwrap().save(&path).unwrap();
+
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        raw["kdf"] = serde_json::json!({ "log_n": 30, "r": 8, "p": 1 });
+        std::fs::write(&path, raw.to_string()).unwrap();
+        assert!(matches!(Wallet::load(&path, PASSWORD), Err(WalletError::WeakKdfParameters)));
+    }
+
+    #[test]
+    fn kdf_cost_at_the_ceilings_and_existing_default_wallets_still_load() {
+        // Exactly at both ceilings: 256 MiB of memory and 2^22 work units.
+        let at_ceiling = KdfParams { log_n: 18, r: 8, p: 2 };
+        assert!(at_ceiling.validate().is_ok());
+        // The legacy lower bound must stay accepted, not just the default cost.
+        let at_floor = KdfParams { log_n: 14, r: 8, p: 1 };
+        assert!(at_floor.validate().is_ok());
+        assert!(KdfParams::default().validate().is_ok());
+
+        // A wallet written at the default cost must keep loading.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wallet.json");
+        Wallet::new(PASSWORD).unwrap().save(&path).unwrap();
+        let (wallet, _) = Wallet::load(&path, PASSWORD).unwrap();
+        assert_eq!(wallet.kdf, KdfParams::default());
     }
 
     #[test]

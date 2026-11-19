@@ -278,7 +278,9 @@ impl RpcServer {
     /// Pass the node's existing registry so the exporter observes these values.
     /// Labels use registered method names or `unknown`; malformed payloads,
     /// notifications and HTTP guard rejections bypass call instrumentation.
+    /// Also enables committed mempool lifecycle events (S8.2).
     pub fn with_metrics(mut self, metrics: Metrics) -> Self {
+        self.state.set_metrics(metrics.clone());
         self.metrics = Some(metrics);
         self
     }
@@ -403,7 +405,11 @@ impl RpcServer {
                 signature: TransactionSignature::from_ed25519(&signature),
                 ..unsigned
             };
-            Ok::<_, RpcError>(state.submit_transaction(tx)?.to_string())
+            let hash = state.submit_transaction(tx)?;
+            // The candidate pool was committed inside submit_transaction; publish
+            // its buffered lifecycle events. Rejected candidates dropped theirs.
+            state.flush_mempool_events();
+            Ok::<_, RpcError>(hash.to_string())
         })?;
 
         module.register_method("eth_getTransactionReceipt", |params, state, _extensions| {
@@ -753,6 +759,87 @@ mod tests {
         )
         .await;
         assert_eq!(nonce["result"], "0x1");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[test]
+    fn flush_without_a_registry_drains_and_publishes_no_history() {
+        let key = signing_key(11);
+        let mut state = funded_state(&key, 100_000);
+        // No registry attached: committed submits must still drain the buffer,
+        // so it cannot grow across the process lifetime.
+        state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+        state.flush_mempool_events();
+        state.submit_transaction(signed_transfer(&key, 1, 10)).unwrap();
+        state.flush_mempool_events();
+
+        // A registry attached later counts only admissions that follow it;
+        // the drained history above must not publish retroactively.
+        let metrics = Metrics::new().unwrap();
+        state.set_metrics(metrics.clone());
+        state.submit_transaction(signed_transfer(&key, 2, 10)).unwrap();
+        state.flush_mempool_events();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+    }
+
+    #[tokio::test]
+    async fn mempool_events_count_only_committed_submits() {
+        let key = signing_key(9);
+        let state = funded_state(&key, 100_000);
+        let metrics = Metrics::new().unwrap();
+        let (addr, handle) = RpcServer::new(state)
+            .with_metrics(metrics.clone())
+            .start(RpcServerConfig {
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                max_connections: 16,
+                security: RpcSecurityConfig::default(),
+            })
+            .await
+            .unwrap();
+
+        async fn send(addr: SocketAddr, tx: &Transaction, id: u64) -> serde_json::Value {
+            rpc_request(
+                addr,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "eth_sendTransaction",
+                    "params": [{
+                        "from": tx.from.to_string(),
+                        "to": tx.to.expect("transfer has a recipient").to_string(),
+                        "value": format!("0x{:x}", tx.value),
+                        "nonce": format!("0x{:x}", tx.nonce),
+                        "gasPrice": format!("0x{:x}", tx.gas_price),
+                        "gas": format!("0x{:x}", tx.gas_limit),
+                        "chainId": format!("0x{:x}", tx.chain_id),
+                        "data": "0x",
+                        "publicKey": format!("0x{}", hex::encode(tx.public_key)),
+                        "signature": format!("0x{}", hex::encode(tx.signature.to_ed25519())),
+                    }],
+                }),
+            )
+            .await
+        }
+
+        // A committed admission counts once.
+        let good = signed_transfer(&key, 0, 10);
+        let response = send(addr, &good, 1).await;
+        assert_eq!(response["result"].as_str(), Some(good.hash().to_string().as_str()));
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+
+        // Admitted by the pool but unexecutable against the state: the candidate
+        // is dropped after seal, so no lifecycle event may reach the registry.
+        let unexecutable = signed_transfer(&key, 1, 1_000_000);
+        let response = send(addr, &unexecutable, 2).await;
+        assert!(response["error"].is_object(), "over-balance transfer must be rejected");
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"replaced\"} 0"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"evicted\"} 0"));
 
         handle.stop().unwrap();
         handle.stopped().await;
