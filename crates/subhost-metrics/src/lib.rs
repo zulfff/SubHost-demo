@@ -9,10 +9,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use prometheus::{
-    CounterVec, Encoder, Gauge, HistogramOpts, HistogramVec, Opts, Registry, TextEncoder,
+    Counter, CounterVec, Encoder, Gauge, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
+    TextEncoder,
 };
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 /// Exporter configuration.
@@ -24,6 +26,53 @@ pub struct MetricsConfig {
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self { listen_addr: SocketAddr::from(([127, 0, 0, 1], 9090)) }
+    }
+}
+
+/// One coherent runtime-readiness snapshot, published by the node.
+///
+/// Readiness is exactly `ledger_loaded && !syncing && consensus_alive` for
+/// validator, observer and explicit single-writer demo modes alike (Q-020).
+/// `consensus_alive` is operational block-pipeline liveness, not BFT finality.
+/// The default is not ready: a node must prove each predicate, never inherit it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HealthStatus {
+    /// Genesis, ledger, validator registry and journal/archive recovery all
+    /// reconciled successfully.
+    pub ledger_loaded: bool,
+    /// An active catch-up range is in flight or waiting to complete. Ordinary
+    /// peer absence is not syncing.
+    pub syncing: bool,
+    /// The configured block pipeline task started and has not exited or
+    /// reported a fatal error. Cleared before controlled shutdown.
+    pub consensus_alive: bool,
+}
+
+impl HealthStatus {
+    /// Whether `/health/ready` may answer 200.
+    pub fn is_ready(&self) -> bool {
+        self.ledger_loaded && !self.syncing && self.consensus_alive
+    }
+}
+
+/// Bounded mempool lifecycle events (S6.3). Labels come from this enum only,
+/// never from sender input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MempoolEvent {
+    Admitted,
+    Replaced,
+    Evicted,
+    Expired,
+}
+
+impl MempoolEvent {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::Replaced => "replaced",
+            Self::Evicted => "evicted",
+            Self::Expired => "expired",
+        }
     }
 }
 
@@ -40,6 +89,12 @@ pub struct Metrics {
     connected_peers: Gauge,
     block_height: Gauge,
     pending_transactions: Gauge,
+    health: Arc<Mutex<HealthStatus>>,
+    finalized_height: Gauge,
+    qc_latency: Histogram,
+    ledger_active_bytes: Gauge,
+    ledger_snapshot_modified: Gauge,
+    mempool_events: CounterVec,
 }
 
 impl Metrics {
@@ -80,6 +135,47 @@ impl Metrics {
             "subhost_pending_transactions",
             "Number of transactions currently in the mempool",
         )?;
+        let finalized_height = Gauge::new(
+            "subhost_finalized_height",
+            "Height of the newest block committed with a verified final quorum certificate",
+        )?;
+        let qc_latency = Histogram::with_opts(
+            HistogramOpts::new(
+                "subhost_qc_commit_latency_seconds",
+                "Seconds from proposal to verified final commit, as measured by the node",
+            )
+            // 50ms to ~100s: a healthy quorum and a stalled one.
+            .buckets(prometheus::exponential_buckets(0.05, 2.0, 12)?),
+        )?;
+        let ledger_active_bytes = Gauge::new(
+            "subhost_ledger_active_bytes",
+            "On-disk bytes of the committed manifest, snapshot and segments (no replay)",
+        )?;
+        let ledger_snapshot_modified = Gauge::new(
+            "subhost_ledger_snapshot_modified_seconds",
+            "Unix timestamp of the committed snapshot file; 0 means no timestamp is available",
+        )?;
+        // Registered at zero and deliberately without an increment API: a reorg
+        // count must stay unsupported until a reviewed reorg protocol exists.
+        let reorgs = Counter::new(
+            "subhost_reorg_total",
+            "Chain reorganizations; always 0 until a reviewed reorg protocol ships",
+        )?;
+        let mempool_events = CounterVec::new(
+            Opts::new(
+                "subhost_mempool_transactions_total",
+                "Mempool lifecycle events by bounded event label",
+            ),
+            &["event"],
+        )?;
+        for event in [
+            MempoolEvent::Admitted,
+            MempoolEvent::Replaced,
+            MempoolEvent::Evicted,
+            MempoolEvent::Expired,
+        ] {
+            mempool_events.with_label_values(&[event.label()]);
+        }
 
         registry.register(Box::new(rpc_requests.clone()))?;
         registry.register(Box::new(rpc_errors.clone()))?;
@@ -87,6 +183,12 @@ impl Metrics {
         registry.register(Box::new(connected_peers.clone()))?;
         registry.register(Box::new(block_height.clone()))?;
         registry.register(Box::new(pending_transactions.clone()))?;
+        registry.register(Box::new(finalized_height.clone()))?;
+        registry.register(Box::new(qc_latency.clone()))?;
+        registry.register(Box::new(ledger_active_bytes.clone()))?;
+        registry.register(Box::new(ledger_snapshot_modified.clone()))?;
+        registry.register(Box::new(reorgs.clone()))?;
+        registry.register(Box::new(mempool_events.clone()))?;
 
         Ok(Self {
             registry: Arc::new(registry),
@@ -96,6 +198,12 @@ impl Metrics {
             connected_peers,
             block_height,
             pending_transactions,
+            health: Arc::new(Mutex::new(HealthStatus::default())),
+            finalized_height,
+            qc_latency,
+            ledger_active_bytes,
+            ledger_snapshot_modified,
+            mempool_events,
         })
     }
 
@@ -143,6 +251,53 @@ impl Metrics {
         self.pending_transactions.set(count as f64);
     }
 
+    /// Publish one coherent readiness snapshot. Replaces the previous snapshot
+    /// entirely so the three predicates can never be observed out of step.
+    pub fn set_health(&self, status: HealthStatus) {
+        *self.health.lock().expect("health mutex poisoned") = status;
+    }
+
+    /// The last published readiness snapshot.
+    pub fn health(&self) -> HealthStatus {
+        *self.health.lock().expect("health mutex poisoned")
+    }
+
+    /// Record the newest height committed with a verified final QC. Only the
+    /// node's verified commit path may call this, never a peer announcement.
+    pub fn set_finalized_height(&self, height: u64) {
+        self.finalized_height.set(height as f64);
+    }
+
+    /// Record one proposal-to-final-commit latency. Invalid samples are
+    /// dropped, matching the RPC histogram's guard.
+    pub fn record_qc_latency(&self, duration_secs: f64) {
+        if duration_secs.is_finite() && duration_secs >= 0.0 {
+            self.qc_latency.observe(duration_secs);
+        }
+    }
+
+    /// Publish a `LedgerDiskStats` measurement from `subhost-storage`. The
+    /// caller holds the commit lock while measuring. A missing snapshot
+    /// timestamp is exported as 0, documented as "unavailable", never as a
+    /// real epoch time.
+    pub fn set_ledger_disk_stats(
+        &self,
+        active_file_bytes: u64,
+        snapshot_modified: Option<SystemTime>,
+    ) {
+        self.ledger_active_bytes.set(active_file_bytes as f64);
+        let timestamp = snapshot_modified
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs_f64())
+            .unwrap_or(0.0);
+        self.ledger_snapshot_modified.set(timestamp);
+    }
+
+    /// Count one bounded mempool lifecycle event.
+    pub fn record_mempool_event(&self, event: MempoolEvent) {
+        self.mempool_events.with_label_values(&[event.label()]).inc();
+    }
+
     /// Render the registry in the Prometheus text exposition format.
     pub fn encode(&self) -> Result<Vec<u8>, MetricsError> {
         let encoder = TextEncoder::new();
@@ -151,9 +306,15 @@ impl Metrics {
         Ok(buffer)
     }
 
-    /// The exporter router, exposing `GET /metrics` and `GET /health`.
+    /// The exporter router.
+    ///
+    /// `GET /metrics` exposes the registry. `GET /health` (legacy) and
+    /// `GET /health/live` only attest that the exporter answers.
+    /// `GET /health/ready` answers 200 only when the node-published snapshot
+    /// satisfies `ledger_loaded && !syncing && consensus_alive`, else 503.
     pub fn router(&self) -> Router {
         let metrics = self.clone();
+        let ready = self.clone();
         Router::new()
             .route(
                 "/metrics",
@@ -163,6 +324,20 @@ impl Metrics {
                 }),
             )
             .route("/health", get(|| async { "ok" }))
+            .route("/health/live", get(|| async { "ok" }))
+            .route(
+                "/health/ready",
+                get(move || {
+                    let ready = ready.clone();
+                    async move {
+                        if ready.health().is_ready() {
+                            (StatusCode::OK, "ready")
+                        } else {
+                            (StatusCode::SERVICE_UNAVAILABLE, "not ready")
+                        }
+                    }
+                }),
+            )
     }
 
     fn metrics_response(&self) -> Response {
@@ -233,6 +408,12 @@ mod tests {
             "subhost_connected_peers",
             "subhost_block_height",
             "subhost_pending_transactions",
+            "subhost_finalized_height",
+            "subhost_qc_commit_latency_seconds",
+            "subhost_ledger_active_bytes",
+            "subhost_ledger_snapshot_modified_seconds",
+            "subhost_reorg_total",
+            "subhost_mempool_transactions_total",
         ] {
             assert!(rendered.contains(name), "{name} is missing from the exposition");
         }
@@ -334,6 +515,127 @@ mod tests {
         assert!(http_get(addr, "/health").await.contains("ok"));
 
         server.abort();
+    }
+
+    #[test]
+    fn default_health_is_not_ready_and_snapshots_replace_atomically() {
+        let metrics = Metrics::new().unwrap();
+        assert_eq!(metrics.health(), HealthStatus::default());
+        assert!(!metrics.health().is_ready());
+
+        // Each partial state must stay not ready.
+        for partial in [
+            HealthStatus { ledger_loaded: true, syncing: false, consensus_alive: false },
+            HealthStatus { ledger_loaded: true, syncing: true, consensus_alive: true },
+            HealthStatus { ledger_loaded: false, syncing: false, consensus_alive: true },
+        ] {
+            metrics.set_health(partial);
+            assert!(!metrics.health().is_ready());
+        }
+
+        let ready = HealthStatus { ledger_loaded: true, syncing: false, consensus_alive: true };
+        metrics.set_health(ready);
+        assert_eq!(metrics.health(), ready);
+        assert!(ready.is_ready());
+
+        // A clone shares the same snapshot, and shutdown clears readiness.
+        let clone = metrics.clone();
+        clone.set_health(HealthStatus::default());
+        assert!(!metrics.health().is_ready());
+    }
+
+    #[tokio::test]
+    async fn ready_route_refuses_until_every_predicate_holds() {
+        let metrics = Metrics::new().unwrap();
+        let listener =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = metrics.router();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        // Liveness only proves the exporter answers, even while not ready.
+        for path in ["/health", "/health/live"] {
+            let response = http_get(addr, path).await;
+            assert!(response.contains("200"), "{path}: {response}");
+        }
+        let response = http_get(addr, "/health/ready").await;
+        assert!(response.contains("503"), "default must be not ready: {response}");
+
+        metrics.set_health(HealthStatus {
+            ledger_loaded: true,
+            syncing: true,
+            consensus_alive: true,
+        });
+        let response = http_get(addr, "/health/ready").await;
+        assert!(response.contains("503"), "syncing must be not ready: {response}");
+
+        metrics.set_health(HealthStatus {
+            ledger_loaded: true,
+            syncing: false,
+            consensus_alive: true,
+        });
+        let response = http_get(addr, "/health/ready").await;
+        assert!(response.contains("200"), "coherent ready must pass: {response}");
+        assert!(response.contains("ready"));
+
+        server.abort();
+    }
+
+    #[test]
+    fn runtime_measurements_appear_in_the_exposition() {
+        let metrics = Metrics::new().unwrap();
+        metrics.set_finalized_height(41);
+        metrics.record_qc_latency(0.5);
+        metrics.set_ledger_disk_stats(
+            4096,
+            Some(UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)),
+        );
+        metrics.record_mempool_event(MempoolEvent::Admitted);
+        metrics.record_mempool_event(MempoolEvent::Admitted);
+        metrics.record_mempool_event(MempoolEvent::Evicted);
+
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_finalized_height 41"));
+        assert!(rendered.contains("subhost_qc_commit_latency_seconds_count 1"));
+        assert!(rendered.contains("subhost_ledger_active_bytes 4096"));
+        assert!(rendered.contains("subhost_ledger_snapshot_modified_seconds 1700000000"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 2"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"evicted\"} 1"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"replaced\"} 0"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"expired\"} 0"));
+        // Reorgs stay registered at zero with no increment API.
+        assert!(rendered.contains("subhost_reorg_total 0"));
+    }
+
+    #[test]
+    fn missing_snapshot_timestamp_exports_zero_not_a_fake_time() {
+        let metrics = Metrics::new().unwrap();
+        metrics.set_ledger_disk_stats(0, None);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_ledger_active_bytes 0"));
+        assert!(rendered.contains("subhost_ledger_snapshot_modified_seconds 0"));
+    }
+
+    #[test]
+    fn invalid_qc_latencies_are_ignored() {
+        let metrics = Metrics::new().unwrap();
+        for duration in [f64::NAN, -1.0, f64::INFINITY] {
+            metrics.record_qc_latency(duration);
+        }
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_qc_commit_latency_seconds_count 0"));
+    }
+
+    #[tokio::test]
+    async fn exporter_bind_failure_is_reported() {
+        let occupied =
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = occupied.local_addr().unwrap();
+        let metrics = Metrics::new().unwrap();
+        let error = metrics.serve(MetricsConfig { listen_addr: addr }).await.unwrap_err();
+        assert!(matches!(error, MetricsError::Bind { .. }));
     }
 
     async fn http_get(addr: SocketAddr, path: &str) -> String {

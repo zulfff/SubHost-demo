@@ -218,6 +218,21 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Platform observability API (S8, ADR-013).** `Metrics::set_health` publishes
+  one coherent `HealthStatus` snapshot; the exporter serves `/health/live`
+  (and legacy `/health`) as liveness-only and `/health/ready` as 200 only when
+  `ledger_loaded && !syncing && consensus_alive`, default not ready. New
+  families: `subhost_finalized_height`, `subhost_qc_commit_latency_seconds`,
+  `subhost_ledger_active_bytes`, `subhost_ledger_snapshot_modified_seconds`
+  (0 = unavailable), `subhost_reorg_total` (registered at 0, unsupported until
+  a reviewed reorg protocol) and `subhost_mempool_transactions_total{event}`
+  with bounded lifecycle labels. `LedgerStore::disk_stats()` measures the
+  committed manifest/snapshot/segment footprint without replay, excluding
+  backups and orphans and erroring on missing active data. Node runtime hooks
+  are Track A follow-up work; until they land the gauges read defaults and
+  readiness stays 503. Operator guide and sample alerts:
+  `docs/operations/observability.md`.
+
 - **Corrected BLS authentication for the testnet.** RFC 9380 G2 hashing replaces
   the scalar-hash construction that allowed arbitrary signatures to be rescaled
   from public possession proofs. Official curve vectors and direct forgery

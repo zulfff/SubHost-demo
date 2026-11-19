@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 use subhost_core::{
     encode_canonical, tx_root_of, Block, ChainId, Gas, Hash, Receipt, ReceiptStatus,
 };
@@ -109,6 +110,22 @@ pub enum MigrationOutcome {
     NothingToMigrate,
     /// The legacy file was migrated and verified by a full replay.
     Migrated { height: u64 },
+}
+
+/// On-disk footprint of the committed ledger, for the metrics exporter.
+///
+/// Measured from the validated manifest's own file references plus filesystem
+/// metadata — no block replay, no checksum verification. This is an operational
+/// measurement, not block/QC authentication. Backups and orphan files the
+/// manifest does not name are excluded. Missing or invalid active data is an
+/// error, never a false zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerDiskStats {
+    /// Actual on-disk bytes of the manifest, its snapshot and its segments.
+    pub active_file_bytes: u64,
+    /// Modification time of the committed snapshot file, when one exists.
+    /// `None` for an ephemeral/fresh store or a legacy single-file ledger.
+    pub snapshot_modified: Option<SystemTime>,
 }
 
 /// A ledger store bound to one chain ID and one data directory.
@@ -312,6 +329,31 @@ impl LedgerStore {
             return Err(StorageError::Invalid("there is no segmented ledger to prune".into()));
         }
         segmented::prune(self.chain_id, data_dir, keep_segments)
+    }
+
+    /// Measure the committed ledger's on-disk footprint without replaying it.
+    ///
+    /// The caller serializes this with [`Self::persist`]/[`Self::prune`] under
+    /// the node's commit lock so the manifest and the files it names are read
+    /// coherently. An ephemeral or fresh store reports empty metadata; a legacy
+    /// single-file ledger reports that file's size and no snapshot timestamp.
+    /// Legacy edge: a ledger file deleted after open is indistinguishable from
+    /// a fresh store without extra state, so it also reports empty metadata
+    /// (segmented stores error on a missing named file instead).
+    pub fn disk_stats(&self) -> Result<LedgerDiskStats, StorageError> {
+        let Some(path) = &self.path else {
+            return Ok(LedgerDiskStats { active_file_bytes: 0, snapshot_modified: None });
+        };
+        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
+        if segmented::manifest_path(data_dir).is_file() {
+            return segmented::disk_stats(self.chain_id, data_dir);
+        }
+        if !path.is_file() {
+            return Ok(LedgerDiskStats { active_file_bytes: 0, snapshot_modified: None });
+        }
+        let metadata =
+            fs::metadata(path).map_err(|source| StorageError::Io { path: path.clone(), source })?;
+        Ok(LedgerDiskStats { active_file_bytes: metadata.len(), snapshot_modified: None })
     }
 
     fn empty(&self) -> RestoredLedger {

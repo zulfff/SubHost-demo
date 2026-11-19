@@ -289,6 +289,45 @@ pub(crate) fn read_manifest(
     Ok(committed)
 }
 
+/// Measure the files the validated manifest names, without replaying records.
+///
+/// Every named file must exist: a missing segment or snapshot is reported as an
+/// I/O error rather than silently shrinking the measurement. Only the manifest,
+/// its snapshot and its segments count; backups and orphans are excluded.
+pub(crate) fn disk_stats(
+    chain_id: ChainId,
+    data_dir: &Path,
+) -> Result<crate::LedgerDiskStats, StorageError> {
+    let committed = read_manifest(data_dir, chain_id)?;
+    let mut total = 0u64;
+    let add = |path: PathBuf| -> Result<u64, StorageError> {
+        let metadata = fs::metadata(&path)
+            .map_err(|source| StorageError::Io { path: path.clone(), source })?;
+        Ok(metadata.len())
+    };
+    total = total
+        .checked_add(add(manifest_path(data_dir))?)
+        .ok_or_else(|| StorageError::Invalid("ledger size overflow".into()))?;
+    for segment in &committed.segments {
+        let bytes = add(segments_dir(data_dir).join(&segment.file))?;
+        total = total
+            .checked_add(bytes)
+            .ok_or_else(|| StorageError::Invalid("ledger size overflow".into()))?;
+    }
+    let snapshot_modified = if let Some(snapshot) = &committed.snapshot {
+        let path = ledger_dir(data_dir).join(&snapshot.file);
+        let metadata = fs::metadata(&path)
+            .map_err(|source| StorageError::Io { path: path.clone(), source })?;
+        total = total
+            .checked_add(metadata.len())
+            .ok_or_else(|| StorageError::Invalid("ledger size overflow".into()))?;
+        metadata.modified().ok()
+    } else {
+        None
+    };
+    Ok(crate::LedgerDiskStats { active_file_bytes: total, snapshot_modified })
+}
+
 /// Parse the six-digit index out of `NNNNNN.log`.
 fn segment_index(name: &str) -> Option<u64> {
     let digits = name.strip_suffix(".log")?;
