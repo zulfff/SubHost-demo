@@ -209,10 +209,10 @@ mesh well connected and run redundant certified-history relays so a missing
 certificate stays available.
 
 **Residual risk**: If every archive misses a block, recovery cannot manufacture
-its certificate. Per-peer rate limiting and abuse controls are still S7. A pruning
-node can currently be halted by a legitimate historical certificate for a pruned
-height (the `Historical` comparison treats an absent block as a conflict); see
-finding R-57-01 in `security-audit/2026-11-19-pr57-native-sync-review.md`.
+its certificate. Per-peer rate limiting and abuse controls are still S7. A
+historical certificate at a pruned height is unverifiable and does not halt the
+node; only a retained differing hash is accountable evidence (R-57-01, fixed in
+#67; see `security-audit/2026-11-19-pr57-native-sync-review.md`).
 
 **Detection**: Compare `eth_blockNumber` and `state_root` across nodes.
 
