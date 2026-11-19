@@ -270,6 +270,13 @@ selection; conflicting final evidence triggers accountable incident handling.
 ADR-007 lands with implementation. A deeper speculative/demo reorg needs a
 separate storage/execution contract and cannot be advertised as finalized reorg.
 
+| Task | Status |
+| --- | --- |
+| S3.1–S3.2 | Consensus classifier + halt signal (ADR-007); node buffering and readiness gating land with S3.3 |
+| S3.1 node buffering | Pending, Track A node side with S3.3 (raka): bounded candidate store, readiness gating |
+| S3.3–S3.4 | In progress on `s3.3/native-sync` (raka) |
+| S3.5 | Planned |
+
 **S3.1 Candidate selection**
 - Buffer bounded authenticated H+1 candidates by block hash and unknown-parent
   certified successors while requesting their missing certified ancestors.

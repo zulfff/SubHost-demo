@@ -555,6 +555,9 @@ pub enum ConsensusError {
 
     #[error("this replica has no validator signing key")]
     NotAValidator,
+
+    #[error("consensus driver is halted: {0}")]
+    Halted(String),
 }
 
 #[cfg(test)]

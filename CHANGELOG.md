@@ -18,6 +18,9 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   replaces a construction that allowed arbitrary signature forgery from a public
   PoP. Use fresh genesis proofs and signing/history directories; preserve old data
   and keys. Public/scalar/signature codecs retain their sizes.
+- **`ConsensusError` gained a `Halted` variant.** Code that matches the enum
+  exhaustively must handle it; signing calls return it while a conflicting-final-
+  evidence halt is active. No wire or on-disk format changes.
 - **Validator consensus has separate Prepare and final Commit phases.** Signed
   leader envelopes, phase-separated genesis-bound votes, authenticated timeout
   reports and independent views replace the linear view/height contract. All
@@ -245,6 +248,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   template. Test builds use optimization level 1 while retaining debug assertions
   and overflow checks. Upgrade/rollback boundaries are documented; no stable
   release, audit completion or independent full rebuild claim is implied.
+
+- **Certified candidate classification and finalized-fork accountability
+  (S3, ADR-007).** `ConsensusDriver::classify_final_evidence` authenticates a
+  final certificate and reports `Duplicate`, `Next`, `Conflicting`,
+  `Historical` or `MissingAncestors`, so a repeated certificate is never a fork,
+  junk evidence is a plain error, and a genuine conflict becomes an incident.
+  `halt`/`halted` stop every signature through the single signing path while
+  certified history still applies; the sticky reason is process-local, keeping
+  the `SUBVOTE2` journal format unchanged. No finalized rollback:
+  `subhost_reorg_total` stays at 0.
 
 - **Platform observability API (S8, ADR-013).** `Metrics::set_health` publishes
   one coherent `HealthStatus` snapshot; the exporter serves `/health/live`
