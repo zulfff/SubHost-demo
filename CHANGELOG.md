@@ -323,6 +323,20 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   the running-proofs plan mapped to the fixed-suite tests, the 503 re-enable
   steps, and the S12.3 soak/abort rules. Prep-only — activation waits on the
   gate; no keys or tokens are committed. Docs only.
+- **Encrypted node start-up: `subhost node --producer-credential-file`
+  (S9.6 completion, ADR-011, activation-gate item).** With `--validator`, the
+  flag unlocks `<data-dir>/producer.keystore.json` (or `--producer-key-file`)
+  through `subhost-keystore`'s owner-only credential convention and boots via
+  `Node::bootstrap_with_producer_key` (#79) — same membership/PoP checks, the
+  configured key file never read when a key is supplied. Fail-closed before
+  any validator activity: missing keystore, wrong or group-readable
+  credential, and non-keystore files all refuse start-up; no plaintext
+  fallback, no key generation. Without the flag the legacy loader path is
+  unchanged (hardened reader). Public validators can now start encrypted.
+  Docs: producer-keystore.md status/examples, start-stop.md, ADR-011 consumer
+  contract, ROADMAP S9.6 marked complete. Tests: flag requires `--validator`;
+  unlock identity via default and explicit paths; wrong/loose credential,
+  missing keystore and legacy-file-at-keystore-path refusals.
 
 - **Opt-in OTLP tracing export provider (S8.1, Q-020/Q-035).** `subhost-telemetry`
   gains an `otlp` feature; default builds carry no OpenTelemetry dependency and

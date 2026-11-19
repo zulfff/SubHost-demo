@@ -151,12 +151,14 @@ lifecycle with the bootstrap API.
   node's separate `stat`-then-open permission check is gone. Permission-bit
   refusals keep the existing `InsecureProducerKey` variant; the other refusals
   surface as `UnsafeProducerKey { path, reason }`.
-- **Remaining consumer step (Track B):** `subhost node` does not yet unlock a
-  keystore itself. The node API is in place; wiring a
-  `--producer-credential-file` flag through the CLI to
-  `bootstrap_with_producer_key` is the CLI owner's step. Until then a migrated
-  data directory still starts from the preserved legacy `producer.key`, which
-  is now read through the hardened loader.
+- **CLI node start-up (landed):** `subhost node --validator
+  --producer-credential-file FILE` unlocks the keystore (default
+  `<data-dir>/producer.keystore.json`, override with `--producer-key-file`)
+  and boots through `bootstrap_with_producer_key`. Fail-closed: a missing
+  keystore, a wrong/loose credential or a non-keystore file refuses start-up
+  before any validator activity; there is no plaintext fallback and no key
+  generation. Without the flag, a migrated data directory still starts from
+  the preserved legacy `producer.key`, read through the hardened loader.
 - **CLI init (landed here):** `subhost init --producer-credential-file` routes
   an existing producer key file by content. A keystore is unlocked with the
   credential file and fails closed without one; a legacy hex file keeps the
