@@ -50,8 +50,9 @@ RPC submissions stay pending until a final Commit-domain `n - f` QC is verified
 and durably appended. Signed leaders rotate through authenticated timeout
 certificates while prepared locks survive timeouts and restart. All consensus
 signatures bind the full genesis context. Signing obligations are journalled
-before release; historical QC replay/sync remains S3 and network abuse controls
-remain S7. This prototype still needs independent protocol review and the real
+before release; native certified-history catch-up and finalized-fork incident
+handling are implemented (S3.3, ADR-007), while transaction gossip and network
+abuse controls remain S7. This prototype still needs independent protocol review and the real
 audit/soak gates. Unsigned demo genesis requires explicit `--single-writer`.
 See `docs/consensus.md`.
 
@@ -62,12 +63,17 @@ so anyone who copies the file can produce blocks as that validator. That is
 acceptable for a testnet and not for production; `ROADMAP.md` S9.6 replaces it with
 an encrypted keystore. Back the file up as carefully as the identity it represents.
 
-**Gossip has no historical catch-up or peer scoring.** Validator nodes exchange
-producer-authenticated proposals, verified votes and QC-certified next blocks.
-Demo chains without validators accept unsigned blocks. There is no per-peer rate
-limit or request for a missed range, so an offline node cannot catch up across a
-history gap. Gossip retransmission is best effort; configured bootstrap endpoints retry with
-capped backoff after connection failure or peer restart.
+**Gossip has bounded historical catch-up but no peer scoring.** Validator nodes
+exchange producer-authenticated proposals, verified votes and QC-certified next
+blocks. Demo chains without validators accept unsigned blocks. A node behind a gap
+requests bounded `GetBlocks`/`Blocks` ranges from a peer's certified archive
+(newest 4096 pairs) and verifies every certificate and state transition in order;
+a gap beyond the retained window needs a snapshot or a fresh testnet. A conflicting
+authenticated final certificate is a durable incident that halts the node
+(`fork-incidents.bin`) until an operator resolves it; the ledger is never rolled
+back. There is no per-peer rate limit or peer scoring yet (S7). Gossip
+retransmission is best effort; configured bootstrap endpoints retry with capped
+backoff after connection failure or peer restart.
 
 **Legacy validator BLS authentication is broken and refused.** The old
 hash-and-multiply construction allows arbitrary signatures to be forged by

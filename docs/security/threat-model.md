@@ -18,22 +18,23 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
 > production and full re-validation of peer blocks; BLS-verified quorum
 > certificates with separate `n - f` Prepare/Commit quorums, genesis-bound signed
 > leaders, durable prepared locks and authenticated timeout rotation;
-> stake-deducting slashing; a
+> stake-deducting slashing with ejection (100% for double signing, 1% for
+> downtime); native bounded certified-history catch-up and durable finalized-fork
+> incident handling (halt, no rollback); a
 > libp2p gossip transport that the node uses for live block propagation; and an IBC
 > light client that verifies a single ed25519 signer's headers and Merkle
 > commitment proofs.
 >
-> **Not implemented:** request/response catch-up and authentication of every
-> historical QC on ledger replay (S3); a peer can replay certified commits in order
-> for a fresh node to follow, but the node cannot request a missing range.
-> Finalized-fork incident handling, peer scoring, an encrypted mempool, Dandelion++
-> routing, threshold encryption, inactivity leaks,
-> weak-subjectivity checkpoints, an unbonding period, validator-set rotation, an
-> encrypted producer key (S9.6), on-chain governance, EVM or WASM execution, zk
-> proofs, a Merkle Patricia Trie, non-membership proofs, multisig light clients,
-> oracle or MEV defences, an HSM program, per-IP rate limiting, in-process TLS, and
-> authentication on the metrics or faucet surfaces. JSON-RPC authentication exists
-> but is opt-in and defaults to off. There is no bug bounty.
+> **Not implemented:** peer scoring and per-peer abuse controls, and transaction
+> gossip (S7); an encrypted mempool, Dandelion++ routing, threshold encryption,
+> inactivity leaks, weak-subjectivity checkpoints, an unbonding period,
+> validator-set rotation, an encrypted producer key for node start-up (S9.6),
+> on-chain governance, EVM or WASM execution, zk proofs, a Merkle Patricia Trie,
+> non-membership proofs, multisig light clients, oracle or MEV defences, an HSM
+> program, per-IP rate limiting, in-process TLS, and authentication on the metrics
+> or faucet surfaces. A history gap beyond the retained certified window still
+> needs a snapshot or a fresh testnet. JSON-RPC authentication exists but is opt-in
+> and defaults to off. There is no bug bounty.
 >
 > `SECURITY.md` is the authoritative, code-verified statement of the current
 > posture. Where this document and `SECURITY.md` disagree, `SECURITY.md` wins.
@@ -103,13 +104,15 @@ checkpoint.
 
 **Impact**: Chain reorganization, safety violation
 
-**Mitigation**: None today. There are no weak-subjectivity checkpoints, no
-unbonding period, no validator-set rotation, and no fork-choice or light-client
-rule that refuses a deep reorganization.
+**Mitigation**: No weak-subjectivity checkpoints, no unbonding period, no
+validator-set rotation, and no fork-choice or light-client rule that refuses a
+deep reorganization. A conflicting authenticated final certificate is handled as
+a durable incident that halts the node (ADR-007), not as a reorg; this detects a
+finalized fork but does not prevent a long-range rewrite from an old checkpoint.
 
 **Residual risk**: Treat validator keys as long-lived, pin the expected chain out
 of band, and do not rely on this code for long-range safety. Checkpoints,
-unbonding, rotation, and finalized-fork handling are roadmap items (S3).
+unbonding, and rotation remain roadmap items.
 
 **Detection**: Out-of-band checkpoint and chain-identity monitoring.
 
@@ -189,16 +192,27 @@ A peer withholds a block, or two nodes produce at the same height.
 
 **Current behaviour**: With a genesis validator set, the node commits a block only
 after independently authenticating its final `n - f` Commit QC and durably
-appending it; a competing block at the same height is rejected. A fresh node can
-follow a peer that replays certified commits in order (the `sync_relay` example
-exercises 100 blocks), but it cannot request a missing range, and a peer that
-holds only the tip cannot help across a history gap. Demo chains without
-validators use `accept_block`, which accepts only the exact child of the local
-tip. Early blocks are buffered up to 64 heights ahead of the tip.
+appending it. Native catch-up (S3.3) lets a node behind a gap request bounded
+`GetBlocks`/`Blocks` ranges from a peer's certified archive (newest 4096 pairs) and
+verify every certificate and state transition in order; the request is derived
+from an authenticated certificate, a candidate past a gap is buffered (bounded,
+64) until its ancestors commit, and a catch-up with no contiguous progress for
+30 s releases signing. A gap beyond the retained window still needs a snapshot or
+a fresh testnet. Demo chains without validators use `accept_block`, which accepts
+only the exact child of the local tip; early blocks are buffered up to 64 heights.
 
-**Mitigation**: None at the protocol level for a history gap. Keep the gossip mesh
-small and well connected, and run a certified-history relay when a node must join
-an existing chain. This is a known gap, not a defended property.
+**Mitigation**: A conflicting authenticated final certificate is a durable
+incident: the node writes `fork-incidents.bin`, halts signing and readiness, and
+re-halts on restart until an operator resolves it; the append-only ledger is never
+rolled back. Duplicate and unauthenticated evidence never halt. Keep the gossip
+mesh well connected and run redundant certified-history relays so a missing
+certificate stays available.
+
+**Residual risk**: If every archive misses a block, recovery cannot manufacture
+its certificate. Per-peer rate limiting and abuse controls are still S7. A pruning
+node can currently be halted by a legitimate historical certificate for a pruned
+height (the `Historical` comparison treats an absent block as a conflict); see
+finding R-57-01 in `security-audit/2026-11-19-pr57-native-sync-review.md`.
 
 **Detection**: Compare `eth_blockNumber` and `state_root` across nodes.
 
