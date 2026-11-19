@@ -88,6 +88,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **Wallet files could abort the process through their scrypt cost parameters.**
+  `KdfParams::validate` now refuses file-supplied costs above 256 MiB of memory
+  (`128 * N * r`) or 2^22 work units (`N * r * p`) with checked arithmetic before
+  any KDF allocation, on both the encrypt and decrypt paths. Default-cost
+  wallets (N = 2^15, r = 8, p = 1) and legacy files without a `kdf` field still
+  load. Closes SUBHOST-2026-002.
 - Rejected oversized transaction admission/replacement preserves the existing
   pool and ledger state. Actual JSON gossip envelopes are checked against the
   transport budget before publication.
