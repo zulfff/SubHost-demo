@@ -352,6 +352,21 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   produces version 3 or enforces the floor until the L4 activation wiring;
   L3 (Track B) mirrors the binding in the manifest and dispatches replay from
   the header version.
+- **OTLP export wiring in the `subhost` CLI (S8.1, Q-035).** The CLI now enables
+  the `subhost-telemetry` `otlp` feature and wires the merged provider (#74):
+  a global `--otlp-endpoint <URL>` flag (env `SUBHOST_OTLP_ENDPOINT`) opts in to
+  OTLP HTTP/protobuf span export on any subcommand. Export stays off until an
+  endpoint is configured — default behaviour and log output are unchanged and no
+  exporter is constructed. Telemetry init moves inside the tokio runtime (the
+  batch processor needs a runtime context); the shutdown guard is retained for
+  the process lifetime and flushes on exit. Construction/install failure warns
+  and falls back to plain logging, never fatal; an empty endpoint behaves like
+  unset. The endpoint is used verbatim including `/v1/traces`; the exporter
+  honours `OTEL_EXPORTER_OTLP_TIMEOUT` (default 10 s). No new dependencies (the
+  otel 0.33 set landed with #74, MSRV 1.75 ≤ workspace 1.89). New tests cover
+  flag parsing, endpoint normalization, malformed-endpoint refusal and the
+  non-fatal fallback. The sync-relay example keeps plain logging (follow-up).
+  Documented in `docs/operations/observability.md`.
 
 - **Public genesis prep script (Q-012/Q-037).** Added
   `scripts/testnet/prepare-public-genesis.sh`: generates the four distinct
