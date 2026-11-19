@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 use subhost_core::{
-    encode_canonical, tx_root_of, Block, ChainId, Gas, Hash, Receipt, ReceiptStatus,
+    encode_canonical, settle_block_fees, tx_root_of, Address, Block, BlockHeader, ChainId,
+    FeePolicy, Gas, Hash, Receipt, ReceiptStatus, FEE_HEADER_VERSION,
 };
 use subhost_state::{State, StateSnapshot};
 use tracing::debug;
@@ -132,9 +133,16 @@ pub struct LedgerDiskStats {
 /// The newest head this process fully verified, kept so an append validates
 /// only the blocks it adds instead of replaying the whole retained history.
 ///
-/// It is trusted only while it matches the committed manifest (base height,
-/// head height, head hash). Any mismatch — a pruned store, a rolled-back
-/// manifest, a fresh process — falls back to the full snapshot validation.
+/// Two trust sources, one per store kind:
+/// - **durable**: trusted only while it matches the committed manifest (base
+///   height, head height, head hash). Any mismatch — a pruned store, a
+///   rolled-back manifest, a fresh process — falls back to full validation;
+/// - **ephemeral**: there is no manifest, so the cache *is* the committed
+///   record. It is trusted as the last successful in-process validation, and
+///   only an append that strictly extends it takes the suffix path.
+///
+/// Either way the cache is written only after a validation succeeded, and an
+/// unchanged or shortened history always keeps the full validation.
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedHead {
     pub base_height: u64,
@@ -165,6 +173,7 @@ pub struct LedgerStore {
     path: Option<PathBuf>,
     chain_id: ChainId,
     head: Arc<HeadCache>,
+    fee_policy: Option<FeePolicy>,
 }
 
 impl LedgerStore {
@@ -180,6 +189,7 @@ impl LedgerStore {
             path: Some(data_dir.join(LEDGER_FILE_NAME)),
             chain_id,
             head: Arc::new(Mutex::new(None)),
+            fee_policy: None,
         })
     }
 
@@ -188,7 +198,28 @@ impl LedgerStore {
         if chain_id == 0 {
             return Err(StorageError::InvalidChainId);
         }
-        Ok(Self { path: None, chain_id, head: Arc::new(Mutex::new(None)) })
+        Ok(Self { path: None, chain_id, head: Arc::new(Mutex::new(None)), fee_policy: None })
+    }
+
+    /// Bind the genesis fee policy this store replays version 2 blocks with.
+    ///
+    /// Attach it after `open`/`ephemeral` and before the first `load`/`persist`:
+    /// the node knows the policy from genesis, storage never reads a genesis
+    /// file. A durable store records it in the manifest at the first persist and
+    /// refuses any later change; offline tools pass nothing and use the recorded
+    /// policy. Clones carry it by value, like the chain id.
+    ///
+    /// Structural validation needs the chain's block gas limit, which only the
+    /// anchor or first header supplies, so it happens during replay
+    /// (`FeePolicy::initial_context`/`next_context`), not here.
+    pub fn with_fee_policy(mut self, policy: FeePolicy) -> Result<Self, StorageError> {
+        self.fee_policy = Some(policy);
+        Ok(self)
+    }
+
+    /// The policy this store was opened with, if any.
+    pub fn fee_policy(&self) -> Option<&FeePolicy> {
+        self.fee_policy.as_ref()
     }
 
     pub fn chain_id(&self) -> ChainId {
@@ -222,7 +253,7 @@ impl LedgerStore {
             Some(path) => {
                 let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
                 if segmented::manifest_path(data_dir).is_file() {
-                    segmented::load(self.chain_id, data_dir)?
+                    segmented::load(self.chain_id, data_dir, self.fee_policy.as_ref())?
                 } else if !path.is_file() {
                     self.empty()
                 } else {
@@ -241,7 +272,7 @@ impl LedgerStore {
 
     /// Validate a decoded snapshot and rebuild the in-memory ledger from it.
     pub fn restore(&self, snapshot: LedgerSnapshot) -> Result<RestoredLedger, StorageError> {
-        let state = validate_snapshot(&snapshot, self.chain_id)?;
+        let state = validate_snapshot(&snapshot, self.chain_id, self.fee_policy.as_ref())?;
         debug!(
             blocks = snapshot.blocks.len(),
             receipts = snapshot.receipts.len(),
@@ -275,7 +306,15 @@ impl LedgerStore {
         snapshot_interval: u64,
     ) -> Result<(), StorageError> {
         let Some(path) = &self.path else {
-            return validate_snapshot(snapshot, self.chain_id).map(|_| ());
+            // No filesystem, but the same validation sequence as a durable
+            // store: suffix on the verified head when it anchors the append,
+            // full validation otherwise, and the head recorded only on success.
+            return segmented::validate_ephemeral(
+                self.chain_id,
+                snapshot,
+                &self.head,
+                self.fee_policy.as_ref(),
+            );
         };
         let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
         fs::create_dir_all(data_dir)
@@ -289,6 +328,7 @@ impl LedgerStore {
             segment_max_bytes,
             snapshot_interval,
             &self.head,
+            self.fee_policy.as_ref(),
         )
     }
 
@@ -417,27 +457,222 @@ impl LedgerStore {
     }
 }
 
+/// Where a full replay starts: an already-verified state, the height it belongs
+/// to, and that block's header when one exists (height 0 is the genesis state).
+pub(crate) struct ReplayAnchor {
+    pub state: State,
+    pub height: u64,
+    pub header: Option<BlockHeader>,
+}
+
 /// Validate a snapshot against the configured chain and rebuild its state.
+///
+/// No anchor is available here (ephemeral store, legacy restore), so a version 2
+/// history is refused: replay cannot reconstruct the genesis state on its own.
 pub(crate) fn validate_snapshot(
     snapshot: &LedgerSnapshot,
     chain_id: ChainId,
+    policy: Option<&FeePolicy>,
 ) -> Result<State, StorageError> {
-    validate_snapshot_from(snapshot, chain_id, 0)
+    validate_snapshot_from(snapshot, chain_id, 0, policy, None)
 }
 
 /// Validate a snapshot whose history starts after `base_height`.
+///
+/// `anchor` is the already-verified state at a retained height. A version 2
+/// history is re-executed from it and settled per block, so the offered root is
+/// checked against a replayed one rather than trusted. A legacy history keeps
+/// the commitment-only check: no execution, no settlement.
 fn validate_snapshot_from(
     snapshot: &LedgerSnapshot,
     chain_id: ChainId,
     base_height: u64,
+    policy: Option<&FeePolicy>,
+    anchor: Option<&ReplayAnchor>,
 ) -> Result<State, StorageError> {
     if snapshot.chain_id != chain_id || snapshot.state.chain_id != chain_id {
         return Err(StorageError::ChainMismatch { expected: chain_id, got: snapshot.chain_id });
     }
-    let state = State::from_snapshot(snapshot.state.clone())
+    let offered = State::from_snapshot(snapshot.state.clone())
         .map_err(|error| StorageError::Invalid(error.to_string()))?;
+    let fee_enabled =
+        snapshot.blocks.iter().any(|block| block.header.version >= FEE_HEADER_VERSION);
+    let state = if fee_enabled {
+        let anchor = anchor.ok_or_else(|| {
+            StorageError::Invalid(
+                "a fee-enabled ledger needs a committed state anchor: persist the genesis state first"
+                    .into(),
+            )
+        })?;
+        let skip = usize::try_from(anchor.height.saturating_sub(base_height))
+            .map_err(|_| StorageError::Invalid("anchor height does not fit in memory".into()))?;
+        let blocks = snapshot.blocks.get(skip..).ok_or_else(|| {
+            StorageError::Invalid("anchor height is beyond the offered history".into())
+        })?;
+        let mut state = anchor.state.clone();
+        replay_blocks(
+            blocks,
+            anchor.header.as_ref(),
+            policy,
+            &mut state,
+            "on the committed anchor",
+        )?;
+        if state.root() != offered.root() {
+            return Err(StorageError::Invalid(
+                "offered state does not match the replayed history".into(),
+            ));
+        }
+        state
+    } else {
+        offered
+    };
     validate_chain_from(base_height, &snapshot.blocks, &snapshot.receipts, chain_id, &state)?;
     Ok(state)
+}
+
+/// Bind the recorded fee policy to the one this call supplies (Q-030 rules 1-4).
+///
+/// `committed` says whether a manifest or legacy record already exists: a fresh
+/// store has nothing recorded yet and may take a supplied policy, while a
+/// committed ledger that records none cannot hold version 2 blocks at all.
+/// `persisting` separates the two asymmetries: `load` with no supplied policy
+/// uses the recorded one (offline tools), `persist` refuses to drop it.
+pub(crate) fn bind_fee_policy(
+    recorded: Option<&FeePolicy>,
+    supplied: Option<&FeePolicy>,
+    blocks: &[Block],
+    committed: bool,
+    persisting: bool,
+) -> Result<Option<FeePolicy>, StorageError> {
+    let has_v2 = blocks.iter().any(|block| block.header.version >= FEE_HEADER_VERSION);
+    let has_legacy = blocks.iter().any(|block| block.header.version < FEE_HEADER_VERSION);
+    if let (Some(recorded), Some(supplied)) = (recorded, supplied) {
+        if recorded != supplied {
+            return Err(StorageError::Invalid(
+                "supplied fee policy differs from the recorded one".into(),
+            ));
+        }
+    }
+    if recorded.is_some() && has_legacy {
+        return Err(StorageError::Invalid(
+            "a fee-enabled ledger cannot contain legacy version 1 blocks".into(),
+        ));
+    }
+    if committed && recorded.is_none() && has_v2 {
+        return Err(StorageError::Invalid(
+            "version 2 blocks in a ledger that records no fee policy".into(),
+        ));
+    }
+    if supplied.is_some() && recorded.is_none() && has_legacy {
+        return Err(StorageError::Invalid(
+            "a fee policy cannot be bound to a legacy version 1 ledger".into(),
+        ));
+    }
+    if persisting && committed && recorded.is_some() && supplied.is_none() && has_v2 {
+        return Err(StorageError::Invalid(
+            "persist cannot drop the recorded fee policy of a fee-enabled ledger".into(),
+        ));
+    }
+    if has_v2 && recorded.is_none() && supplied.is_none() {
+        return Err(StorageError::Invalid(
+            "a fee-enabled ledger needs a fee policy: persist the genesis state first".into(),
+        ));
+    }
+    Ok(recorded.or(supplied).cloned())
+}
+
+/// Execute `blocks` on `state`, settling version 2 fees once per block.
+///
+/// `parent` is the header immediately before `blocks[0]`, taken from the offered
+/// snapshot or the retained history — never from the cache. With no parent the
+/// first block uses the genesis initial fee. The producer credit happens after
+/// every transaction of the block, so a tip is never spendable inside its own
+/// block, and the recorded base fee must equal the derived one.
+///
+/// Legacy blocks are executed without settlement, which is what restore has
+/// always done; a legacy block inside a fee-enabled history is refused.
+pub(crate) fn replay_blocks(
+    blocks: &[Block],
+    parent: Option<&BlockHeader>,
+    policy: Option<&FeePolicy>,
+    state: &mut State,
+    anchor: &str,
+) -> Result<(), StorageError> {
+    let fee_enabled = blocks.iter().any(|block| block.header.version >= FEE_HEADER_VERSION);
+    let policy = if fee_enabled {
+        Some(policy.ok_or_else(|| {
+            StorageError::Invalid("a version 2 block requires a fee policy".into())
+        })?)
+    } else {
+        None
+    };
+    let limit = parent.map_or_else(
+        || blocks.first().map_or(0, |block| block.header.gas_limit),
+        |header| header.gas_limit,
+    );
+    let mut previous = parent;
+    for block in blocks {
+        let height = block.header.height;
+        if let Some(policy) = policy {
+            if block.header.version < FEE_HEADER_VERSION {
+                return Err(StorageError::Invalid(format!(
+                    "block {height} mixes a legacy header into a fee-enabled history"
+                )));
+            }
+            let context = match previous {
+                Some(parent) => policy.next_context(parent, limit),
+                None => policy.initial_context(limit),
+            }
+            .map_err(|error| {
+                StorageError::Invalid(format!(
+                    "cannot derive the fee context for block {height}: {error}"
+                ))
+            })?;
+            if block.header.base_fee_per_gas != context.base_fee_per_gas {
+                return Err(StorageError::Invalid(format!(
+                    "block {height} records base fee {} but the policy derives {}",
+                    block.header.base_fee_per_gas, context.base_fee_per_gas
+                )));
+            }
+            let mut debited = 0u128;
+            for transaction in &block.transactions {
+                let fee = state.apply_transaction(transaction).map_err(|error| {
+                    StorageError::Invalid(format!("cannot replay block {height} {anchor}: {error}"))
+                })?;
+                debited = debited.checked_add(fee).ok_or_else(|| {
+                    StorageError::Invalid(format!("block {height} debited fees overflow"))
+                })?;
+            }
+            let settlement = settle_block_fees(
+                &context,
+                block.transactions.iter().map(|transaction| (transaction, transaction.gas_limit)),
+            )
+            .map_err(|error| {
+                StorageError::Invalid(format!("cannot settle block {height} fees: {error}"))
+            })?;
+            if settlement.total != debited {
+                return Err(StorageError::Invalid(format!(
+                    "block {height} breaks fee conservation: settled {} but debited {debited}",
+                    settlement.total
+                )));
+            }
+            let producer =
+                (block.header.validator != Address::ZERO).then_some(block.header.validator);
+            state.credit_block_priority(producer, settlement.priority).map_err(|error| {
+                StorageError::Invalid(format!(
+                    "cannot credit block {height} priority fees: {error}"
+                ))
+            })?;
+        } else {
+            for transaction in &block.transactions {
+                state.apply_transaction(transaction).map_err(|error| {
+                    StorageError::Invalid(format!("cannot replay block {height} {anchor}: {error}"))
+                })?;
+            }
+        }
+        previous = Some(&block.header);
+    }
+    Ok(())
 }
 
 /// Commitment for one successful receipt.

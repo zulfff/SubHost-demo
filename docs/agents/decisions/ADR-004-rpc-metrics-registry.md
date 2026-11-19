@@ -52,7 +52,7 @@ ready and excludes socket delivery time.
 
 ## Evidence
 
-- https://docs.rs/jsonrpsee-server/0.24.11/jsonrpsee_server/middleware/rpc/trait.RpcServiceT.html — decoded-call middleware returns `MethodResponse` (verified 2026-11-18).
-- https://github.com/paritytech/jsonrpsee/blob/v0.24.11/server/src/server.rs — notifications, parse failures and invalid requests bypass call middleware (verified against the cached 0.24.11 source, 2026-11-18).
-- https://prometheus.io/docs/practices/instrumentation/ — label cardinality determines the number of time series (verified 2026-11-18).
-- `crates/subhost-node/src/lib.rs`, `Node::run` — exporter owns `self.metrics` while the current RPC constructor receives only the state.
+- https://docs.rs/jsonrpsee-server/0.24.11/jsonrpsee_server/middleware/rpc/trait.RpcServiceT.html: decoded-call middleware returns `MethodResponse` (verified 2026-11-18).
+- https://github.com/paritytech/jsonrpsee/blob/v0.24.11/server/src/server.rs: notifications, parse failures and invalid requests bypass call middleware (verified against the cached 0.24.11 source, 2026-11-18).
+- https://prometheus.io/docs/practices/instrumentation/: label cardinality determines the number of time series (verified 2026-11-18).
+- `crates/subhost-node/src/lib.rs`, `Node::run`: exporter owns `self.metrics` while the current RPC constructor receives only the state.

@@ -238,10 +238,25 @@ Durability and integrity:
   head, every commitment, and a full `State::apply_transaction` replay of the suffix
   on the cached head state, so a transaction the committed state cannot apply (a
   replay, a skipped nonce) is refused even when its commitments are honest. The
-  offered state root must equal the replayed root. Otherwise — no cache yet, a
-  legacy file, a pruned or rolled-back manifest, an unchanged history — the whole
+  offered state root must equal the replayed root. Otherwise (no cache yet, a
+  legacy file, a pruned or rolled-back manifest, an unchanged history) the whole
   offered history is validated as before. The cache is populated by a successful
-  load and updated only after a manifest commit succeeds.
+  load and updated only after a manifest commit succeeds. An ephemeral store has
+  no manifest, so its cache *is* the committed record: it anchors the suffix the
+  same way, and an unchanged history replays zero blocks against it;
+- a fee-enabled (version 2) history is re-executed and settled in **both** paths,
+  not only the suffix: the full path replays from the committed snapshot anchor,
+  derives each block's fee context from its parent header (`initial_context` at
+  height 1), checks the recorded `base_fee_per_gas` against the derived one,
+  aggregates with `settle_block_fees`, verifies per-block conservation against
+  the fees actually debited, and credits the producer once at end of block before
+  comparing roots. The policy is bound fail-closed through `manifest.json`'s
+  `fee_policy` (Q-030): no recorded policy with v2 blocks, a differing supplied
+  policy, a policy on a legacy ledger, or a persist dropping a recorded policy
+  are all refused; `load` with no supplied policy uses the recorded one. A v2
+  history with no committed anchor is refused, naming the fix: persist the
+  genesis state first. Legacy v1 histories are unchanged: no execution in the
+  full path, no settlement, no credit;
 
 Determinism:
 

@@ -44,7 +44,7 @@ everything else is track B. Track A's six conditions are accepted:
 
 1. `NodeConfig::new` sets `rpc_security: RpcSecurityConfig::default()`, so every
    existing constructor and test keeps compiling and stays default-off.
-2. `subhost-rpc::start` — not the caller — refuses a non-loopback bind unless
+2. `subhost-rpc::start` (not the caller) refuses a non-loopback bind unless
    `allow_public` **and** a token are both set (`RpcServeError::BindPolicy`).
 3. A non-loopback refusal has a test that binds a routable address, so the rule
    cannot regress into a comment.
