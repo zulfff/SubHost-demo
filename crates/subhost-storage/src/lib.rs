@@ -132,9 +132,16 @@ pub struct LedgerDiskStats {
 /// The newest head this process fully verified, kept so an append validates
 /// only the blocks it adds instead of replaying the whole retained history.
 ///
-/// It is trusted only while it matches the committed manifest (base height,
-/// head height, head hash). Any mismatch — a pruned store, a rolled-back
-/// manifest, a fresh process — falls back to the full snapshot validation.
+/// Two trust sources, one per store kind:
+/// - **durable**: trusted only while it matches the committed manifest (base
+///   height, head height, head hash). Any mismatch — a pruned store, a
+///   rolled-back manifest, a fresh process — falls back to full validation;
+/// - **ephemeral**: there is no manifest, so the cache *is* the committed
+///   record. It is trusted as the last successful in-process validation, and
+///   only an append that strictly extends it takes the suffix path.
+///
+/// Either way the cache is written only after a validation succeeded, and an
+/// unchanged or shortened history always keeps the full validation.
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedHead {
     pub base_height: u64,
@@ -275,7 +282,10 @@ impl LedgerStore {
         snapshot_interval: u64,
     ) -> Result<(), StorageError> {
         let Some(path) = &self.path else {
-            return validate_snapshot(snapshot, self.chain_id).map(|_| ());
+            // No filesystem, but the same validation sequence as a durable
+            // store: suffix on the verified head when it anchors the append,
+            // full validation otherwise, and the head recorded only on success.
+            return segmented::validate_ephemeral(self.chain_id, snapshot, &self.head);
         };
         let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
         fs::create_dir_all(data_dir)

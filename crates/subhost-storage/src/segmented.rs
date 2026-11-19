@@ -780,6 +780,44 @@ fn validate_appended_suffix(
     let start = usize::try_from(committed_records).map_err(|_| {
         StorageError::Invalid("retained record count does not fit in memory".into())
     })?;
+    validate_suffix_on(cached, start, snapshot, chain_id)
+}
+
+/// Validate the blocks an ephemeral store appends on top of its last successful
+/// validation.
+///
+/// There is no manifest to match against: for an ephemeral store the cache *is*
+/// the committed record, so it anchors the suffix on its own. Every other trust
+/// condition is the durable one — a missing cache, an unchanged or shortened
+/// history, or a rewritten prefix falls back to the full validation.
+fn validate_ephemeral_suffix(
+    head_cache: &HeadCache,
+    snapshot: &LedgerSnapshot,
+    chain_id: ChainId,
+) -> Result<Option<State>, StorageError> {
+    let guard = lock_cache(head_cache);
+    let Some(cached) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let Some(retained) = cached.height.checked_sub(cached.base_height) else {
+        return Ok(None);
+    };
+    let start = usize::try_from(retained)
+        .map_err(|_| StorageError::Invalid("retained record count does not fit in memory".into()))?;
+    validate_suffix_on(cached, start, snapshot, chain_id)
+}
+
+/// Validate only the append: `start` counts the already-verified blocks the
+/// offered snapshot carries, so `snapshot.blocks[start..]` is what is new.
+///
+/// The parent header comes from the offered snapshot, never from the cache: the
+/// block at `start - 1` is the verified head, whose hash the cache already pins.
+fn validate_suffix_on(
+    cached: &VerifiedHead,
+    start: usize,
+    snapshot: &LedgerSnapshot,
+    chain_id: ChainId,
+) -> Result<Option<State>, StorageError> {
     // Only growth is covered here. An unchanged or shortened history keeps the
     // full validation, which must also re-check the offered prefix: genesis
     // seeding legitimately persists a changed state at height 0.
@@ -835,6 +873,32 @@ fn validate_appended_suffix(
     Ok(Some(state))
 }
 
+/// Validate an ephemeral persist and record the head it verified.
+///
+/// Same sequence as the durable path: suffix validation when the cache anchors
+/// the append, full validation otherwise, append-only against the verified head,
+/// and the cache updated only after everything succeeded. Nothing is written to
+/// disk; the cache is the only record an ephemeral store keeps.
+pub(crate) fn validate_ephemeral(
+    chain_id: ChainId,
+    snapshot: &LedgerSnapshot,
+    head_cache: &HeadCache,
+) -> Result<(), StorageError> {
+    let new_height = snapshot.blocks.last().map_or(0, |block| block.header.height);
+    let verified = match validate_ephemeral_suffix(head_cache, snapshot, chain_id)? {
+        Some(state) => state,
+        None => crate::validate_snapshot(snapshot, chain_id)?,
+    };
+    check_ephemeral_append_only(head_cache, snapshot, new_height)?;
+    *lock_cache(head_cache) = Some(VerifiedHead {
+        base_height: 0,
+        height: new_height,
+        hash: snapshot.blocks.last().map_or(Hash::ZERO, Block::hash),
+        state: verified,
+    });
+    Ok(())
+}
+
 /// Read whatever history the directory currently commits to: the manifest if it
 /// exists, otherwise a legacy single file.
 fn read_previous(
@@ -872,19 +936,48 @@ fn check_append_only(
     let Some(previous) = previous else {
         return Ok(());
     };
-    if new_height < previous.head_height {
+    check_head_unchanged(
+        previous.head_height,
+        previous.base_height,
+        previous.head_hash,
+        snapshot,
+        new_height,
+    )
+}
+
+/// The ephemeral counterpart: the verified head is the only committed record, so
+/// it is what a rewrite would have to contradict.
+fn check_ephemeral_append_only(
+    head_cache: &HeadCache,
+    snapshot: &LedgerSnapshot,
+    new_height: u64,
+) -> Result<(), StorageError> {
+    let guard = lock_cache(head_cache);
+    let Some(cached) = guard.as_ref() else {
+        return Ok(());
+    };
+    check_head_unchanged(cached.height, cached.base_height, cached.hash, snapshot, new_height)
+}
+
+fn check_head_unchanged(
+    head_height: u64,
+    base_height: u64,
+    head_hash: Hash,
+    snapshot: &LedgerSnapshot,
+    new_height: u64,
+) -> Result<(), StorageError> {
+    if new_height < head_height {
         return Err(StorageError::NonAppendPersist);
     }
-    if previous.head_height > 0 {
-        let index = previous
-            .head_height
-            .checked_sub(previous.base_height)
+    if head_height > 0 {
+        let index = head_height
+            .checked_sub(base_height)
             .and_then(|offset| offset.checked_sub(1))
             .ok_or(StorageError::NonAppendPersist)?;
         let index = usize::try_from(index)
             .map_err(|_| StorageError::Invalid("block height overflow".into()))?;
         let carried = snapshot.blocks.get(index).ok_or(StorageError::NonAppendPersist)?;
-        if carried.header.height != previous.head_height || carried.hash() != previous.head_hash {
+        if carried.header.height != head_height || carried.hash() != head_hash {
             return Err(StorageError::NonAppendPersist);
         }
     }
