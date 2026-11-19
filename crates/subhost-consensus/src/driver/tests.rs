@@ -1193,3 +1193,34 @@ fn the_halt_reason_is_process_local_and_never_serialized() {
         "the node persists and re-applies the incident outside the checkpoint"
     );
 }
+
+#[test]
+fn a_halted_driver_refuses_the_commit_vote_when_the_prepare_quorum_forms() {
+    let (_, _, mut drivers) = setup(4);
+    let first = block(1, Hash::ZERO, 1);
+    let (proposal, _) = drivers[0].propose(first).unwrap();
+    let prepares: Vec<_> = [0, 1, 2]
+        .into_iter()
+        .map(|i| drivers[i].observe_proposal(proposal.clone()).unwrap().unwrap())
+        .collect();
+    // Halt after the Prepare vote, before the Commit phase can be signed.
+    drivers[1].halt(HaltReason::ConflictingFinalEvidence { height: 1 });
+    drivers[1].record_vote(prepares[0].clone()).unwrap();
+    drivers[1].record_vote(prepares[1].clone()).unwrap();
+    assert!(matches!(drivers[1].record_vote(prepares[2].clone()), Err(ConsensusError::Halted(_))));
+    assert!(drivers[1].own_commit_vote().is_none());
+    assert!(drivers[1].pending_qc().is_none());
+}
+
+#[test]
+fn a_halted_driver_refuses_to_sign_a_view_change_report() {
+    let (_, _, mut drivers) = setup(4);
+    let first = block(1, Hash::ZERO, 1);
+    let (proposal, _) = drivers[0].propose(first).unwrap();
+    drivers[1].observe_proposal(proposal).unwrap();
+    assert!(drivers[1].tick(Duration::ZERO).unwrap().is_none(), "arms the deadline");
+    drivers[1].halt(HaltReason::ConflictingFinalEvidence { height: 1 });
+    assert!(matches!(drivers[1].tick(Duration::from_millis(2000)), Err(ConsensusError::Halted(_))));
+    assert!(drivers[1].own_view_change().is_none());
+    assert_eq!(drivers[1].view(), 1, "a refused timeout must not advance the view");
+}
