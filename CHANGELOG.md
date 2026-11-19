@@ -245,6 +245,19 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Operations runbooks and sample alerts (S8.4/S8.5).** Added
+  `docs/operations/` runbooks for start/stop, producer key handling and rotation,
+  ledger diagnosis/recovery, conflicting-final-evidence incident investigation,
+  and an incident checklist; they cross-link the existing backup/restore,
+  upgrade, certified-sync and mempool-persistence guides. Added
+  `docs/operations/alerts.md` as the canonical sample Prometheus rules (height
+  stall, a no-quorum finality-stall proxy, disk growth, finality lag, QC latency,
+  RPC errors, not-ready) with a table of which metrics are live versus still
+  gated on node call-sites; `observability.md` now points to it. Docs only — no
+  code, metric or API change. Rotation is documented as genesis-bound (no online
+  validator-set change protocol), and ledger recovery as restore-from-backup
+  (append-only, no in-place rewrite of finalized history).
+
 - **Encrypted producer keystore (S9.6, ADR-011).** New Track B crate
   `subhost-keystore`: purpose-specific JSON v1 (`subhost-producer-keystore/v1`,
   explicitly not ERC-2335) wrapping the canonical 32-byte BLS scalar in

@@ -537,11 +537,11 @@ looking traffic.
 | Task | Status |
 | --- | --- |
 | S8.2/S8.3 Platform API | Merged (PR #47, ADR-013, Q-020) |
-| S8.2/S8.3 node runtime hooks | Pending Track A, after the Platform API lands |
+| S8.2/S8.3 node runtime hooks | Partial: block height + health wired; finalized height, QC latency, disk stats and peer count still pending Track A (see `docs/operations/alerts.md`) |
 | S8.2 mempool event wiring | Merged (#51, Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
 | S8.1 OTLP tracing, RPC spans | Pending, later S8 slices |
-| S8.4 Runbooks | Partial: `docs/operations/observability.md`; remaining runbooks pending |
-| S8.5 Alerts | Sample rules shipped in `docs/operations/observability.md` |
+| S8.4 Runbooks | Complete: start/stop, key rotation, ledger repair, incident investigation + checklist (this PR); backup/restore, upgrade, certified-sync, mempool-persistence already present |
+| S8.5 Alerts | Canonical sample rules in `docs/operations/alerts.md` (height stall, no-quorum proxy, disk growth + live/gated metric table); `observability.md` keeps a summary |
 
 **S8.1 Tracing** — OpenTelemetry OTLP export behind a feature flag; spans for
 `accept_block`, `seal_block`, consensus steps, and RPC methods.
