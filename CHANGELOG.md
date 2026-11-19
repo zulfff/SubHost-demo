@@ -14,6 +14,21 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **Mempool calldata default tightened and eviction ranks by fee density
+  (Q-037 L0, interim mitigation C).** `max_tx_data_bytes` defaults to 16 KiB
+  instead of 128 KiB (the protocol upper bound stays 128 KiB; operators can
+  restore the old default explicitly). Replace-by-fee and capacity/byte-budget
+  eviction now rank by gas price per encoded byte — a higher raw price spread
+  over far more bytes no longer wins a slot or survives eviction — with the
+  tie-break unchanged (highest nonce, then hash). Proposal ordering stays
+  gas-price-first. Block selection gains a per-block calldata byte budget,
+  default 256 KiB, settable via `RpcState::with_proposal_calldata_bytes_limit`;
+  it binds on `tx.data.len()` independently of gas and total bytes. The Q-034
+  restore filter is unchanged: entries above the tighter cap are cap-dropped
+  on restore, parked underpriced entries are still preserved (Q-017). This
+  mitigates the cheap-calldata residual; the activation gate remains the
+  intrinsic-gas floor (Q-037 L2-L4).
+
 - **Fee-enabled chains start from a new genesis, not an upgrade (S6.2,
   ADR-010).** A genesis `fee_policy` binds into the consensus context and
   switches block headers to version 2: a 13-field binary layout whose base fee
