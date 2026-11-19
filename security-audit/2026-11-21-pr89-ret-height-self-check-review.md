@@ -61,8 +61,9 @@ contract (prune after commit, failure never halts, boot warning below 4096).
 - Tech-lead gates at `671dc02`: fmt, clippy `-D warnings`, 648 workspace tests,
   deny: green (reported in PR #89).
 - nara independent four-gate run at `671dc02` (worktree `qa-ret-fix-review`,
-  logs `/tmp/opencode/retfix-gates/`): in flight at the time of this note
-  (fmt green, clippy running). The merged retention stack is covered by this
-  run because `state.rs` and the storage files are byte-identical to the
-  reviewed/merged content. Results will be appended here when the run
-  completes; a killed gate (exit 143) is never treated as green.
+  logs `/tmp/opencode/retfix-gates/`): **ALL GREEN** (2026-11-21, cache bypass
+  per tech-lead decision, detached run, four OK markers + done):
+  fmt OK, clippy `-D warnings` OK, **657 tests passed / 0 failed** across 36
+  suites, deny OK (advisories, bans, licenses, sources all ok). The merged
+  retention stack is covered by this run because `state.rs` and the storage
+  files are byte-identical to the reviewed/merged content.

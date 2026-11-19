@@ -71,8 +71,8 @@ slice. Satisfied: #89 merged before any trigger exists.
 - Superseding run: the merged retention files are byte-identical between
   `11e009a` and `93aeadc` (verified by diff; the only deltas were unrelated
   main commits #78/#86). The independent four-gate run at `671dc02` (#89 head =
-  merged #87 + fix) therefore covers the merged retention stack; results are
-  recorded in the #89 review note when complete.
+  merged #87 + fix) therefore covers the merged retention stack: **ALL GREEN**
+  (657 tests passed / 0 failed; see the #89 review note for the full result).
 
 ## Limitations
 

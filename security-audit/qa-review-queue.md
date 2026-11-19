@@ -9,7 +9,7 @@ rebuilds cheap).
 
 | Item | Branch / PR | Scope | State | QA focus |
 | --- | --- | --- | --- | --- |
-| L2 calldata floor (bima) | `s6/calldata-floor-api`, final head `94aa940` | `CalldataPolicy::check_floor`, genesis binding, v3 accept-only codec (Q-037, ADR-015) | Pre-review APPROVE; R-L2-01 closed (`8a5f995` docs), R-L2-02 closed (`56690b7` length rule + boundary test); rebased onto `3148a4e`, patch identity verified; PR opens on green | Track A. Accept-only until L4. nara four-gate run detached at `94aa940` (`/tmp/opencode/l2-final-gates/`), results on completion. |
+| L2 calldata floor (bima) | `s6/calldata-floor-api`, final head `94aa940` | `CalldataPolicy::check_floor`, genesis binding, v3 accept-only codec (Q-037, ADR-015) | R-L2-01/R-L2-02 closed; **R-L2-03 blocking** (test fixtures vs new encode-time version check); APPROVE suspended pending fix + green re-run | Track A. Accept-only until L4. nara gates at `94aa940`: fmt/clippy/deny OK, test=101 (Q-037-track-b). |
 | PR #88 | `s8/otlp-cli-wiring` (`fd005b8`) | S8.1 OTLP CLI wiring (Q-035) | OPEN, formal review APPROVE, no blocking | Track B (tania). Opt-in default byte-identical, non-fatal fallback, guard in runtime. Info: https for remote collectors; no auth-header field yet. Independent `--all-features` gates queued behind the activation-critical runs. |
 | PR #84 | `s6.1b/mempool-persist-node` | opt-in mempool persistence consumer (Q-016/Q-038) | OPEN, APPROVE + re-review; tech-lead mechanical rebase per ADR-016 (head `eb61fce`, patch identity independently verified: 0-line interdiff vs approved `1641df7`); gates running | Track A (raka, session unresponsive, escalated). Report: `2026-11-20-pr84-mempool-persist-review.md`. R-84-01 Low closes when yoga's stacked `--mempool-persist` flag PR lands. |
 | yoga retention flag | `yoga/retention-blocks-flag` (`a05b2d2`) | `--retention-blocks` CLI + runbook | Pre-review APPROVE (config-only, inert until the node trigger) | Track B. Q5/Q7 honored; boot warning <4096 belongs to the trigger slice. |
@@ -45,9 +45,9 @@ rebuilds cheap).
 | --- | --- | --- | --- | --- | --- |
 | L2 `b75c40d` | OK | OK | killed (143) | OK | Superseded: heads moved to `94aa940`. SIGTERM was collateral of an over-broad `pkill` (acknowledged in Q-037-track-a), not a code failure. |
 | retention `11e009a` | OK | killed (143) | n/a | n/a | Superseded: merged retention files byte-identical to `93aeadc`; covered by the `671dc02` run. |
-| retfix `671dc02` (= merged #87+#89) | OK | running | running | running | Detached; completion ping authoritative. Logs `/tmp/opencode/retfix-gates/`. |
-| L2 final `94aa940` | OK | running | running | running | Detached, four OK markers + exit line. Logs `/tmp/opencode/l2-final-gates/`. |
-| OTLP `fd005b8` (#88) | queued | queued | queued | queued | `--all-features`, behind the activation-critical runs. |
+| retfix `671dc02` (= merged #87+#89) | OK | OK | OK (657/0) | OK | **ALL GREEN**, cache bypass, detached, four markers + done. Logs `/tmp/opencode/retfix-gates/`. |
+| L2 final `94aa940` | OK | OK | **FAILED (101)** | OK | R-L2-03 blocking: two `proposal_budget_tests` fixtures encode `version: u32::MAX`, refused by L2's new encode-time version check. `--no-fail-fast` enumeration: exactly these 2 failures, 667 passed workspace-wide, nothing else latent. One-line fixture fix recommended (Q-037-track-b); re-run at fixed head. Logs `/tmp/opencode/l2-final-gates/`. |
+| OTLP `fd005b8` (#88) | running | running | running | running | `--all-features`, cache bypass, detached. Logs `/tmp/opencode/otlp-gates/`. |
 
 Gate practice (2026-11-20/21): a killed gate (exit 143 / abrupt log end) is
 never green; re-run detached (`setsid nohup`), verify FMT_OK / CLIPPY_OK /
@@ -103,4 +103,7 @@ Audit prep: `AUDIT-PACKAGE.md` (S12.2 prep only; audit + soak human/time-gated).
 
 Gate reference: four-gate baseline on `fa87215`
 (`2026-11-19-four-gate-baseline/fa87215/SUMMARY.md`), deny workaround per Q-029.
-Builds: source `~/.config/subhost/s3-env.sh` (sccache, secret: never commit/print).
+Builds: sccache S3 cache **bypassed** by tech-lead decision (backend degraded);
+gates run with `unset RUSTC_WRAPPER`, `CARGO_INCREMENTAL=0`, no s3-env.sh
+sourcing until re-enable is announced. When re-enabled: source
+`~/.config/subhost/s3-env.sh` (sccache, secret: never commit/print).
