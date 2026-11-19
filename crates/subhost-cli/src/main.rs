@@ -1430,6 +1430,15 @@ fn handle_db(cmd: DbCommands) -> Result<()> {
                         base_height + 1
                     );
                 }
+                // `prune` (keep-segments) still refuses with an error instead of
+                // this outcome; the arm keeps the match exhaustive for Q-036.
+                PruneOutcome::RefusedBySnapshot { snapshot_height, requested_height } => {
+                    bail!(
+                        "cannot prune {}: the newest snapshot is at block {snapshot_height}, \
+                         which a prune to {requested_height} would drop",
+                        data_dir.display()
+                    );
+                }
             }
         }
     }
