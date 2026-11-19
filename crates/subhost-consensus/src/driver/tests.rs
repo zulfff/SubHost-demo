@@ -1225,3 +1225,112 @@ fn a_halted_driver_refuses_to_sign_a_view_change_report() {
     assert!(drivers[1].own_view_change().is_none());
     assert_eq!(drivers[1].view(), 1, "a refused timeout must not advance the view");
 }
+
+#[test]
+fn conflicting_reports_from_one_signer_in_one_view_are_refused() {
+    let (_, keys, mut drivers) = setup(4);
+    let first = block(1, Hash::ZERO, 1);
+    let (proposal, _) = drivers[0].propose(first).unwrap();
+    let prepares: Vec<_> = [0, 1, 2]
+        .into_iter()
+        .map(|i| drivers[i].observe_proposal(proposal.clone()).unwrap().unwrap())
+        .collect();
+    for vote in &prepares {
+        drivers[2].record_vote(vote.clone()).unwrap();
+    }
+    assert!(drivers[2].prepared_certificate().is_some());
+    // Signer 2's own timeout report carries its prepared proof at view 2.
+    let locked_report = timeout(&mut drivers, &[2]).remove(0);
+    assert_eq!(locked_report.view, 2);
+    assert!(locked_report.prepared.is_some());
+    assert!(drivers[3].record_view_change(locked_report).unwrap());
+    let saved = drivers[3].checkpoint();
+
+    // Same signer, same view, different content: equivocation, refused outright.
+    assert!(matches!(
+        drivers[3].record_view_change(nil_report(&keys, 2, 2)),
+        Err(ConsensusError::InvalidProposal(_))
+    ));
+    assert_eq!(drivers[3].checkpoint(), saved, "a refused report changes nothing");
+
+    // A lower report from the same signer is ignored, never a replacement.
+    assert!(!drivers[3].record_view_change(nil_report(&keys, 2, 1)).unwrap());
+    assert_eq!(drivers[3].checkpoint(), saved);
+}
+
+#[test]
+fn a_peer_report_carrying_a_conflicting_prepared_lock_is_refused() {
+    let (_, keys, mut drivers) = setup(4);
+    let locked = block(1, Hash::ZERO, 1);
+    let (proposal, _) = drivers[0].propose(locked).unwrap();
+    let prepares: Vec<_> = [0, 1, 2]
+        .into_iter()
+        .map(|i| drivers[i].observe_proposal(proposal.clone()).unwrap().unwrap())
+        .collect();
+    for vote in &prepares {
+        drivers[1].record_vote(vote.clone()).unwrap();
+    }
+    assert!(drivers[1].prepared_certificate().is_some());
+
+    // An authenticated prepare proof for a different block at the SAME view.
+    let rival = block(1, Hash::ZERO, 9);
+    let rival_qc = PrepareCertificate {
+        protocol_context: Hash::ZERO,
+        view: 1,
+        block_hash: rival.hash(),
+        signatures: [0, 1, 2]
+            .into_iter()
+            .map(|i| {
+                (
+                    keys[i].0,
+                    BLSScheme::encode_signature(&BLSScheme::sign(
+                        &keys[i].1,
+                        &PrepareCertificate::payload_for(1, &rival.hash()),
+                    )),
+                )
+            })
+            .collect(),
+    };
+    let mut report = nil_report(&keys, 3, 2);
+    report.prepared = Some(PreparedBlock { block: rival, qc: rival_qc });
+    report.signature =
+        BLSScheme::encode_signature(&BLSScheme::sign(&keys[3].1, &report.signing_payload()));
+
+    let saved = drivers[1].checkpoint();
+    assert!(drivers[1].record_view_change(report).is_err());
+    assert_eq!(drivers[1].checkpoint(), saved, "the local lock survives the refusal");
+}
+
+#[test]
+fn timeout_certificate_support_bounds_hold_at_sixty_four_validators() {
+    let (registry, keys, _) = setup(64);
+    let config = ConsensusConfig::new(64).unwrap();
+    assert_eq!(config.max_faulty, 21);
+    assert_eq!(config.quorum_threshold, 43);
+    let observer = ConsensusDriver::new(config, registry.clone(), None).unwrap();
+    let messages: Vec<_> = (0..43).map(|i| nil_report(&keys, i, 2)).collect();
+    let tc = TimeoutCertificate { view: 2, height: 1, tip: Hash::ZERO, messages };
+    observer.validate_timeout_certificate(&tc).unwrap();
+
+    let mut short = tc.clone();
+    short.messages.pop();
+    assert!(observer.validate_timeout_certificate(&short).is_err(), "42 of 64 is not n-f");
+
+    let mut over = tc.clone();
+    over.messages = (0..65).map(|i| tc.messages[i % 43].clone()).collect();
+    assert!(
+        observer.validate_timeout_certificate(&over).is_err(),
+        "more reports than registered validators is refused before any dedup"
+    );
+
+    // The other supported extreme: a single validator is its own quorum.
+    let (registry1, keys1, _) = setup(1);
+    let one = ConsensusDriver::new(ConsensusConfig::new(1).unwrap(), registry1, None).unwrap();
+    let single = TimeoutCertificate {
+        view: 2,
+        height: 1,
+        tip: Hash::ZERO,
+        messages: vec![nil_report(&keys1, 0, 2)],
+    };
+    one.validate_timeout_certificate(&single).unwrap();
+}
