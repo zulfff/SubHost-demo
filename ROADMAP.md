@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-19 · `main` = `7e291b8` · S0, S1 (through S1.4), S4 (through S4.5), S5.1a/S5.3a merged · S2 timeout/quorum + CLI policy (#46) and S3 certified-history relay (#45) merged · S8 slice 1 (#47), S9 (#48), 002 wallet fix (#49) and S8.2 mempool events (#51) merged · S5.2 implemented on `s5/rpc-methods`, 003 storage slice (#50) in review · `Q-001`–`Q-024` agreed
+Status: 2026-11-19 · `main` = `6d3f314` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S2: phased rounds, RFC 9380 BLS, view change + node policy (ADR-008), safety regressions (#62); remaining assurance is external (S12) · S3: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57) · S6.1a (#44) and S6.2 step 1 core/state API (#60, ADR-010) merged, storage slice in progress · S8 slice 1 (#47) and mempool events (#51) merged · S9.1–S9.5 (#48) merged, S9.6 keystore in review (#59, CLI tests requested) · S12.1 threat model (#58) merged · `Q-001`–`Q-031` agreed except Q-012/Q-025 (open, `blocks: none`)
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -124,17 +124,17 @@ agent always sees the real state.
 | --- | --- | --- | --- | --- | --- |
 | S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
 | S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
-| S2 | Wire the consensus driver into the node | A | S1 | L | Timeout/quorum + leader recovery and CLI policy merged (#46); exit-criteria verification pending |
-| S3 | Fork choice, reorg, and block sync | A | S2 | L | Certified-history relay merged (#45); native protocol/fork choice/reorg pending |
+| S2 | Wire the consensus driver into the node | A | S1 | L | Merged: phased rounds, RFC 9380 BLS, authenticated view change, node policy (ADR-008, #46); safety regressions #62. Remaining assurance is external (S12) |
+| S3 | Fork choice, reorg, and block sync | A | S2 | L | Merged: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive + classifier consumption (#57). Per Q-013: append-only finality, no finalized reorg |
 | S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.5 |
-| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a/S5.3a merged; S5.3b implemented; S5.2 methods in progress |
-| S6 | Durable mempool and fee market | B | S0 | M | S6.1a snapshot API merged (#44); fee market and node/RPC consumers pending |
+| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | Merged: S5.1a auth/bind policy, S5.2 methods (#54), S5.3a middleware + S5.3b node wiring. TLS = documented reverse-proxy mode; rate limit per connection |
+| S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44), S6.1b pending; S6.2 step 1 merged (#60, ADR-010), storage slice in progress (dewi), node/RPC wiring next (bima); S6.3 counters merged (#51), TTL/eviction pending |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
-| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 merged (#47); S8.2 mempool events in review (#51); tracing/runbooks/alerts pending |
-| S9 | Release engineering | B | S5 | M | PR #48 in review (rebase pending after #47) |
+| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 health/gauges merged (#47); mempool events merged (#51); OTLP tracing, RPC spans, remaining runbooks/alerts pending |
+| S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore in review (#59, CLI tests requested); Track A bootstrap loader pending after S6.2 |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
-| S12 | External audit and public testnet soak | all | S1–S9 | XL | Planned |
+| S12 | External audit and public testnet soak | all | S1–S9 | XL | S12.1 threat model merged (#58); public testnet activation in progress (Q-012); audit, soak, bounty, go/no-go pending |
 
 Size is relative effort, not calendar time. S10 alone is larger than S0–S9 combined.
 
@@ -286,7 +286,7 @@ separate storage/execution contract and cannot be advertised as finalized reorg.
 | S3.1–S3.2 | Consensus classifier + halt merged (ADR-007); node consumption implemented on `s3.3/native-sync` (raka) |
 | S3.1 node buffering | Implemented: bounded node-owned candidate store fed by `classify_final_evidence`, drained ascending after backfill |
 | S3.2 node consumption | Implemented: durable `fork-incidents.bin`, halt propagation, readiness suppression, re-halt on restart |
-| S3.3–S3.4 | Implemented on `s3.3/native-sync` (raka): bounded range sync, catch-up stall budget, node archive; backup inclusion remains |
+| S3.3–S3.4 | Merged (#57): bounded range sync, catch-up stall budget, node archive; backup inclusion remains |
 | S3.5 | Planned |
 
 **S3.1 Candidate selection**
@@ -419,7 +419,7 @@ start-up time remains proportional to retained history even after pruning (S4.3)
 | Task | Status |
 | --- | --- |
 | S5.1a | Merged |
-| S5.2 | In progress on the separate `s5/rpc-methods` branch |
+| S5.2 | Merged (#54): block-by-hash, syncing, legacy fee history, priority-fee recommendation |
 | S5.3a | Merged server middleware and registry API contract (ADR-004) |
 | S5.3b | Node registry wiring and exported success/error regression implemented on the S2 branch (Track A) |
 
@@ -537,7 +537,7 @@ looking traffic.
 | --- | --- |
 | S8.2/S8.3 Platform API | Merged (PR #47, ADR-013, Q-020) |
 | S8.2/S8.3 node runtime hooks | Pending Track A, after the Platform API lands |
-| S8.2 mempool event wiring | In review on `s8/mempool-event-wiring` (Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
+| S8.2 mempool event wiring | Merged (#51, Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
 | S8.1 OTLP tracing, RPC spans | Pending, later S8 slices |
 | S8.4 Runbooks | Partial: `docs/operations/observability.md`; remaining runbooks pending |
 | S8.5 Alerts | Sample rules shipped in `docs/operations/observability.md` |
