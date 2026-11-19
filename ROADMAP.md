@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-19 · `main` = `6d3f314` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S2: phased rounds, RFC 9380 BLS, view change + node policy (ADR-008), safety regressions (#62); remaining assurance is external (S12) · S3: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57) · S6.1a (#44) and S6.2 step 1 core/state API (#60, ADR-010) merged, storage slice in progress · S8 slice 1 (#47) and mempool events (#51) merged · S9.1–S9.5 (#48) merged, S9.6 keystore in review (#59, CLI tests requested) · S12.1 threat model (#58) merged · `Q-001`–`Q-031` agreed except Q-012/Q-025 (open, `blocks: none`)
+Status: 2026-11-19 · `main` = `c3a5945` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S2: phased rounds, RFC 9380 BLS, view change + node policy (ADR-008), safety regressions (#62); remaining assurance is external (S12) · S3: classifier + fork halt (#53/#56), relay (#45), native range sync + certified archive (#57) · S6.1a (#44) and S6.2 step 1 core/state API (#60, ADR-010) merged, storage slice in review (#65) · S8 slice 1 (#47) and mempool events (#51) merged · S9.1–S9.5 (#48) merged, S9.6 keystore (#59) merged · S12.1 threat model (#58) merged · `Q-001`–`Q-031` agreed except Q-012/Q-025 (open, `blocks: none`)
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
