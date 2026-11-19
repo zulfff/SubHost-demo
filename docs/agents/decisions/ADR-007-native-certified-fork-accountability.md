@@ -99,6 +99,11 @@ the driver.
   `ROADMAP.md` S3 contract correction.
 ## Amendment — S3.3 native certified history sync (Track A)
 
+*Status: forward contract. S3.3/S3.4 are not merged into `main` yet, so the
+node/archive files cited below live on raka's branch, not in landed code. The
+decision itself is agreed (Q-027, Q-028); this label is removed when the slice
+lands.*
+
 This section records the transport, archive and node-side catching-up decision
 that S3.1/S3.2 above deliberately left to S3.3. It amends, and does not replace,
 the classification and halt decision.

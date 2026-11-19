@@ -847,19 +847,21 @@ impl ConsensusDriver {
                 FinalEvidence::Conflicting { height }
             });
         }
-        if height == self.height + 1
+        let next_height =
+            self.height.checked_add(1).ok_or_else(|| invalid("height counter overflow"))?;
+        if height == next_height
             && block.header.parent_hash == self.tip
             && qc.view >= self.initial_view()?
         {
             return Ok(FinalEvidence::Next);
         }
-        if height == self.height + 1 {
+        if height == next_height {
             // A certified child of the finalized height that is not our tip (or a
             // view behind committed finality) means a quorum finalized a different
             // branch: accountable evidence, never a silent rollback.
             return Ok(FinalEvidence::Conflicting { height });
         }
-        Ok(FinalEvidence::MissingAncestors { from: self.height + 1, to: height - 1 })
+        Ok(FinalEvidence::MissingAncestors { from: next_height, to: height - 1 })
     }
 
     /// Reset an idle timer when newly admitted work first arrives. No view,

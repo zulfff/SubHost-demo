@@ -257,7 +257,9 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `halt`/`halted` stop every signature through the single signing path while
   certified history still applies; the sticky reason is process-local, keeping
   the `SUBVOTE2` journal format unchanged. No finalized rollback:
-  `subhost_reorg_total` stays at 0.
+  `subhost_reorg_total` stays at 0. Height arithmetic in the classifier is
+  overflow-checked, and direct tests cover the halted Commit-vote and
+  view-change refusals.
 
 - **Platform observability API (S8, ADR-013).** `Metrics::set_health` publishes
   one coherent `HealthStatus` snapshot; the exporter serves `/health/live`
