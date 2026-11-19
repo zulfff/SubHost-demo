@@ -1,10 +1,11 @@
 # Pending transaction snapshots
 
-S6.1a adds the `MempoolStore` API in `subhost-mempool`. It provides bounded,
-validated, atomic pending snapshots. The bundled node/RPC path does not yet use
-it: admission durability and CLI configuration are S6.1b consumers of the landed
-contract. Accepted transactions remain volatile outside journalled open proposals
-until that integration is implemented.
+S6.1a adds the `MempoolStore` API in `subhost-mempool`; S6.1b wires it into the
+node and RPC paths (Q-034: persist before acknowledgement, restore on boot).
+Durability is **opt-in**: `subhost node --mempool-persist`
+(`NodeConfig.mempool_persist`, default off). Without the flag, accepted
+transactions remain volatile outside journalled open proposals, exactly as
+before.
 
 ## Store API and limits
 
@@ -91,17 +92,34 @@ genesis-less demo chains with the same chain id are indistinguishable.
 A failed restore (corrupt, truncated, foreign, oversized, unauthenticated or
 partial snapshot) **refuses boot** rather than silently starting with an empty
 pool. The boot error names the snapshot path; RPC persistence errors keep no
-local detail. Recovery is a one-file action:
+local detail. Recovery is an explicit operator action — the node never deletes
+or repairs the snapshot itself:
 
 1. stop the node;
-2. remove `<data_dir>/mempool.bin`;
+2. move `<data_dir>/mempool.bin` aside (e.g. `mempool.bin.bad-$(date +%s)`) so
+   the evidence is preserved for inspection;
 3. restart.
 
-Deleting the file is safe: it holds signed **pending** transactions only — no
-committed ledger history, no votes or QCs, no producer keys. The ledger,
-voting journal and archive are untouched. The only loss is accepted-but-unmined
-transactions, which clients can resubmit. An absent file is a normal empty
-start, not a failure.
+Moving the file aside is the recommended path; deleting it outright is also
+safe and equally an explicit operator choice. Either way the file holds signed
+**pending** transactions only — no committed ledger history, no votes or QCs,
+no producer keys. The ledger, voting journal and archive are untouched. The
+only loss is accepted-but-unmined transactions, which clients can resubmit. An
+absent file is a normal empty start, not a failure.
+
+### CLI opt-in
+
+```sh
+# Durable pending pool: persist on admission, restore on start-up.
+subhost node --validator --data-dir DIR --mempool-persist
+
+# Default (flag absent): volatile pool, mempool.bin never read or written.
+subhost node --validator --data-dir DIR
+```
+
+The flag composes with all node modes (validator, single-writer demo,
+observer); it chooses durability only. Capacity and per-sender configuration
+flags are an explicit follow-up slice (ROADMAP S6.1), not part of this opt-in.
 
 Capacity and per-sender flags are an explicit follow-up; the opt-in chooses
 durability only, and `Mempool` already enforces count, per-sender and runtime
@@ -117,8 +135,9 @@ rolling voting state back or certifying missing history.
 Retain `mempool.bin` in whole-directory offline backups once consumers enable it.
 Unknown versions, wrong context, invalid signatures, duplicate slots, size limits,
 truncation and checksum failure are errors. There is no implicit repair or format
-migration. The node `mempool_persist` opt-in (CLI `--mempool-persist` in the stacked flag
-PR) is exposed; explicit capacity and per-sender flags remain a follow-up.
+migration. The node `mempool_persist` opt-in is exposed as
+`subhost node --mempool-persist`; explicit capacity and per-sender flags remain
+a follow-up.
 
 Tests cover deterministic replacement/restart, empty snapshots, context mismatch,
 corruption/truncation, invalid signed entries, duplicate slots, record/file/count

@@ -120,6 +120,14 @@ enum Commands {
         #[arg(long, requires = "validator")]
         producer_credential_file: Option<PathBuf>,
 
+        /// Persist accepted-but-unmined transactions to `<data-dir>/mempool.bin`
+        /// and restore them on start-up (Q-016/Q-038). Opt-in: unset keeps the
+        /// pool volatile. A corrupt or foreign snapshot refuses boot; recovery
+        /// is moving the snapshot aside and restarting (see
+        /// docs/operations/mempool-persistence.md).
+        #[arg(long)]
+        mempool_persist: bool,
+
         #[arg(short, long, default_value = DEFAULT_RPC_URL.trim_start_matches("http://"))]
         listen: String,
 
@@ -477,6 +485,7 @@ fn main() -> Result<()> {
                 view_timeout_ms,
                 producer_key_file,
                 producer_credential_file,
+                mempool_persist,
                 listen,
                 data_dir,
                 metrics_addr,
@@ -496,6 +505,7 @@ fn main() -> Result<()> {
                     view_timeout_ms,
                     producer_key_file,
                     producer_credential_file,
+                    mempool_persist,
                     listen,
                     data_dir,
                     metrics_addr,
@@ -1008,6 +1018,7 @@ async fn run_node(
     view_timeout_ms: Option<u64>,
     producer_key_file: Option<PathBuf>,
     producer_credential_file: Option<PathBuf>,
+    mempool_persist: bool,
     listen: String,
     data_dir: Option<PathBuf>,
     metrics_addr: Option<SocketAddr>,
@@ -1060,6 +1071,9 @@ async fn run_node(
     config.producer_key_file = producer_key_file;
     // Q-036: accepted now, inert until the node-side prune trigger lands.
     config.retention_blocks = retention_blocks;
+    // Q-038: durability is an explicit operator choice; the node attaches the
+    // store and restores the snapshot only when this is set (boot policy A).
+    config.mempool_persist = mempool_persist;
     config.network = network;
     validate_node_policy(&config)?;
     // ADR-011: with a credential, boot from the unlocked keystore key; the
@@ -1648,6 +1662,21 @@ mod tests {
             ])
             .is_err());
         }
+    }
+
+    #[test]
+    fn mempool_persist_flag_defaults_off_and_is_opt_in() {
+        let cli = Cli::try_parse_from(["subhost", "node"]).unwrap();
+        assert!(matches!(cli.command, Commands::Node { mempool_persist: false, .. }));
+        let cli = Cli::try_parse_from(["subhost", "node", "--mempool-persist"]).unwrap();
+        assert!(matches!(cli.command, Commands::Node { mempool_persist: true, .. }));
+        // Durability composes with validator and demo modes alike.
+        let cli =
+            Cli::try_parse_from(["subhost", "node", "--validator", "--mempool-persist"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Node { validator: true, mempool_persist: true, .. }
+        ));
     }
 
     #[test]

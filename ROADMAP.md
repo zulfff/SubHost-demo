@@ -494,11 +494,11 @@ the metrics match a request-count test.
   candidate is live, failure refuses the acknowledgement), `retire_mined` (live
   pool, best-effort) and `retire_mined_candidate` (pure, no I/O), plus
   `restore_pending` (mined-nonce filter, cap/budget re-admission in deterministic
-  order, parked underpriced entries preserved per Q-017). Remaining: the five
-  `block.rs` call-site swaps and the one bootstrap restore line (Track A wiring,
-  after S6.2 step 3), then the CLI opt-in/capacity consumers. Until the wiring
-  lands no store is configured and the bundled node's accepted pool stays
-  volatile, so this stage is not complete.
+  order, parked underpriced entries preserved per Q-017). The `block.rs`
+  call-site swaps and the bootstrap restore line landed (#80); the node opt-in
+  `NodeConfig.mempool_persist` landed (#84) and the CLI flag
+  `subhost node --mempool-persist` stacks on it (Q-038). Remaining: explicit
+  capacity and per-sender flags (follow-up slice, tech-lead-confirmed split).
 - Relevant doc: `docs/operations/mempool-persistence.md`.
 - Runtime byte budget landed with the hooks: `MempoolConfig::max_pending_bytes`
   (default 32 MiB) binds with persistence on or off, evicting in the existing
