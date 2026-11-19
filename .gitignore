@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 **/*.rs.bk
+**/bom.json
+/dist/
+**/__pycache__/
 
 # Local node and wallet data — never commit key material or ledgers
 /data/

@@ -224,6 +224,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Release engineering and checked optimized tests (S9).** Added exact tag/version
+  validation, an immutable compiler-image binary build, deterministic archives
+  and SHA256 inventories, pinned CycloneDX/Sigstore tooling, reusable locked CI,
+  pre-publication image scanning, and an unprivileged read-only deployment
+  template. Test builds use optimization level 1 while retaining debug assertions
+  and overflow checks. Upgrade/rollback boundaries are documented; no stable
+  release, audit completion or independent full rebuild claim is implied.
+
 - **Platform observability API (S8, ADR-013).** `Metrics::set_health` publishes
   one coherent `HealthStatus` snapshot; the exporter serves `/health/live`
   (and legacy `/health`) as liveness-only and `/health/ready` as 200 only when
