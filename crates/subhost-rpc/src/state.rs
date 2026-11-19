@@ -592,10 +592,14 @@ impl RpcState {
 
     pub fn block_at_height(&self, height: u64) -> Option<Block> {
         // A pruned height has no block to serve; the mapping stays a single
-        // offset because the retained history is contiguous.
+        // offset because the retained history is contiguous. The base is read
+        // outside the blocks lock, so a concurrent retention trim can advance
+        // it between the two reads; the height self-check makes every such
+        // interleaving return the correct block or null, never a wrong block
+        // (R-RET-01).
         let index = height.checked_sub(self.base_height())?.checked_sub(1)?;
         let index = usize::try_from(index).ok()?;
-        read(&self.blocks).get(index).cloned()
+        read(&self.blocks).get(index).cloned().filter(|block| block.header.height == height)
     }
 
     /// Height of the newest block this node can serve.
@@ -983,5 +987,33 @@ mod tests {
         assert!(state.retain_from(1).is_err());
         assert_eq!(state.base_height(), 0);
         assert_eq!(state.pending_count(), 1);
+    }
+    #[test]
+    fn a_stale_base_read_never_serves_a_wrong_block() {
+        // R-RET-01: simulate the trim window directly — the blocks vector is
+        // already trimmed to [4,5,6] while a reader still sees the old base 0.
+        let key = signing_key(45);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = RpcState::in_memory(1).unwrap();
+        state.seed_accounts([(sender, 1_000_000)]).unwrap();
+        for nonce in 0..6 {
+            state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+        }
+        write(&state.blocks).retain(|block| block.header.height > 3);
+        assert_eq!(state.base_height(), 0);
+
+        // Without the height self-check these would serve blocks 4, 5 and 6.
+        for height in 1..=3 {
+            assert!(state.block_at_height(height).is_none(), "height {height}");
+        }
+        // The stale base can also map a retained height past the trimmed
+        // vector; that is a transient null, never a wrong block.
+        assert!(state.block_at_height(4).is_none());
+
+        // Once the trim stores the new base, the mapping is correct again.
+        state.base_height.store(3, Ordering::SeqCst);
+        assert_eq!(state.block_at_height(4).unwrap().header.height, 4);
+        assert_eq!(state.block_at_height(6).unwrap().header.height, 6);
+        assert!(state.block_at_height(3).is_none());
     }
 }
