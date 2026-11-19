@@ -4,6 +4,10 @@
 #[path = "proposal_budget_tests.rs"]
 mod proposal_budget_tests;
 
+#[cfg(test)]
+#[path = "block_span_tests.rs"]
+mod block_span_tests;
+
 use crate::state::{lock, read, write, BlockEvent, RpcError, RpcState};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -402,13 +406,53 @@ impl RpcState {
     /// in-memory view has been swapped; on error nothing is published. The caller
     /// installs the mutated pool only after this returns `Ok`.
     fn seal_block(&self, pool: &mut Mempool) -> Result<HashMap<Hash, Receipt>, RpcError> {
+        // S8.1 (Q-035): one info span per seal, bounded operational fields only.
+        // Height/gas are recorded once a candidate exists; an empty seal reports
+        // tx_count 0 with no height rather than a fabricated one.
+        let span = tracing::info_span!(
+            "seal_block",
+            height = tracing::field::Empty,
+            tx_count = tracing::field::Empty,
+            gas_used = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+        );
+        let _enter = span.enter();
+        let result = self.seal_block_inner(pool);
+        match &result {
+            Ok(_) => {
+                span.record("outcome", "ok");
+            }
+            Err(error) => {
+                // Gas/receipt-index and fee-settlement overflows surface as
+                // Internal here; they are budget failures, not execution bugs.
+                let kind = match error {
+                    RpcError::Persistence(_) => "storage",
+                    RpcError::Internal => "budget",
+                    _ => "rejected",
+                };
+                span.record("error_kind", kind);
+                span.record("outcome", if kind == "rejected" { "rejected" } else { "error" });
+            }
+        }
+        result
+    }
+
+    fn seal_block_inner(&self, pool: &mut Mempool) -> Result<HashMap<Hash, Receipt>, RpcError> {
         let Some(BuiltCandidate { block, state: candidate_state }) = self.build_candidate(pool)?
         else {
+            let span = tracing::Span::current();
+            span.record("tx_count", 0u64);
+            span.record("gas_used", 0u64);
             return Ok(HashMap::new());
         };
 
         let block_hash = block.hash();
         let height = block.header.height;
+        let span = tracing::Span::current();
+        span.record("height", height);
+        span.record("tx_count", block.transactions.len() as u64);
+        span.record("gas_used", block.header.gas_used);
         let mut receipts = HashMap::with_capacity(block.transactions.len());
         let mut cumulative_gas_used: Gas = 0;
         for (index, tx) in block.transactions.iter().enumerate() {
@@ -487,6 +531,24 @@ impl RpcState {
     /// both commitments, the state transition, and the resulting state root.
     /// Receipts are derived locally and never taken from the wire.
     pub fn accept_block(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
+        // S8.1 (Q-035): the producer address is public operational identity
+        // (already in blocks and logs); the hash is the 32-byte block hash only.
+        let span = tracing::info_span!(
+            "accept_block",
+            height = block.header.height,
+            block_hash = %block.hash(),
+            tx_count = block.transactions.len() as u64,
+            producer = %block.header.validator,
+            outcome = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+        );
+        let _enter = span.enter();
+        let result = self.accept_block_inner(block);
+        record_block_result(&span, &result);
+        result
+    }
+
+    fn accept_block_inner(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
         self.verify_block_authority(&block)?;
         if self.validators.is_some() {
@@ -509,14 +571,43 @@ impl RpcState {
         block: Block,
         qc: &QuorumCertificate,
     ) -> Result<Vec<Receipt>, RpcError> {
-        let _commit_guard = lock(&self.commit_lock);
-        self.validate_final_qc(&block, qc)?;
-        let height = block.header.height;
-        let receipts = self.accept_validated(block)?;
-        self.committed_view.store(qc.view, Ordering::SeqCst);
-        self.verified_view.store(true, Ordering::SeqCst);
-        self.finalized_height.store(height, Ordering::SeqCst);
-        Ok(receipts)
+        // S8.1 (Q-035): a certificate failure is tagged structurally as
+        // invalid_qc at the validation boundary, never inferred from the error
+        // text. Store ordering below is unchanged.
+        let span = tracing::info_span!(
+            "commit_qc",
+            height = block.header.height,
+            view = qc.view,
+            block_hash = %block.hash(),
+            outcome = tracing::field::Empty,
+            error_kind = tracing::field::Empty,
+        );
+        let _enter = span.enter();
+        let result = (|| -> Result<Vec<Receipt>, (&'static str, RpcError)> {
+            let _commit_guard = lock(&self.commit_lock);
+            self.validate_final_qc(&block, qc).map_err(|error| ("invalid_qc", error))?;
+            let height = block.header.height;
+            let receipts =
+                self.accept_validated(block).map_err(|error| (rpc_error_kind(&error), error))?;
+            self.committed_view.store(qc.view, Ordering::SeqCst);
+            self.verified_view.store(true, Ordering::SeqCst);
+            self.finalized_height.store(height, Ordering::SeqCst);
+            Ok(receipts)
+        })();
+        match result {
+            Ok(receipts) => {
+                span.record("outcome", "ok");
+                Ok(receipts)
+            }
+            Err((kind, error)) => {
+                span.record("error_kind", kind);
+                span.record(
+                    "outcome",
+                    if matches!(kind, "storage" | "execution") { "error" } else { "rejected" },
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Independently verify a certified next block without writing the ledger,
@@ -749,6 +840,32 @@ impl RpcState {
             receipts: ordered,
         })?;
         Ok(())
+    }
+}
+
+/// Bounded static classification of block-path failures for span fields
+/// (Q-035). Raw error text can embed peer-supplied strings and never enters a
+/// span; persistence failures are `storage`, internal execution failures are
+/// `execution`, everything else is a validation `rejected`.
+fn rpc_error_kind(error: &RpcError) -> &'static str {
+    match error {
+        RpcError::Persistence(_) => "storage",
+        RpcError::Internal => "execution",
+        _ => "rejected",
+    }
+}
+
+/// Record the terminal outcome of a block-path span from its result.
+fn record_block_result<T>(span: &tracing::Span, result: &Result<T, RpcError>) {
+    match result {
+        Ok(_) => {
+            span.record("outcome", "ok");
+        }
+        Err(error) => {
+            let kind = rpc_error_kind(error);
+            span.record("error_kind", kind);
+            span.record("outcome", if kind == "rejected" { "rejected" } else { "error" });
+        }
     }
 }
 

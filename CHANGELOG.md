@@ -476,9 +476,30 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   a tokio runtime; exporter startup failure is reported, never fatal. New
   dependencies `opentelemetry`/`opentelemetry_sdk` (`rt-tokio`)/`opentelemetry-otlp`
   (`http-proto`, `hyper-client`) 0.33 and `tracing-opentelemetry` 0.34 (MSRV 1.75
-  ≤ workspace 1.89); `cargo deny` clean. Binary wiring (CLI flag / node) and the
-  Track A block/consensus spans follow per Q-035; the Track B RPC spans are
-  landed (#69) and export through this provider once a binary installs it.
+  ≤ workspace 1.89); `cargo deny` clean. Binary wiring (CLI flag / node)
+  follows; the Track A block/consensus spans and the Track B RPC spans (#69)
+  are landed and export through this provider once a binary installs it.
+
+- **Block and consensus tracing spans (S8.1, Q-035).** One `info` span per
+  driver step, never per vote: `seal_block`, `accept_block` and `commit_qc`
+  in the block path (`subhost-rpc`), and `consensus_propose`,
+  `consensus_prepare`, `consensus_commit`, `consensus_view_change` at the
+  node orchestration boundary (`subhost-node`). Fields are bounded and
+  operational: height/view, the 32-byte block hash, transaction/gas counts,
+  authenticated vote/report tallies against the n−f quorum threshold,
+  `has_prepared`, and a static `error_kind`
+  (`invalid_qc`/`execution`/`budget`/`context`/`storage`/`rejected`) with
+  `outcome` `ok`/`rejected`/`error`/`pending`. Certificate failures are
+  tagged `invalid_qc` structurally at the validation boundary; prepare and
+  view-change spans carry no `error_kind`. No calldata, transaction hashes,
+  signatures, keys, tokens or raw peer error text enters a span; no span
+  guard is held across an `await`. A no-op producer tick emits nothing; a
+  signed timeout report emits one post-hoc marker. The consensus driver
+  gains read-only tally accessors (`prepare_count`, `commit_count`,
+  `view_change_count`, `quorum_threshold`). Spans ride the global subscriber
+  (OTLP provider above) with no new runtime dependency; contract tests in
+  `block_span_tests.rs` and `consensus_span_tests.rs` assert the field
+  tables, per-step volume and the privacy boundary.
 
 - **Pending-store consumer wiring (S6.1b, Q-034/Q-016).** The five RPC commit
   call sites now use the hooks landed in #75: admission and builder-driven

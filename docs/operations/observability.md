@@ -1,7 +1,8 @@
 # Observability: health, runtime metrics and alerts
 
 Status: S8 Platform API (this document, ADR-013) plus the Track A node runtime
-hooks (Q-020/Q-032): health predicates come from actual runtime state, finalized
+hooks (Q-020/Q-032) and block/consensus tracing spans (Q-035): health
+predicates come from actual runtime state, finalized
 height and QC latency are published at the verified final commit path, and the
 ledger footprint/snapshot age are measured periodically under the commit lock.
 `subhost_connected_peers` is the remaining gated gauge (needs a network handle
@@ -145,6 +146,60 @@ log output are unchanged, and no exporter is constructed.
 - The `sync-relay` example still uses plain logging; relay span export is a
   follow-up slice.
 
+## Block and consensus spans (S8.1)
+
+The block path and the node's consensus orchestration emit one `info` span
+per driver step through ordinary `tracing` macros (contract Q-035). They ride
+the same global subscriber as the RPC method spans: with no subscriber they
+are near-free no-ops; the OTLP provider exports them once installed.
+
+| Span | Emitted at | Fields |
+| --- | --- | --- |
+| `seal_block` | `RpcState::seal_block` | `height`, `tx_count`, `gas_used`, `outcome`, `error_kind` |
+| `accept_block` | `RpcState::accept_block` | `height`, `block_hash`, `tx_count`, `producer`, `outcome`, `error_kind` |
+| `commit_qc` | `RpcState::commit_qc` | `height`, `view`, `block_hash`, `outcome`, `error_kind` |
+| `consensus_propose` | leader propose step | `view`, `height`, `block_hash`, `outcome`, `error_kind` |
+| `consensus_prepare` | proposal/prepared-block step | `view`, `block_hash`, `votes_have`, `votes_need`, `outcome` |
+| `consensus_commit` | commit step with a pending QC | `view`, `height`, `block_hash`, `outcome`, `error_kind` |
+| `consensus_view_change` | report receipt, TC adoption, producer timeout | `view`, `target_view`, `reports_have`, `reports_need`, `has_prepared`, `outcome` |
+
+Semantics:
+
+- **One span per step, never per vote.** Vote delivery updates the tallies
+  carried by the step spans (`votes_have`, `reports_have`); it emits nothing.
+  A no-op producer tick emits nothing; a tick that signs a view-change report
+  emits one post-hoc marker span (all fields known, closes immediately). Its
+  duration is near zero by construction; dashboards should treat markers as
+  counters, not latency samples.
+- `outcome` is `ok`, `rejected`, `error` or `pending`. `pending` marks a
+  commit step whose certificate is not yet final (commit votes still
+  arriving). `error` is reserved for local infrastructure/context failures;
+  protocol validation failures are `rejected`.
+- `error_kind` is a bounded static classification, never raw peer error text:
+  `invalid_qc` (certificate validation, tagged structurally at the
+  `validate_final_qc` boundary), `execution`, `budget` (gas/receipt-index/fee
+  overflow at seal), `context` (no proposal, not a validator, halted),
+  `storage` (persistence), `rejected` (everything else). Prepare and
+  view-change spans carry **no** `error_kind` field.
+- `has_prepared` is the local prepared lock held *before* the step;
+  `reports_have` is the authenticated tally *after* the step and includes the
+  node's own retained report once it joins the target view. `target_view` on
+  TC adoption is `certificate.view` (the driver enters that view, not +1).
+  `votes_need`/`reports_need` are the quorum threshold (n−f).
+- An empty seal reports `tx_count=0`, `gas_used=0`, `outcome=ok` and no
+  `height` field rather than a fabricated one.
+- **Privacy boundary:** only the 32-byte block hash enters a span: never
+  transaction hashes, calldata, signatures, keys, tokens or mempool contents.
+  `producer` is the public validator address already present in blocks.
+  Durations come from the span itself; no duration field is recorded.
+- No span guard is held across an `await`; every consensus span is scoped to
+  its synchronous driver step.
+
+Tests: `subhost-rpc/src/block_span_tests.rs` and
+`subhost-node/src/consensus_span_tests.rs` assert the field tables, the
+per-step (not per-vote) volume, structural `invalid_qc` tagging, and the
+absence of raw error text and transaction identity.
+
 ## Sample alert rules (S8.5)
 
 The canonical, expanded rule set — including a no-quorum finality-stall proxy
@@ -205,7 +260,7 @@ quorum certificates exist), so that alert must stay disabled for demo deployment
   `otlp` feature (Q-035): `otlp::init_with_otlp` installs the export layer and
   returns a retained shutdown guard. The `subhost` CLI now wires it (global
   `--otlp-endpoint` / `SUBHOST_OTLP_ENDPOINT`, opt-in at runtime); RPC method
-  spans (#69) export once an endpoint is set. The Track A block/consensus spans
-  and the sync-relay export wiring follow.
+  spans (#69) and the Track A block/consensus spans (Q-035) export once an
+  endpoint is set. The sync-relay export wiring follows.
 - The exporter is unauthenticated: bind loopback or a private interface, or
   front it with an authenticating proxy. `/health/*` reveals readiness state.
