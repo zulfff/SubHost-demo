@@ -25,8 +25,8 @@ use subhost_state::{State, StateSnapshot};
 use tracing::debug;
 
 use crate::{
-    LedgerSnapshot, PruneOutcome, RestoredLedger, StorageError, LEDGER_BACKUP_FILE_NAME,
-    LEDGER_DIR_NAME, LEDGER_FILE_NAME, MANIFEST_FILE_NAME,
+    lock_cache, HeadCache, LedgerSnapshot, PruneOutcome, RestoredLedger, StorageError,
+    VerifiedHead, LEDGER_BACKUP_FILE_NAME, LEDGER_DIR_NAME, LEDGER_FILE_NAME, MANIFEST_FILE_NAME,
 };
 
 /// Target size for one segment file. A record is never split, so a segment may
@@ -652,29 +652,47 @@ fn snapshot_due(head: u64, current: Option<&SnapshotRef>, interval: u64) -> bool
 
 /// Append new block records, write the state snapshot when one is due, then
 /// commit the manifest.
+///
+/// Validation replays only the appended suffix when `head_cache` still matches
+/// the committed manifest; otherwise the whole offered history is validated.
+/// The cache is updated only after the manifest commit succeeds, so a failed
+/// persist leaves it describing the head that is actually on disk.
 pub(crate) fn persist(
     chain_id: ChainId,
     data_dir: &Path,
     snapshot: &LedgerSnapshot,
     segment_max_bytes: u64,
     snapshot_interval: u64,
+    head_cache: &HeadCache,
 ) -> Result<(), StorageError> {
     let previous = read_previous(chain_id, data_dir)?;
     let base_height = previous.as_ref().map_or(0, |previous| previous.base_height);
     let new_height = snapshot.blocks.last().map_or(0, |block| block.header.height);
+    let committed_records = previous.as_ref().map_or(Ok(0), CommittedLedger::records)?;
     // Validate before any write, against the base the manifest commits to. A
     // full history offered to a pruned store is rejected here rather than being
     // silently re-anchored.
-    crate::validate_snapshot_from(snapshot, chain_id, base_height)?;
+    let verified = match validate_appended_suffix(
+        previous.as_ref(),
+        head_cache,
+        snapshot,
+        chain_id,
+        committed_records,
+    )? {
+        Some(state) => state,
+        None => crate::validate_snapshot_from(snapshot, chain_id, base_height)?,
+    };
     check_append_only(previous.as_ref(), snapshot, new_height)?;
 
-    let committed_records = previous.as_ref().map_or(Ok(0), CommittedLedger::records)?;
     let dir = segments_dir(data_dir);
     fs::create_dir_all(&dir).map_err(|source| StorageError::Io { path: dir.clone(), source })?;
 
     let mut segments = previous.as_ref().map_or_else(Vec::new, |best| best.segments.clone());
     if committed_records < new_height.saturating_sub(base_height) {
-        let receipts = group_receipts(snapshot);
+        // Appended blocks start above the last committed *record*; a legacy
+        // previous has a head but no records, so every receipt is still new.
+        let committed_head = base_height.saturating_add(committed_records);
+        let receipts = group_receipts(snapshot, committed_head);
         let mut appender = Appender::open(&dir, &mut segments, segment_max_bytes)?;
         let start = usize::try_from(committed_records)
             .map_err(|_| StorageError::Segment("record count does not fit in memory".into()))?;
@@ -712,7 +730,109 @@ pub(crate) fn persist(
     };
     write_manifest(data_dir, chain_id, &committed)?;
     cleanup(data_dir, &committed, previous_snapshot.as_ref());
+    // The manifest commit succeeded: the offered head is now the verified head.
+    *lock_cache(head_cache) = Some(VerifiedHead {
+        base_height,
+        height: new_height,
+        hash: committed.head_hash,
+        state: verified,
+    });
     Ok(())
+}
+
+/// Validate only the blocks appended on top of the cached verified head.
+///
+/// Returns `None` when the cache cannot be trusted for this append — no cache,
+/// a legacy previous, a different committed head or base, an unchanged or
+/// shortened history — and the caller falls back to the full snapshot
+/// validation. Once the cache matches, its verdict is final: a suffix the
+/// cached state cannot replay is refused, not retried with the weaker full
+/// check, which never replays transitions.
+///
+/// The committed prefix is not re-read or re-validated here: it was fully
+/// verified when the cache was populated (load or a previous persist) and is
+/// append-only on disk. `check_append_only` still pins the carried head block.
+fn validate_appended_suffix(
+    previous: Option<&CommittedLedger>,
+    head_cache: &HeadCache,
+    snapshot: &LedgerSnapshot,
+    chain_id: ChainId,
+    committed_records: u64,
+) -> Result<Option<State>, StorageError> {
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    // A legacy single file has no committed snapshot; this persist rewrites it
+    // as segments, so the cache cannot describe what is on disk.
+    if previous.snapshot.is_none() {
+        return Ok(None);
+    }
+    let guard = lock_cache(head_cache);
+    let Some(cached) = guard.as_ref() else {
+        return Ok(None);
+    };
+    if cached.base_height != previous.base_height
+        || cached.height != previous.head_height
+        || cached.hash != previous.head_hash
+    {
+        return Ok(None);
+    }
+    let start = usize::try_from(committed_records).map_err(|_| {
+        StorageError::Invalid("retained record count does not fit in memory".into())
+    })?;
+    // Only growth is covered here. An unchanged or shortened history keeps the
+    // full validation, which must also re-check the offered prefix: genesis
+    // seeding legitimately persists a changed state at height 0.
+    let Some(suffix) = snapshot.blocks.get(start..) else {
+        return Ok(None);
+    };
+    if suffix.is_empty() || snapshot.chain_id != chain_id || snapshot.state.chain_id != chain_id {
+        return Ok(None);
+    }
+
+    // `validate_chain_from` skips the first block's parent link when the base
+    // height is non-zero, so the link to the verified head is checked here.
+    let first = &suffix[0];
+    let expected_height = cached
+        .height
+        .checked_add(1)
+        .ok_or_else(|| StorageError::Invalid("block height overflow".into()))?;
+    if first.header.height != expected_height || first.header.parent_hash != cached.hash {
+        return Err(StorageError::Invalid(format!(
+            "block {expected_height} does not extend the verified head"
+        )));
+    }
+
+    // Replaying the suffix enforces nonce ordering across the whole history:
+    // a transaction already committed below the head cannot be applied again.
+    let mut state = cached.state.clone();
+    for block in suffix {
+        for transaction in &block.transactions {
+            state.apply_transaction(transaction).map_err(|error| {
+                StorageError::Invalid(format!(
+                    "cannot replay block {} on the verified head: {error}",
+                    block.header.height
+                ))
+            })?;
+        }
+    }
+
+    let receipts: Vec<Receipt> = snapshot
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.block_height > cached.height)
+        .cloned()
+        .collect();
+    crate::validate_chain_from(cached.height, suffix, &receipts, chain_id, &state)?;
+
+    let offered = State::from_snapshot(snapshot.state.clone())
+        .map_err(|error| StorageError::Invalid(error.to_string()))?;
+    if offered.root() != state.root() {
+        return Err(StorageError::Invalid(
+            "offered state does not match the replayed suffix".into(),
+        ));
+    }
+    Ok(Some(state))
 }
 
 /// Read whatever history the directory currently commits to: the manifest if it
@@ -837,10 +957,14 @@ pub(crate) fn prune(
     Ok(PruneOutcome::Pruned { dropped_segments, retained_segments: keep_segments, base_height })
 }
 
-fn group_receipts(snapshot: &LedgerSnapshot) -> HashMap<u64, Vec<Receipt>> {
+/// Group the receipts of the blocks this persist appends (heights above
+/// `previous_head`); receipts of the committed prefix are never rewritten.
+fn group_receipts(snapshot: &LedgerSnapshot, previous_head: u64) -> HashMap<u64, Vec<Receipt>> {
     let mut by_height: HashMap<u64, Vec<Receipt>> = HashMap::new();
     for receipt in &snapshot.receipts {
-        by_height.entry(receipt.block_height).or_default().push(receipt.clone());
+        if receipt.block_height > previous_head {
+            by_height.entry(receipt.block_height).or_default().push(receipt.clone());
+        }
     }
     for receipts in by_height.values_mut() {
         receipts.sort_by_key(|receipt| receipt.transaction_index);

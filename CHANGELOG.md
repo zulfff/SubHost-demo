@@ -88,6 +88,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **Ledger appends no longer re-validate the whole retained history
+  (SUBHOST-2026-003, storage slice).** `LedgerStore` keeps the last fully verified
+  head; a persist that extends it validates only the appended suffix, including a
+  state replay that refuses transactions the committed state cannot apply
+  (replayed or nonce-skipping transactions with otherwise honest commitments,
+  which the old root-only check accepted into a ledger that would fail to load).
+  Commit latency no longer grows with history: the audit PoC measured 52.6x
+  submit-latency growth over 1000 empty blocks on `01a59df`, 1.2x with the fix.
+  A cache miss (fresh process before load, legacy file, prune, unchanged history)
+  falls back to the previous full validation. Unpriced calldata (Bima/Raka fee
+  contract) and the node-side O(N) block-list clone per commit remain separate
+  follow-ups.
 - Rejected oversized transaction admission/replacement preserves the existing
   pool and ledger state. Actual JSON gossip envelopes are checked against the
   transport budget before publication.

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 use subhost_core::{
     encode_canonical, tx_root_of, Block, ChainId, Gas, Hash, Receipt, ReceiptStatus,
@@ -128,15 +129,42 @@ pub struct LedgerDiskStats {
     pub snapshot_modified: Option<SystemTime>,
 }
 
+/// The newest head this process fully verified, kept so an append validates
+/// only the blocks it adds instead of replaying the whole retained history.
+///
+/// It is trusted only while it matches the committed manifest (base height,
+/// head height, head hash). Any mismatch — a pruned store, a rolled-back
+/// manifest, a fresh process — falls back to the full snapshot validation.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedHead {
+    pub base_height: u64,
+    pub height: u64,
+    pub hash: Hash,
+    pub state: State,
+}
+
+pub(crate) type HeadCache = Mutex<Option<VerifiedHead>>;
+
+/// Lock the head cache, recovering from a poisoned mutex: the cache is a plain
+/// verified snapshot with no torn-state invariant, and a panic elsewhere must
+/// not turn every later persist into a crash.
+pub(crate) fn lock_cache(cache: &HeadCache) -> MutexGuard<'_, Option<VerifiedHead>> {
+    cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// A ledger store bound to one chain ID and one data directory.
 ///
 /// [`LedgerStore::ephemeral`] yields a store that validates exactly like the
 /// durable one but discards writes, which keeps in-memory and on-disk nodes on
 /// the same code path.
+///
+/// Clones share the verified-head cache: they describe the same directory, and
+/// the node serializes persist/prune under its commit lock (single writer).
 #[derive(Debug, Clone)]
 pub struct LedgerStore {
     path: Option<PathBuf>,
     chain_id: ChainId,
+    head: Arc<HeadCache>,
 }
 
 impl LedgerStore {
@@ -148,7 +176,11 @@ impl LedgerStore {
         let data_dir = data_dir.as_ref();
         fs::create_dir_all(data_dir)
             .map_err(|source| StorageError::Io { path: data_dir.to_path_buf(), source })?;
-        Ok(Self { path: Some(data_dir.join(LEDGER_FILE_NAME)), chain_id })
+        Ok(Self {
+            path: Some(data_dir.join(LEDGER_FILE_NAME)),
+            chain_id,
+            head: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// A store that performs every validation but never touches the filesystem.
@@ -156,7 +188,7 @@ impl LedgerStore {
         if chain_id == 0 {
             return Err(StorageError::InvalidChainId);
         }
-        Ok(Self { path: None, chain_id })
+        Ok(Self { path: None, chain_id, head: Arc::new(Mutex::new(None)) })
     }
 
     pub fn chain_id(&self) -> ChainId {
@@ -181,18 +213,30 @@ impl LedgerStore {
     }
 
     /// Load and fully validate the ledger, or return an empty one.
+    ///
+    /// A successful load fully verifies the retained history, so its head is
+    /// cached for suffix-only validation of later appends.
     pub fn load(&self) -> Result<RestoredLedger, StorageError> {
-        let Some(path) = &self.path else {
-            return Ok(self.empty());
+        let restored = match &self.path {
+            None => self.empty(),
+            Some(path) => {
+                let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
+                if segmented::manifest_path(data_dir).is_file() {
+                    segmented::load(self.chain_id, data_dir)?
+                } else if !path.is_file() {
+                    self.empty()
+                } else {
+                    self.restore(legacy::read(path)?)?
+                }
+            }
         };
-        let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
-        if segmented::manifest_path(data_dir).is_file() {
-            return segmented::load(self.chain_id, data_dir);
-        }
-        if !path.is_file() {
-            return Ok(self.empty());
-        }
-        self.restore(legacy::read(path)?)
+        *lock_cache(&self.head) = Some(VerifiedHead {
+            base_height: restored.base_height,
+            height: restored.height(),
+            hash: restored.blocks.last().map_or(Hash::ZERO, Block::hash),
+            state: restored.state.clone(),
+        });
+        Ok(restored)
     }
 
     /// Validate a decoded snapshot and rebuild the in-memory ledger from it.
@@ -238,7 +282,14 @@ impl LedgerStore {
             .map_err(|source| StorageError::Io { path: data_dir.to_path_buf(), source })?;
         // `segmented::persist` reads the committed base from the manifest and
         // validates the retained suffix against it before writing anything.
-        segmented::persist(self.chain_id, data_dir, snapshot, segment_max_bytes, snapshot_interval)
+        segmented::persist(
+            self.chain_id,
+            data_dir,
+            snapshot,
+            segment_max_bytes,
+            snapshot_interval,
+            &self.head,
+        )
     }
 
     /// Test-only entry point that shrinks the segment roll-over threshold and the

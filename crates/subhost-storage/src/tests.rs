@@ -1347,3 +1347,239 @@ fn legacy_ledger_disk_stats_report_the_file_without_a_snapshot_timestamp() {
     assert_eq!(stats.active_file_bytes, fs::metadata(&path).unwrap().len());
     assert_eq!(stats.snapshot_modified, None);
 }
+
+/// Seal one block whose header commits to `state` as-is, without applying its
+/// transactions: the producer shortcut the suffix replay must catch.
+fn seal_without_replay(
+    parent: &Block,
+    transactions: Vec<Transaction>,
+    state: &State,
+) -> (Block, Vec<Receipt>) {
+    let height = parent.header.height + 1;
+    let mut hashes = Vec::new();
+    let mut commitments = Vec::new();
+    let mut gas_used = 0u64;
+    for (tx_index, tx) in transactions.iter().enumerate() {
+        gas_used += tx.gas_limit;
+        let tx_hash = tx.hash();
+        hashes.push(tx_hash);
+        commitments.push(receipt_commitment(
+            tx_hash,
+            height,
+            u32::try_from(tx_index).unwrap(),
+            tx.gas_limit,
+            gas_used,
+        ));
+    }
+    let header = BlockHeader {
+        version: 1,
+        chain_id: 1,
+        height,
+        timestamp: 1_700_000_000 + height,
+        parent_hash: parent.hash(),
+        state_root: state.root(),
+        tx_root: tx_root_of(&hashes),
+        receipt_root: receipts_root(&commitments),
+        validator: Address::ZERO,
+        gas_used,
+        gas_limit: BLOCK_GAS_LIMIT,
+        extra_data: Vec::new(),
+    };
+    let block = Block { header, transactions, signatures: Vec::new() };
+    let mut cumulative_gas_used = 0u64;
+    let receipts = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(tx_index, tx)| {
+            cumulative_gas_used += tx.gas_limit;
+            Receipt {
+                tx_hash: tx.hash(),
+                block_hash: block.hash(),
+                block_height: height,
+                transaction_index: u32::try_from(tx_index).unwrap(),
+                gas_used: tx.gas_limit,
+                cumulative_gas_used,
+                status: ReceiptStatus::Success,
+                logs: Vec::new(),
+                contract_address: None,
+            }
+        })
+        .collect();
+    (block, receipts)
+}
+
+#[test]
+fn append_refuses_a_transaction_the_state_cannot_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let (first, state) = ledger(1);
+    store.persist(&first).unwrap();
+
+    // Honest commitments and an offered state root that matches the header,
+    // but the nonce skips ahead. The full-history check never replays
+    // transitions, so only the suffix replay catches this before it is written.
+    let (block, receipts) = seal_without_replay(&first.blocks[0], vec![transfer(5)], &state);
+    let mut snapshot = first.clone();
+    snapshot.blocks.push(block);
+    snapshot.receipts.extend(receipts);
+
+    let error = store.persist(&snapshot).unwrap_err();
+    assert!(matches!(error, StorageError::Invalid(_)), "unexpected error: {error:?}");
+    assert!(error.to_string().contains("cannot replay block 2"), "{error}");
+    assert_eq!(store.load().unwrap().height(), 1, "nothing may be committed");
+}
+
+#[test]
+fn append_refuses_a_replayed_committed_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let (first, state) = ledger(1);
+    store.persist(&first).unwrap();
+
+    // The same transaction again in block 2: its nonce is already consumed by
+    // the committed head, so the replay refuses it even with honest commitments.
+    let (block, receipts) = seal_without_replay(&first.blocks[0], vec![transfer(0)], &state);
+    let mut snapshot = first.clone();
+    snapshot.blocks.push(block);
+    snapshot.receipts.extend(receipts);
+
+    let error = store.persist(&snapshot).unwrap_err();
+    assert!(error.to_string().contains("cannot replay block 2"), "{error}");
+    assert_eq!(store.load().unwrap().height(), 1);
+}
+
+#[test]
+fn append_refuses_a_tampered_offered_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(1).0).unwrap();
+
+    let (mut next, mut state) = ledger(2);
+    state.credit(Address::new([9; 20]), 1).unwrap();
+    next.state = state.snapshot();
+
+    let error = store.persist(&next).unwrap_err();
+    assert!(
+        error.to_string().contains("offered state does not match the replayed suffix"),
+        "{error}"
+    );
+    assert_eq!(store.load().unwrap().height(), 1);
+}
+
+#[test]
+fn append_refuses_a_suffix_that_does_not_extend_the_verified_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(1).0).unwrap();
+
+    let (mut next, _) = ledger(2);
+    next.blocks[1].header.parent_hash = Hash::ZERO;
+
+    let error = store.persist(&next).unwrap_err();
+    assert!(error.to_string().contains("does not extend the verified head"), "{error}");
+    assert_eq!(store.load().unwrap().height(), 1);
+}
+
+#[test]
+fn a_reloaded_store_replays_appends_against_the_loaded_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let (first, state) = ledger(1);
+    store.persist(&first).unwrap();
+
+    // A fresh process never persisted anything: its cache comes from load.
+    let reopened = open(dir.path());
+    assert_eq!(reopened.load().unwrap().height(), 1);
+    let (block, receipts) = seal_without_replay(&first.blocks[0], vec![transfer(5)], &state);
+    let mut snapshot = first.clone();
+    snapshot.blocks.push(block);
+    snapshot.receipts.extend(receipts);
+    assert!(matches!(reopened.persist(&snapshot), Err(StorageError::Invalid(_))));
+    assert_eq!(reopened.load().unwrap().height(), 1);
+}
+
+#[test]
+fn a_legacy_previous_gets_full_validation_then_caches_the_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let (legacy_snapshot, _) = ledger(2);
+    fs::write(dir.path().join(LEDGER_FILE_NAME), legacy::encode(&legacy_snapshot)).unwrap();
+
+    let store = open(dir.path());
+    assert_eq!(store.load().unwrap().height(), 2);
+    // The legacy file has no committed snapshot: this persist migrates it and
+    // must validate the whole offered history, not a suffix.
+    store.persist(&ledger(3).0).unwrap();
+    assert!(segmented::manifest_path(dir.path()).is_file());
+    // Now the cache describes the segmented head; the next append is a suffix.
+    store.persist(&ledger(4).0).unwrap();
+    assert_eq!(store.load().unwrap().height(), 4);
+}
+
+#[test]
+fn append_refuses_a_suffix_inconsistent_with_the_committed_genesis_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let mut seeded = State::with_chain_id(1);
+    seeded.credit(Address::new([3; 20]), 500).unwrap();
+    store
+        .persist(&LedgerSnapshot {
+            chain_id: 1,
+            state: seeded.snapshot(),
+            blocks: Vec::new(),
+            receipts: Vec::new(),
+        })
+        .unwrap();
+
+    // ledger(1) funds only its own sender: the committed genesis allocation is
+    // absent from the offered state, so the suffix cannot replay on the head.
+    // Accepting it would write a ledger that fails to load.
+    let error = store.persist(&ledger(1).0).unwrap_err();
+    assert!(error.to_string().contains("cannot replay block 1"), "{error}");
+    assert_eq!(store.load().unwrap().height(), 0);
+}
+
+#[test]
+fn append_refuses_a_replay_of_a_transaction_in_the_pruned_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    persist_each_block(&store, 4, 1, 1);
+    store.prune(2).unwrap();
+    assert_eq!(store.load().unwrap().base_height, 2);
+
+    // Block 1 (and its nonce-0 transaction) is pruned, so no offered list can
+    // contain it: only the cached head state's nonce check covers this replay.
+    let (full, state) = ledger(4);
+    let (block, receipts) = seal_without_replay(&full.blocks[3], vec![transfer(0)], &state);
+    let mut blocks = full.blocks[2..].to_vec();
+    blocks.push(block);
+    let mut retained: Vec<Receipt> =
+        full.receipts.iter().filter(|receipt| receipt.block_height >= 3).cloned().collect();
+    retained.extend(receipts);
+    let snapshot =
+        LedgerSnapshot { chain_id: 1, state: state.snapshot(), blocks, receipts: retained };
+
+    let error = store.persist(&snapshot).unwrap_err();
+    assert!(error.to_string().contains("cannot replay block 5"), "{error}");
+    assert_eq!(store.load().unwrap().height(), 4);
+}
+
+#[test]
+fn an_unchanged_history_with_a_tampered_state_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(1).0).unwrap();
+
+    // Empty suffix: the full validation runs and its final root check refuses
+    // the doctored state, exactly as before the cache existed.
+    let (mut same, mut state) = ledger(1);
+    state.credit(Address::new([9; 20]), 1).unwrap();
+    same.state = state.snapshot();
+
+    let error = store.persist(&same).unwrap_err();
+    assert!(
+        error.to_string().contains("state does not match the newest block state root"),
+        "{error}"
+    );
+    assert_eq!(store.load().unwrap().height(), 1);
+}
