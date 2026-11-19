@@ -80,6 +80,7 @@ fn build(block_transactions: Vec<Vec<Transaction>>) -> (LedgerSnapshot, State) {
             gas_used,
             gas_limit: BLOCK_GAS_LIMIT,
             extra_data: Vec::new(),
+            base_fee_per_gas: 0,
         };
         let block = Block { header, transactions, signatures: Vec::new() };
 
@@ -1384,6 +1385,7 @@ fn seal_without_replay(
         gas_used,
         gas_limit: BLOCK_GAS_LIMIT,
         extra_data: Vec::new(),
+        base_fee_per_gas: 0,
     };
     let block = Block { header, transactions, signatures: Vec::new() };
     let mut cumulative_gas_used = 0u64;

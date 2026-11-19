@@ -242,6 +242,34 @@ impl State {
         Ok(fee)
     }
 
+    /// Credit the block producer's accumulated priority fees once, after every
+    /// transaction in the block has executed (S6.2, Q-017).
+    ///
+    /// Settlement happens at the end of the block, so a producer cannot spend
+    /// the tip from a transaction earlier in the same block. `None` means the
+    /// explicit validatorless demo mode: the tip is burned and no reward
+    /// account is created. A zero reward is a no-op for the same reason —
+    /// settlement must not conjure empty accounts. The overflow check runs
+    /// before any mutation so a failed credit leaves state untouched.
+    pub fn credit_block_priority(
+        &mut self,
+        producer: Option<Address>,
+        amount: Amount,
+    ) -> Result<(), StateError> {
+        let Some(producer) = producer else {
+            return Ok(());
+        };
+        if amount == 0 {
+            return Ok(());
+        }
+        let updated = self
+            .balance(&producer)
+            .checked_add(amount)
+            .ok_or(StateError::BalanceOverflow { address: producer })?;
+        self.accounts.entry(producer).or_default().balance = updated;
+        Ok(())
+    }
+
     fn ensure_balance(&self, address: &Address, amount: Amount) -> Result<(), StateError> {
         let have = self.balance(address);
         if have < amount {
@@ -589,5 +617,48 @@ mod tests {
         assert_ne!(empty, credited);
         state.accounts.get_mut(&addr(1)).unwrap().nonce = 1;
         assert_ne!(credited, state.root());
+    }
+
+    #[test]
+    fn block_priority_settles_once_and_changes_the_root() {
+        let mut state = State::new();
+        state.credit(addr(1), 1_000).unwrap();
+        let before = state.root();
+        state.credit_block_priority(Some(addr(3)), 7).unwrap();
+        assert_eq!(state.balance(&addr(3)), 7);
+        assert_ne!(before, state.root(), "the reward is part of the state root");
+        // A second block's tip accrues on top instead of replacing.
+        state.credit_block_priority(Some(addr(3)), 5).unwrap();
+        assert_eq!(state.balance(&addr(3)), 12);
+    }
+
+    #[test]
+    fn block_priority_never_creates_or_rewards_zero_address() {
+        let mut state = State::new();
+        let root = state.root();
+        // Validatorless demo mode: the tip is burned, no account at all.
+        state.credit_block_priority(None, 9).unwrap();
+        assert_eq!(state.account_count(), 0);
+        assert_eq!(state.balance(&Address::ZERO), 0);
+        // An empty reward is a no-op even for a real producer.
+        state.credit_block_priority(Some(addr(3)), 0).unwrap();
+        assert!(state.account(&addr(3)).is_none());
+        assert_eq!(state.root(), root);
+    }
+
+    #[test]
+    fn block_priority_overflow_leaves_state_untouched() {
+        let mut state = State::new();
+        state.credit(addr(3), Amount::MAX - 1).unwrap();
+        let root = state.root();
+        assert!(matches!(
+            state.credit_block_priority(Some(addr(3)), 2),
+            Err(StateError::BalanceOverflow { address }) if address == addr(3)
+        ));
+        assert_eq!(state.balance(&addr(3)), Amount::MAX - 1);
+        assert_eq!(state.root(), root, "a failed settlement must not mutate");
+        // Exactly reaching the maximum is fine.
+        state.credit_block_priority(Some(addr(3)), 1).unwrap();
+        assert_eq!(state.balance(&addr(3)), Amount::MAX);
     }
 }

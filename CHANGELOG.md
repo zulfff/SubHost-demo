@@ -245,6 +245,22 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Fee-market core/state API and version-2 header codec (S6.2 step 1, ADR-010,
+  contracts Q-017/Q-030).** Additive only: `subhost_core::fee` supplies
+  `FeePolicy`/`FeeContext` with exact-floor base-fee updates (elasticity 2,
+  denominator 8, minimum step 1 in both directions, clamped to `[min, max]`),
+  `Transaction::fee_breakdown` and the pure `settle_block_fees`;
+  `State::credit_block_priority` settles a producer tip once with overflow
+  checked before mutation and no account for a zero reward or validatorless
+  mode. `BlockHeader` gains `base_fee_per_gas` behind a custom codec — binary
+  12-element tuple for version 1, 13 for version 2, JSON named fields with the
+  fee as a decimal string — and `GenesisConfig` gains an optional `fee_policy`
+  that binds into the consensus context only when present. **Nothing enables a
+  policy in this step**: no node/RPC wiring, so chains still produce version-1
+  blocks with byte-identical headers, genesis bindings and burn rules. Ledger
+  policy binding/replay (Track B) and the node/RPC behaviour change land in the
+  next two steps of ADR-010.
+
 - **Release engineering and checked optimized tests (S9).** Added exact tag/version
   validation, an immutable compiler-image binary build, deterministic archives
   and SHA256 inventories, pinned CycloneDX/Sigstore tooling, reusable locked CI,

@@ -74,7 +74,7 @@ The Q-001 thread is workspace-local and untracked by design (see
 
 - `docs/agents/questions/agreed/Q-001-block-signature-scheme.md` (untracked)
 - `docs/agents/replies/Q-001-track-b.md` (untracked)
-- `crates/subhost-core/src/lib.rs:299` — `Block::signing_payload`
-- `crates/subhost-consensus/src/lib.rs:64` — `ValidatorRegistry`
-- `crates/subhost-crypto/src/lib.rs:6` — non-RFC 9380 hash-to-curve limitation
+- `crates/subhost-core/src/lib.rs:299`: `Block::signing_payload`
+- `crates/subhost-consensus/src/lib.rs:64`: `ValidatorRegistry`
+- `crates/subhost-crypto/src/lib.rs:6`: non-RFC 9380 hash-to-curve limitation
 - https://www.ietf.org/archive/id/draft-irtf-cfrg-bls-signature-06.txt

@@ -586,6 +586,7 @@ mod tests {
                 gas_used: 0,
                 gas_limit: BLOCK_GAS_LIMIT,
                 extra_data: Vec::new(),
+                base_fee_per_gas: 0,
             },
             transactions: Vec::new(),
             signatures: Vec::new(),
