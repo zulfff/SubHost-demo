@@ -5,9 +5,13 @@ validator's identity. The crate is `subhost-keystore`; the CLI surface is
 `subhost producer …` plus `subhost init --producer-credential-file`.
 
 **Status:** creation, inspection, unlock, migration and genesis init consume
-the keystore today. Encrypted *node start-up* is not wired yet: Track A lands
-`Node::bootstrap_with_producer_key` and the legacy loader fixes under the same
-ADR. Until then `subhost node` keeps reading the plaintext `producer.key`, and
+the keystore today. The node side is ready: `Node::bootstrap_with_producer_key`
+accepts an unlocked key with the same membership and proof-of-possession checks
+as a file-loaded one, and the legacy `producer.key` loader now uses the
+keystore crate's hardened owner-only reader (no symlinks, owner-only mode,
+effective-uid ownership, bounded read, explicit non-Unix refusal). The
+remaining step is a CLI flag that unlocks the keystore and calls that API;
+until it lands, `subhost node` keeps reading the plaintext `producer.key`, and
 a migrated data directory still starts from that preserved legacy file.
 
 ## Commands

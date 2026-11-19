@@ -99,6 +99,19 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **The legacy producer key loader no longer follows symlinks or trusts a
+  separate stat (S9.6 Track A, ADR-011, Q-018 finding 2).** `read_producer_key`
+  now reads through `subhost_keystore::read_bounded_owner_only`: `O_NOFOLLOW` on
+  the opened handle, a regular file, owner-only mode, an effective-uid ownership
+  check and a 256-byte bound. A symlinked, group-readable, foreign-owned,
+  non-regular or oversized key file is refused before it is parsed, and non-Unix
+  platforms fail explicitly instead of silently accepting. The node's own
+  `stat`-then-open permission check is removed, so the legacy path and the
+  keystore path cannot drift apart, and the init consumer's double-read window
+  is closed. Permission-bit refusals keep `InsecureProducerKey`; the other
+  refusals surface as `UnsafeProducerKey { path, reason }`.
+
+
 - **A pruned height is no longer treated as a fork (R-57-01, PR #57 review).**
   `route_final_evidence` decided a `Historical` certificate by looking up the
   block at its height and comparing hashes; after a ledger prune that lookup
@@ -353,6 +366,17 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   the 4096-item archive window and the failure-path tests land in the S12.3
   retention slice, after the storage-side `prune_to_height` contract; this entry
   is the field only, so the CLI flag can stack on it. No behaviour change.
+- **Node bootstrap with an unlocked producer key (S9.6 Track A, ADR-011).**
+  `Node::bootstrap_with_producer_key(config, key)` takes the BLS key a keystore
+  unlock produced, so no password or plaintext key path reaches the node. It
+  runs the same bootstrap path and the same checks as a file-loaded key:
+  canonical encoding round-trip, derived public key, unique genesis membership,
+  and the registry's proof-of-possession verification. A supplied key wins over
+  any configured key file, which is never read; supplying one to a non-validator
+  configuration is an error. Observers keep booting without key material. The
+  CLI flag that unlocks a keystore for `subhost node` is the remaining consumer
+  step.
+
 
 - **Operations runbooks and sample alerts (S8.4/S8.5).** Added
   `docs/operations/` runbooks for start/stop, producer key handling and rotation,

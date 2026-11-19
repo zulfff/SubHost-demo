@@ -161,6 +161,35 @@ impl Node {
     /// Genesis allocations are applied only when no ledger exists yet, so a
     /// restart can never re-mint balances over a live chain.
     pub fn bootstrap(config: NodeConfig) -> Result<Self, NodeError> {
+        Self::bootstrap_inner(config, None)
+    }
+
+    /// Bootstrap with an already-unlocked producer key (S9.6, ADR-011).
+    ///
+    /// The keystore crate unlocks the file; this entry point takes the resulting
+    /// key so no password or plaintext file path reaches the node. The key is
+    /// validated exactly like a file-loaded one: canonical encoding round-trip,
+    /// derived public key, unique genesis membership, and the registry's
+    /// proof-of-possession checks. Unlocking bypasses nothing — validator
+    /// configuration, journal recovery and certified-history reconciliation all
+    /// run unchanged. A non-validator configuration is an error, and the
+    /// configured key file is never read when a key is supplied.
+    pub fn bootstrap_with_producer_key(
+        config: NodeConfig,
+        key: PrivateKey,
+    ) -> Result<Self, NodeError> {
+        if !config.validator {
+            return Err(NodeError::InvalidConsensusConfiguration(
+                "a supplied producer key requires a validator configuration".into(),
+            ));
+        }
+        Self::bootstrap_inner(config, Some(key))
+    }
+
+    fn bootstrap_inner(
+        config: NodeConfig,
+        supplied_key: Option<PrivateKey>,
+    ) -> Result<Self, NodeError> {
         if config.view_timeout_ms == 0 {
             return Err(NodeError::InvalidConsensusConfiguration(
                 "view_timeout_ms must be nonzero".into(),
@@ -221,15 +250,27 @@ impl Node {
         };
 
         let mut producer_identity = None;
-        let authority = match (config.producer_key_path(), validators.as_ref()) {
-            (None, _) => None,
-            (Some(path), Some(validators)) => {
+        let authority = match (supplied_key, config.producer_key_path(), validators.as_ref()) {
+            // A supplied key wins over any configured file, which is never read.
+            (Some(secret), _, Some(validators)) => {
+                let (producer, secret) = resolve_supplied_producer(secret, genesis.as_ref())?;
+                info!(%producer, "using the supplied producer key");
+                producer_identity = Some((producer, secret.clone()));
+                Some(BlockAuthority::new(validators.clone(), producer, secret)?)
+            }
+            (Some(_), _, None) => {
+                return Err(NodeError::InvalidConsensusConfiguration(
+                    "a supplied producer key requires a genesis validator set".into(),
+                ));
+            }
+            (None, None, _) => None,
+            (None, Some(path), Some(validators)) => {
                 let (producer, secret) = load_producer(&path, genesis.as_ref())?;
                 info!(path = %path.display(), %producer, "loaded the producer key");
                 producer_identity = Some((producer, secret.clone()));
                 Some(BlockAuthority::new(validators.clone(), producer, secret)?)
             }
-            (Some(path), None) => return Err(NodeError::NoValidatorSetForProducer(path)),
+            (None, Some(path), None) => return Err(NodeError::NoValidatorSetForProducer(path)),
         };
         let driver_registry = validators.clone();
 
@@ -1852,13 +1893,18 @@ fn load_genesis(path: &Path) -> Result<Option<GenesisConfig>, NodeError> {
 ///
 /// This is the only loader for the format. `subhost-cli` uses it for `init`, so
 /// the genesis writer and the node cannot disagree about what a key file means.
+///
+/// The file is read through the keystore crate's hardened reader (ADR-011):
+/// `O_NOFOLLOW`, a regular file, an owner-only mode, an effective-uid ownership
+/// check and a bounded read, all on the opened handle rather than a separate
+/// `stat` followed by a second open. Symlinks are refused outright, non-Unix
+/// platforms fail explicitly, and the legacy path and the keystore path cannot
+/// drift apart — which also closes the init consumer's double-read window.
 pub fn read_producer_key(path: &Path) -> Result<PrivateKey, NodeError> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|source| NodeError::ProducerKey { path: path.to_path_buf(), source })?;
-    check_producer_permissions(path, &metadata)?;
-
-    let text = std::fs::read_to_string(path)
-        .map_err(|source| NodeError::ProducerKey { path: path.to_path_buf(), source })?;
+    let bytes = subhost_keystore::read_bounded_owner_only(path, MAX_PRODUCER_KEY_FILE_BYTES)
+        .map_err(|error| producer_read_error(path, error))?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| NodeError::InvalidProducerKey(path.to_path_buf()))?;
     let text = text.trim();
     let digits = text.strip_prefix("0x").unwrap_or(text);
     let bytes =
@@ -1871,6 +1917,44 @@ pub fn read_producer_key(path: &Path) -> Result<PrivateKey, NodeError> {
         return Err(NodeError::InvalidProducerKey(path.to_path_buf()));
     }
     Ok(secret)
+}
+
+/// A legacy key file is 64 hex digits plus an optional `0x` and a newline; the
+/// bound leaves headroom for whitespace without reading an attacker-sized file.
+const MAX_PRODUCER_KEY_FILE_BYTES: u64 = 256;
+
+/// Map the shared secret-file reader's refusals onto the node's error surface.
+///
+/// Permission bits keep their existing dedicated variant; the remaining
+/// refusals (symlink or special file, foreign owner, unsupported platform,
+/// oversized file) name the reason so an operator can act on it.
+fn producer_read_error(path: &Path, error: subhost_keystore::ProducerKeystoreError) -> NodeError {
+    use subhost_keystore::ProducerKeystoreError as Keystore;
+    match error {
+        Keystore::InsecurePermissions { mode } => {
+            NodeError::InsecureProducerKey { path: path.to_path_buf(), mode }
+        }
+        Keystore::Io(source) => NodeError::ProducerKey { path: path.to_path_buf(), source },
+        Keystore::UnsafeFile => NodeError::UnsafeProducerKey {
+            path: path.to_path_buf(),
+            reason: "must be a regular file, not a symlink or special file".into(),
+        },
+        Keystore::InsecureOwner => NodeError::UnsafeProducerKey {
+            path: path.to_path_buf(),
+            reason: "is not owned by the running user".into(),
+        },
+        Keystore::UnsupportedPlatform => NodeError::UnsafeProducerKey {
+            path: path.to_path_buf(),
+            reason: "producer keys require a Unix platform with owner-only file permissions".into(),
+        },
+        Keystore::FileTooLarge => NodeError::UnsafeProducerKey {
+            path: path.to_path_buf(),
+            reason: "is larger than a producer key file may be".into(),
+        },
+        other => {
+            NodeError::UnsafeProducerKey { path: path.to_path_buf(), reason: other.to_string() }
+        }
+    }
 }
 
 /// Write a producer key file, refusing to overwrite an existing one.
@@ -1923,26 +2007,36 @@ fn load_producer(
     }
 }
 
-/// Refuse a key file that anyone but its owner can read.
+/// Resolve an already-unlocked producer key to its unique genesis validator.
 ///
-/// Creation with `0600` is not enough on its own: a copied or restored file can
-/// arrive with a wider mode, and that must fail loudly rather than load.
-#[cfg(unix)]
-fn check_producer_permissions(path: &Path, metadata: &std::fs::Metadata) -> Result<(), NodeError> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(NodeError::InsecureProducerKey { path: path.to_path_buf(), mode });
+/// The same checks the file path applies: canonical encoding round-trip,
+/// derived public key, exactly one genesis match. Proof-of-possession and
+/// corrected-suite verification already happened in
+/// `ValidatorRegistry::from_genesis` before this point, so unlocking a keystore
+/// cannot bypass them.
+fn resolve_supplied_producer(
+    secret: PrivateKey,
+    genesis: Option<&GenesisConfig>,
+) -> Result<(Address, PrivateKey), NodeError> {
+    let encoded = BLSScheme::encode_secret_key(&secret);
+    let decoded =
+        BLSScheme::decode_secret_key(&encoded).ok_or(NodeError::InvalidSuppliedProducerKey)?;
+    if BLSScheme::encode_secret_key(&decoded) != encoded {
+        return Err(NodeError::InvalidSuppliedProducerKey);
     }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_producer_permissions(
-    _path: &Path,
-    _metadata: &std::fs::Metadata,
-) -> Result<(), NodeError> {
-    Ok(())
+    let genesis = genesis.ok_or_else(|| {
+        NodeError::InvalidConsensusConfiguration(
+            "a supplied producer key requires a genesis validator set".into(),
+        )
+    })?;
+    let public_key = BLSScheme::encode_public_key(&BLSScheme::public_key(&secret));
+    let mut matches =
+        genesis.initial_validators.iter().filter(|validator| validator.public_key == public_key);
+    match (matches.next(), matches.next()) {
+        (Some(validator), None) => Ok((validator.address, secret)),
+        (Some(_), Some(_)) => Err(NodeError::AmbiguousSuppliedProducer),
+        (None, _) => Err(NodeError::UnknownSuppliedProducer),
+    }
 }
 
 /// Resolve when the process is asked to terminate.
@@ -2017,6 +2111,18 @@ pub enum NodeError {
 
     #[error("a producer key was configured for {0} but the genesis has no validator set")]
     NoValidatorSetForProducer(PathBuf),
+
+    #[error("producer key file {path} is unsafe: {reason}")]
+    UnsafeProducerKey { path: PathBuf, reason: String },
+
+    #[error("the supplied producer key is not a canonical BLS scalar")]
+    InvalidSuppliedProducerKey,
+
+    #[error("the supplied producer key does not belong to any genesis validator")]
+    UnknownSuppliedProducer,
+
+    #[error("the supplied producer key matches more than one genesis validator")]
+    AmbiguousSuppliedProducer,
 
     #[error("chain ID cannot be zero")]
     InvalidChainId,

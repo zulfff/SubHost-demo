@@ -1519,3 +1519,126 @@ fn bootstrap_ignores_a_stray_pending_file_without_an_attached_store() {
     assert_eq!(node.state().pending_count(), 0);
     assert_eq!(std::fs::read(&pending).unwrap(), b"not a snapshot");
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_producer_key_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (genesis, _, secret) = genesis_with_validator(1);
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    // A real owner-only key elsewhere, with the configured path pointing at it.
+    let target = dir.path().join("elsewhere.key");
+    std::fs::write(&target, hex::encode(BLSScheme::encode_secret_key(&secret))).unwrap();
+    set_mode_0600(&target);
+    let link = dir.path().join(PRODUCER_KEY_FILE_NAME);
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let config = NodeConfig { validator: true, single_writer: false, ..test_config(dir.path()) };
+    match Node::bootstrap(config) {
+        Err(NodeError::UnsafeProducerKey { path, reason }) => {
+            assert_eq!(path, link);
+            assert!(reason.contains("symlink"), "{reason}");
+        }
+        Err(other) => panic!("expected UnsafeProducerKey, got {other:?}"),
+        Ok(_) => panic!("a symlinked producer key must not boot a validator"),
+    }
+    assert!(matches!(read_producer_key(&link), Err(NodeError::UnsafeProducerKey { .. })));
+}
+
+#[test]
+fn an_oversized_producer_key_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (genesis, _, _) = genesis_with_validator(1);
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let path = dir.path().join(PRODUCER_KEY_FILE_NAME);
+    std::fs::write(&path, vec![b'a'; 300]).unwrap();
+    set_mode_0600(&path);
+
+    assert!(matches!(read_producer_key(&path), Err(NodeError::UnsafeProducerKey { .. })));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_producer_key_that_is_not_a_regular_file_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (genesis, _, _) = genesis_with_validator(1);
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let path = dir.path().join(PRODUCER_KEY_FILE_NAME);
+    std::fs::create_dir(&path).unwrap();
+
+    assert!(matches!(read_producer_key(&path), Err(NodeError::UnsafeProducerKey { .. })));
+}
+
+#[test]
+fn a_supplied_producer_key_boots_a_validator_without_any_key_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (genesis, address, secret) = genesis_with_validator(1);
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    // No producer.key on disk at all: the unlocked key is the only input.
+    assert!(!dir.path().join(PRODUCER_KEY_FILE_NAME).exists());
+
+    let config = NodeConfig { validator: true, single_writer: false, ..test_config(dir.path()) };
+    let node = Node::bootstrap_with_producer_key(config, secret).unwrap();
+    assert_eq!(node.genesis().unwrap().total_voting_power(), 100);
+
+    // A legacy chain proposes only when something is executable, so give it a
+    // transaction and check the supplied identity actually signs the proposal.
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    node.state().seed_accounts([(sender, 1_000_000)]).unwrap();
+    node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+
+    let driver = node.consensus().expect("a validator node must own a driver");
+    let mut driver = driver.lock().unwrap();
+    let round = produce_once_inner(
+        node.state(),
+        &mut driver,
+        node.consensus_journal.as_deref(),
+        node.certified_history.as_deref(),
+    )
+    .unwrap()
+    .expect("a validator with a pending transaction must propose");
+    assert_eq!(round.proposal.block.header.validator, address);
+    assert!(!round.proposal.block.signatures.is_empty(), "the supplied key must sign");
+    drop(driver);
+}
+
+#[test]
+fn a_supplied_producer_key_requires_a_validator_configuration() {
+    let dir = tempfile::tempdir().unwrap();
+    let (secret, _) = BLSScheme::keygen();
+    let mut config = test_config(dir.path());
+    config.single_writer = true;
+    assert!(matches!(
+        Node::bootstrap_with_producer_key(config, secret),
+        Err(NodeError::InvalidConsensusConfiguration(_))
+    ));
+}
+
+#[test]
+fn a_supplied_producer_key_outside_the_genesis_set_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (genesis, _, _) = genesis_with_validator(1);
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let (stranger, _) = BLSScheme::keygen();
+
+    let config = NodeConfig { validator: true, single_writer: false, ..test_config(dir.path()) };
+    assert!(matches!(
+        Node::bootstrap_with_producer_key(config, stranger),
+        Err(NodeError::UnknownSuppliedProducer)
+    ));
+}
+
+#[test]
+fn a_supplied_producer_key_never_reads_the_configured_key_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let (genesis, _, secret) = genesis_with_validator(1);
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    // A garbage file at the configured path: supplying a key must ignore it.
+    let path = dir.path().join(PRODUCER_KEY_FILE_NAME);
+    std::fs::write(&path, "not-a-scalar").unwrap();
+    set_mode_0600(&path);
+
+    let config = NodeConfig { validator: true, single_writer: false, ..test_config(dir.path()) };
+    assert!(Node::bootstrap_with_producer_key(config, secret).is_ok());
+}
