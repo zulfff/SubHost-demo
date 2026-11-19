@@ -46,7 +46,7 @@ All names live in the one `Metrics` registry (ADR-004); cloning shares it.
 | `subhost_ledger_active_bytes` | gauge | `LedgerStore::disk_stats()` under the commit lock. |
 | `subhost_ledger_snapshot_modified_seconds` | gauge | Same measurement; Unix seconds. **0 means unavailable**, not a real epoch time. |
 | `subhost_reorg_total` | counter | Registered at 0 with no increment API: reorgs are unsupported until a reviewed reorg protocol ships. Safety incidents are not reorgs. |
-| `subhost_mempool_transactions_total{event}` | counter | Pool lifecycle: `admitted`, `replaced`, `evicted`, `expired` (S6.3). Labels come from `MempoolEvent` only. |
+| `subhost_mempool_transactions_total{event}` | counter | Pool lifecycle: `admitted`, `replaced`, `evicted`, `expired` (S6.3). Labels come from `MempoolEvent` only. Counts pool-committed admissions only; see below. |
 
 Existing families (`subhost_rpc_*`, `subhost_connected_peers`,
 `subhost_block_height`, `subhost_pending_transactions`) are unchanged; see
@@ -68,6 +68,28 @@ not block/QC authentication.
   indistinguishable without extra state); segmented stores error instead.
 - The caller serializes measurement with persist/prune under the node's
   commit lock.
+
+### Mempool lifecycle counting
+
+`admit()` buffers typed events inside the pool instead of touching the
+registry. The submit path admits into a cloned candidate pool and drops the
+clone when a later step (dry-run build or seal) fails, so buffered events
+vanish with rejected candidates; only the committed write-back publishes
+them. The `eth_sendTransaction` handler drains the live pool's buffer after a
+successful submit, recording into the registry when one is attached and
+discarding otherwise (`Mempool::drain_events`), so a server without metrics
+cannot grow the buffer. The counters therefore track **pool-committed
+admissions**, not ledger commits: on the demo receipts-missing path
+`seal_block` can commit the block to the ledger and then return an error
+before the candidate pool is written back (`block.rs`); the live pool keeps
+the mined transactions and the buffered events drop, since the handler
+flushes only on `Ok` (a pre-existing Track A commit-path inconsistency,
+tracked as A follow-up). Idempotent resubmissions
+and lower-price rejections buffer nothing; mined removals are not lifecycle
+events.
+
+`expired` stays at 0: no TTL/expiry path exists in the pool or node yet. It
+wires when the S6.3 expiry lifecycle lands.
 
 ## Sample alert rules (S8.5)
 

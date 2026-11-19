@@ -233,6 +233,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   readiness stays 503. Operator guide and sample alerts:
   `docs/operations/observability.md`.
 
+- **Mempool lifecycle counters wired (S8.2, Q-026).** `Mempool::admit` buffers
+  typed `MempoolEvent`s inside the pool; the submit path's candidate clone
+  carries them, so rejected candidates drop their events and only
+  pool-committed admissions count. `Mempool::flush_events` drains the buffer into
+  `subhost_mempool_transactions_total`, called by the `eth_sendTransaction`
+  handler after a successful submit. The drain is unconditional: without a
+  registry, `Mempool::drain_events` discards the buffer, so it never grows and
+  a registry attached later counts only subsequent admissions. `expired`
+  remains registered at 0 until the S6.3 TTL path exists. `subhost-mempool`
+  now depends on `subhost-metrics`
+  (enum + flush only; no registry handle is stored in the pool).
+
 - **Corrected BLS authentication for the testnet.** RFC 9380 G2 hashing replaces
   the scalar-hash construction that allowed arbitrary signatures to be rescaled
   from public possession proofs. Official curve vectors and direct forgery
