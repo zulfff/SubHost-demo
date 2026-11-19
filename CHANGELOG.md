@@ -309,6 +309,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   legacy `0600` file remains the explicit demo path. Guide:
   `docs/operations/producer-keystore.md`.
 
+- **S8 observability contract accessors (ADR-013, Q-032).** Additive, read-only:
+  `RpcState::finalized_height()` reports the newest height committed with a
+  verified final Commit QC — the atomic is set only inside `commit_qc` and
+  `restore_committed_qc`, never from a peer announcement or a demo single-writer
+  commit (a demo chain publishes 0 by design). `RpcState::ledger_disk_stats()`
+  measures `LedgerStore::disk_stats()` under the existing commit lock, so it
+  serializes with persist/prune and cannot invert the head-cache lock order; a
+  missing active file is an error, never a false zero. No new RPC method and no
+  auth surface change. Five contract tests cover the demo/verified/restored
+  finality paths and both disk-measurement outcomes. The node call-sites that
+  publish these gauges are the follow-up hooks slice.
+
 - **View-change safety regressions (S2.4b, Q-031).** Direct tests now cover the
   phased view-change safety contract: same-view report equivocation is refused
   and a lower report from the same signer is ignored; a peer report whose

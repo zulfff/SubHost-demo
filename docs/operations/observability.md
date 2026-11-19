@@ -3,6 +3,9 @@
 Status: S8 Platform API (this document, ADR-013). The node runtime hooks that
 feed the runtime gauges are Track A work and land after this API; until then
 the new gauges read their registered defaults and `/health/ready` stays 503.
+The read-only RPC contract accessors (`RpcState::finalized_height`,
+`RpcState::ledger_disk_stats`) are landed; the node call-sites that publish them
+periodically are the follow-up hooks slice.
 Nothing here infers readiness from peer counts or block height.
 
 ## Health endpoints
@@ -41,7 +44,7 @@ All names live in the one `Metrics` registry (ADR-004); cloning shares it.
 
 | Metric | Type | Recorded by |
 | --- | --- | --- |
-| `subhost_finalized_height` | gauge | Node commit path, only after a verified final Commit QC. Never from a peer announcement. |
+| `subhost_finalized_height` | gauge | Node commit path, only after a verified final Commit QC (`RpcState::finalized_height`, set at `commit_qc`/`restore_committed_qc`). Never from a peer announcement. Registered at 0 until a verified final commit exists; an explicit single-writer demo chain publishes 0 by design, not as a broken hook. |
 | `subhost_qc_commit_latency_seconds` | histogram | Node, proposal to verified final commit. Invalid samples (NaN/negative/infinite) are dropped. |
 | `subhost_ledger_active_bytes` | gauge | `LedgerStore::disk_stats()` under the commit lock. |
 | `subhost_ledger_snapshot_modified_seconds` | gauge | Same measurement; Unix seconds. **0 means unavailable**, not a real epoch time. |
