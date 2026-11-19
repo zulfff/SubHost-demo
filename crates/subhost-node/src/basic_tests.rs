@@ -181,6 +181,8 @@ pub(super) fn validator_nodes(count: u8) -> (Vec<tempfile::TempDir>, Vec<Node>) 
 
 #[test]
 fn four_validator_nodes_require_three_votes_before_a_ledger_write() {
+    // Q-031: one live cluster at a time, shared with the real-network suites.
+    let _cluster = NETWORK_TEST_LOCK.blocking_lock();
     for voting_nodes in [4, 3, 2] {
         let (dirs, nodes) = validator_nodes(4);
         let manifests: Vec<_> = dirs
@@ -470,24 +472,12 @@ fn historical_contradiction_is_a_conflict_but_a_matching_hash_is_not() {
     assert_eq!(local.state().block_height(), 2);
 
     let remote_block = remote.state().block_at_height(1).unwrap();
-    let remote_certificate = {
-        let history = remote.certified_history.as_ref().unwrap();
-        let served = serve_certified_range(remote.state(), history, 1, 1).unwrap().unwrap();
-        let NetworkMessage::Blocks { items } = served else { panic!("expected a range") };
-        let (block_bytes, qc_bytes) = certified_history::decode_item(&items[0]).unwrap();
-        let block = decode_block(block_bytes).unwrap();
-        let qc: QuorumCertificate = decode_consensus(qc_bytes).unwrap();
-        assert_eq!(block.hash(), remote_block.hash());
-        NetworkMessage::BlockCommit {
-            view: qc.view,
-            data: encode_block(&block),
-            signatures: qc
-                .signatures
-                .iter()
-                .map(|(address, signature)| (*address.as_bytes(), signature.clone()))
-                .collect(),
-        }
-    };
+    let remote_certificate = certified_commit_at(&remote, 1);
+    assert_ne!(
+        local.state().block_at_height(1).unwrap().hash(),
+        remote_block.hash(),
+        "the two authentic certificates must disagree at height 1"
+    );
 
     // The local ledger holds a different block at height 1: a conflict below the tip.
     let mut candidates = CandidateBuffer::default();
@@ -507,22 +497,7 @@ fn historical_contradiction_is_a_conflict_but_a_matching_hash_is_not() {
         node.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 10)).unwrap();
         produce_for_test(node).unwrap();
     }
-    let own = {
-        let history = node.certified_history.as_ref().unwrap();
-        let served = serve_certified_range(node.state(), history, 1, 1).unwrap().unwrap();
-        let NetworkMessage::Blocks { items } = served else { panic!("expected a range") };
-        let (block_bytes, qc_bytes) = certified_history::decode_item(&items[0]).unwrap();
-        let qc: QuorumCertificate = decode_consensus(qc_bytes).unwrap();
-        NetworkMessage::BlockCommit {
-            view: qc.view,
-            data: block_bytes.to_vec(),
-            signatures: qc
-                .signatures
-                .iter()
-                .map(|(address, signature)| (*address.as_bytes(), signature.clone()))
-                .collect(),
-        }
-    };
+    let own = certified_commit_at(node, 1);
     let mut candidates = CandidateBuffer::default();
     let mut driver = node.consensus().unwrap().lock().unwrap();
     let mut commit = node_commit(node, &mut candidates);
@@ -564,6 +539,140 @@ fn junk_or_duplicate_evidence_never_halts_signing() {
 }
 
 #[test]
+fn a_historical_certificate_at_a_pruned_height_is_unverifiable_not_a_fork() {
+    // R-57-01: pruning drops the block at a height but not the finality it
+    // proved, so a canonical certificate replayed there can be neither confirmed
+    // nor refuted. Only a *retained* differing hash may halt a node; treating a
+    // pruned height as a fork lets anyone replay old canonical history until a
+    // pruning validator stops signing.
+    //
+    // A real pruned-ledger fixture would need a >64 MiB segmented history and the
+    // store exposes no prune seam to the node, so this pins the exact decision
+    // `route_final_evidence` applies and the router's pruning guard.
+    let local = Hash::new([7; 32]);
+    let incoming = Hash::new([8; 32]);
+
+    // At or below the retained base there is no block to compare.
+    assert_eq!(historical_meaning(100, 100, None, local), HistoricalMeaning::Unverifiable);
+    assert_eq!(historical_meaning(100, 50, None, local), HistoricalMeaning::Unverifiable);
+    assert_eq!(historical_meaning(0, 0, None, local), HistoricalMeaning::Unverifiable);
+
+    // A retained height still compares the hashes exactly.
+    assert_eq!(historical_meaning(0, 5, Some(local), local), HistoricalMeaning::Duplicate);
+    assert_eq!(historical_meaning(0, 5, Some(local), incoming), HistoricalMeaning::Conflict);
+
+    // Above the retained base without a block (defensive): never a fork either.
+    assert_eq!(historical_meaning(100, 150, None, local), HistoricalMeaning::Unverifiable);
+}
+
+#[test]
+fn an_archive_that_does_not_extend_the_restored_ledger_is_refused_at_boot() {
+    let (_dirs, nodes) = validator_nodes(1);
+    let node = &nodes[0];
+    for nonce in 0..2 {
+        node.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 10)).unwrap();
+        produce_for_test(node).unwrap();
+    }
+    let block1 = node.state().block_at_height(1).unwrap();
+    let block2 = node.state().block_at_height(2).unwrap();
+    let encoded = encode_block(&block2);
+    let path = Path::new(certified_history::HISTORY_FILE);
+
+    // Nothing archived, an archive level with the ledger, and the normal crash
+    // state (one archived child of the restored tip) are all coherent.
+    check_archive_matches_ledger(path, None, 2, block2.hash()).unwrap();
+    check_archive_matches_ledger(path, Some((2, &encoded)), 2, block2.hash()).unwrap();
+    check_archive_matches_ledger(path, Some((2, &encoded)), 1, block1.hash()).unwrap();
+
+    // A larger lead, undecodable bytes, or a non-child at one lead means the
+    // archive and ledger came from different points.
+    assert!(
+        check_archive_matches_ledger(path, Some((3, &encoded)), 1, block1.hash()).is_err(),
+        "two items of lead is a mixed restore"
+    );
+    assert!(
+        check_archive_matches_ledger(path, Some((2, b"not a block")), 1, block1.hash()).is_err(),
+        "a one-item lead must still be a real child of the restored tip"
+    );
+    assert!(
+        check_archive_matches_ledger(path, Some((2, &encoded)), 1, Hash::ZERO).is_err(),
+        "the archived child must extend this ledger, not an arbitrary parent"
+    );
+}
+
+#[test]
+fn booting_with_an_archive_ahead_of_the_ledger_is_refused() {
+    let (_dirs, nodes) = validator_nodes(1);
+    let node = &nodes[0];
+    node.state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
+    produce_for_test(node).unwrap();
+    {
+        let history = node.certified_history.as_ref().unwrap();
+        let mut history = history.lock().unwrap();
+        // Two heights beyond the committed ledger cannot be a crash retry.
+        history.append(2, b"block", b"qc").unwrap();
+        history.append(3, b"block", b"qc").unwrap();
+    }
+    let config = node.config().clone();
+    drop(nodes);
+
+    let Err(error) = Node::bootstrap(config) else {
+        panic!("a partial restore must be refused at boot")
+    };
+    assert!(
+        matches!(
+            error,
+            NodeError::CertifiedHistory { ref detail, .. } if detail.contains("stopped node")
+        ),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn a_forged_far_height_commit_never_starts_catch_up() {
+    // Sari's PR #57 review: the range target may only come from an authenticated
+    // certificate. A forged far-ahead commit must be a plain error with no
+    // buffered candidate, no catch-up state and no incident.
+    let (dirs, nodes) = validator_nodes(1);
+    let producer = &nodes[0];
+    for nonce in 0..3 {
+        producer.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 10)).unwrap();
+        produce_for_test(producer).unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    for file in [GENESIS_FILE_NAME, PRODUCER_KEY_FILE_NAME] {
+        std::fs::copy(dirs[0].path().join(file), dir.path().join(file)).unwrap();
+    }
+    let lagging =
+        Node::bootstrap(NodeConfig { validator: true, ..test_config(dir.path()) }).unwrap();
+
+    let mut forged = certified_commit_at(producer, 3);
+    let NetworkMessage::BlockCommit { ref mut signatures, .. } = forged else {
+        panic!("expected a commit")
+    };
+    for (_, signature) in signatures.iter_mut() {
+        *signature = vec![0xff; 96];
+    }
+
+    let mut candidates = CandidateBuffer::default();
+    let mut commit = node_commit(&lagging, &mut candidates);
+    let mut driver = lagging.consensus().unwrap().lock().unwrap();
+    assert!(
+        handle_consensus_message_inner(lagging.state(), &mut driver, forged, &mut commit).is_err(),
+        "a forged certificate is rejected"
+    );
+    assert!(commit.candidates.highest().is_none(), "unauthenticated evidence is never buffered");
+    assert_eq!(driver.height(), 0, "no state changes on rejection");
+    assert!(driver.halted().is_none(), "junk never halts");
+    assert_eq!(
+        lagging.fork_log.as_ref().unwrap().lock().unwrap().len(),
+        0,
+        "junk records no incident"
+    );
+    assert!(!lagging.catching_up.load(Ordering::SeqCst), "an announcement cannot start catch-up");
+}
+
+#[test]
 fn a_buffered_candidate_applies_once_its_ancestors_backfill() {
     let (dirs, nodes) = validator_nodes(1);
     let producer = &nodes[0];
@@ -578,42 +687,7 @@ fn a_buffered_candidate_applies_once_its_ancestors_backfill() {
     let lagging =
         Node::bootstrap(NodeConfig { validator: true, ..test_config(dir.path()) }).unwrap();
 
-    let tip_three = {
-        let history = producer.certified_history.as_ref().unwrap();
-        let served = serve_certified_range(producer.state(), history, 3, 3).unwrap().unwrap();
-        let NetworkMessage::Blocks { items } = served else { panic!("expected a range") };
-        let (block_bytes, qc_bytes) = certified_history::decode_item(&items[0]).unwrap();
-        let block = decode_block(block_bytes).unwrap();
-        let qc: QuorumCertificate = decode_consensus(qc_bytes).unwrap();
-        NetworkMessage::BlockCommit {
-            view: qc.view,
-            data: encode_block(&block),
-            signatures: qc
-                .signatures
-                .iter()
-                .map(|(address, signature)| (*address.as_bytes(), signature.clone()))
-                .collect(),
-        }
-    };
-
-    // Sari's review: an unauthenticated announcement must not create catch-up
-    // state, so a forged far-ahead commit cannot pin the validator mute.
-    let mut forged = tip_three.clone();
-    if let NetworkMessage::BlockCommit { ref mut signatures, .. } = forged {
-        for (_, signature) in signatures.iter_mut() {
-            *signature = vec![0xff; 96];
-        }
-    }
-    {
-        let mut candidates = CandidateBuffer::default();
-        let mut commit = node_commit(&lagging, &mut candidates);
-        let mut driver = lagging.consensus().unwrap().lock().unwrap();
-        assert!(handle_consensus_message_inner(lagging.state(), &mut driver, forged, &mut commit)
-            .is_err());
-        assert!(commit.candidates.highest().is_none());
-        assert_eq!(driver.height(), 0);
-    }
-    assert!(!lagging.catching_up.load(Ordering::SeqCst));
+    let tip_three = certified_commit_at(producer, 3);
 
     let mut candidates = CandidateBuffer::default();
     let mut commit = node_commit(&lagging, &mut candidates);
@@ -996,6 +1070,24 @@ pub(super) fn node_commit<'a>(
         fork_log: node.fork_log.as_deref(),
         candidates,
         metrics: Some(&node.metrics),
+    }
+}
+
+/// The `BlockCommit` a peer sends for a height this node archived.
+pub(super) fn certified_commit_at(node: &Node, height: BlockHeight) -> NetworkMessage {
+    let history = node.certified_history.as_ref().unwrap();
+    let served = serve_certified_range(node.state(), history, height, height).unwrap().unwrap();
+    let NetworkMessage::Blocks { items } = served else { panic!("expected a range") };
+    let (block_bytes, qc_bytes) = certified_history::decode_item(&items[0]).unwrap();
+    let qc: QuorumCertificate = decode_consensus(qc_bytes).unwrap();
+    NetworkMessage::BlockCommit {
+        view: qc.view,
+        data: block_bytes.to_vec(),
+        signatures: qc
+            .signatures
+            .iter()
+            .map(|(address, signature)| (*address.as_bytes(), signature.clone()))
+            .collect(),
     }
 }
 

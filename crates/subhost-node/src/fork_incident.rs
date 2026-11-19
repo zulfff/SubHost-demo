@@ -35,6 +35,10 @@ const LIMIT: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ForkIncident {
     pub(crate) height: BlockHeight,
+    /// The local block hash at [`ForkIncident::height`].
+    ///
+    /// [`Hash::ZERO`] is a sentinel meaning "this node retains no block at that
+    /// height"; it is never a real block hash and never a claim about the tip.
     pub(crate) local_hash: Hash,
     pub(crate) incoming_hash: Hash,
     pub(crate) local_view: u64,

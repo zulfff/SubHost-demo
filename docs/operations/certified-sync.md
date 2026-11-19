@@ -88,8 +88,17 @@ A contradictory final certificate stops the node instead of rolling back. The
 node appends a record to `fork-incidents.bin` and stays halted across restarts,
 with readiness reporting not alive. Treat that file as incident evidence: preserve
 it before clearing the condition, and do not delete it to force a restart, because
-the node will simply halt again on the next boot. Fork choice/reorg and production
-finality remain separate protocol work. Timeout and leader behavior
+the node will simply halt again on the next boot. A canonical certificate replayed
+at a height the node has already pruned is ignored instead: the block it would have
+to compare is gone, so that evidence can be neither confirmed nor refuted and must
+not stop a pruning validator. Fork choice/reorg and production finality remain
+separate protocol work.
+
+`certified-history.bin`, `consensus-state.bin` and `fork-incidents.bin` belong to
+the same ledger and genesis; copy and restore them together from one stopped node.
+The node refuses at boot an archive that is more than one item ahead of the ledger,
+or a one-item lead that does not extend the restored ledger tip, because every
+later commit would otherwise fail. Timeout and leader behavior
 comes from the node's consensus implementation; the relay only replays already
 finalized blocks.
 
