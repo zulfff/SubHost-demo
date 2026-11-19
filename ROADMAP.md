@@ -583,7 +583,7 @@ ledger repair, reorg investigation, incident checklist.
 | --- | --- |
 | S9.1 | RC/RPC-semver and tag consistency policy implemented; workspace remains 0.1.0 until reviewed version activation |
 | S9.2–S9.5 | Implemented on `s9/release-engineering`; local checks/CI review in progress |
-| S9.6 | Track B landed: `subhost-keystore` crate, `producer` CLI, init unlock consumer (Q-018/ADR-011). Track A landed: `Node::bootstrap_with_producer_key` (same membership/PoP checks, supplied key never reads the configured file) and the legacy loader hardened through the keystore's owner-only reader (no symlinks, euid ownership, bounded read, explicit non-Unix refusal), closing the init double-read window. Remaining: the CLI flag that unlocks a keystore for `subhost node` |
+| S9.6 | Complete: `subhost-keystore` crate, `producer` CLI, init unlock consumer (Q-018/ADR-011); Track A `Node::bootstrap_with_producer_key` + hardened legacy loader (#79); `subhost node --producer-credential-file` encrypted start-up (activation-gate item) |
 
 The pipeline prepares Linux x86_64 binaries, SBOMs, checksum/Sigstore artifacts
 and scanned signed OCI images after all seven CI gates. Candidate image scans

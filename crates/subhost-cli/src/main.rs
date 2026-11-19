@@ -111,6 +111,15 @@ enum Commands {
         #[arg(long, requires = "validator")]
         producer_key_file: Option<PathBuf>,
 
+        /// Owner-only credential file unlocking the encrypted producer
+        /// keystore for node start-up (ADR-011). With this flag the node
+        /// unlocks `<data-dir>/producer.keystore.json` (or
+        /// `--producer-key-file`) and boots with the unlocked key; it never
+        /// falls back to plaintext and never generates a key. Requires
+        /// `--validator`.
+        #[arg(long, requires = "validator")]
+        producer_credential_file: Option<PathBuf>,
+
         #[arg(short, long, default_value = DEFAULT_RPC_URL.trim_start_matches("http://"))]
         listen: String,
 
@@ -457,6 +466,7 @@ fn main() -> Result<()> {
                 single_writer,
                 view_timeout_ms,
                 producer_key_file,
+                producer_credential_file,
                 listen,
                 data_dir,
                 metrics_addr,
@@ -474,6 +484,7 @@ fn main() -> Result<()> {
                     single_writer,
                     view_timeout_ms,
                     producer_key_file,
+                    producer_credential_file,
                     listen,
                     data_dir,
                     metrics_addr,
@@ -984,6 +995,7 @@ async fn run_node(
     single_writer: bool,
     view_timeout_ms: Option<u64>,
     producer_key_file: Option<PathBuf>,
+    producer_credential_file: Option<PathBuf>,
     listen: String,
     data_dir: Option<PathBuf>,
     metrics_addr: Option<SocketAddr>,
@@ -1035,9 +1047,50 @@ async fn run_node(
     config.producer_key_file = producer_key_file;
     config.network = network;
     validate_node_policy(&config)?;
-    let node = Node::bootstrap(config)?;
+    // ADR-011: with a credential, boot from the unlocked keystore key; the
+    // configured key file is never read by the node when a key is supplied.
+    // Without one, the legacy loader path is unchanged.
+    let node = match producer_credential_file {
+        Some(credential_path) => {
+            let key = unlock_producer_keystore(
+                &config.data_dir,
+                config.producer_key_file.as_deref(),
+                &credential_path,
+            )?;
+            Node::bootstrap_with_producer_key(config, key)?
+        }
+        None => Node::bootstrap(config)?,
+    };
     node.run().await?;
     Ok(())
+}
+
+/// Unlock the encrypted producer keystore for node start-up (ADR-011).
+///
+/// Fail-closed: the keystore must exist and unlock with the owner-only
+/// credential file; there is no plaintext fallback and no key generation.
+/// The default target is `<data-dir>/producer.keystore.json`, overridden by
+/// `--producer-key-file`.
+fn unlock_producer_keystore(
+    data_dir: &Path,
+    key_file: Option<&Path>,
+    credential_path: &Path,
+) -> Result<PrivateKey> {
+    let keystore = match key_file {
+        Some(path) => path.to_path_buf(),
+        None => data_dir.join(KEYSTORE_FILE_NAME),
+    };
+    if !keystore.exists() {
+        bail!(
+            "{} does not exist; create it with `subhost producer create` or encrypt the legacy key with `subhost producer migrate`",
+            keystore.display()
+        );
+    }
+    let password = load_credential_file(credential_path).with_context(|| {
+        format!("cannot read the producer credential file {}", credential_path.display())
+    })?;
+    read_encrypted_producer_key(&keystore, password.as_slice())
+        .with_context(|| format!("cannot unlock the producer keystore {}", keystore.display()))
 }
 
 /// Reject ambiguous CLI modes before the node touches its ledger or journal.
@@ -2324,5 +2377,77 @@ mod tests {
         assert!(creation_password_from_pair(&over_cap, &over_cap).is_err());
         let password = creation_password_from_pair(b"  spaced pass  ", b"  spaced pass  ").unwrap();
         assert_eq!(password.as_slice(), b"  spaced pass  ");
+    }
+
+    #[test]
+    fn node_credential_flag_requires_validator_and_parses() {
+        assert!(Cli::try_parse_from([
+            "subhost",
+            "node",
+            "--producer-credential-file",
+            "/tmp/cred",
+        ])
+        .is_err());
+        let cli = Cli::try_parse_from([
+            "subhost",
+            "node",
+            "--validator",
+            "--producer-credential-file",
+            "/tmp/cred",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Commands::Node { producer_credential_file: Some(_), .. }));
+    }
+
+    #[test]
+    fn node_unlock_uses_the_default_keystore_and_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+        let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+
+        // The unlocked key is the keystore identity, via the default path and
+        // via an explicit --producer-key-file override.
+        for key_file in [None, Some(keystore.as_path())] {
+            let key = unlock_producer_keystore(&data_dir, key_file, &credential).unwrap();
+            assert_eq!(
+                BLSScheme::encode_public_key(&BLSScheme::public_key(&key)),
+                read_public_key(&keystore).unwrap()
+            );
+        }
+
+        // Wrong credential: fail closed, no plaintext fallback.
+        let wrong = write_credential(dir.path(), "wrong", b"another password entirely\n");
+        assert!(unlock_producer_keystore(&data_dir, None, &wrong).is_err());
+
+        // A group-readable credential file is refused.
+        let loose = dir.path().join("loose");
+        std::fs::write(&loose, KEYSTORE_PASSWORD).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(unlock_producer_keystore(&data_dir, None, &loose).is_err());
+
+        // Missing keystore: refuse and never generate a key.
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        // PrivateKey deliberately has no Debug; .err() avoids unwrap_err's bound.
+        let error = unlock_producer_keystore(&empty, None, &credential)
+            .err()
+            .expect("missing keystore must refuse start-up")
+            .to_string();
+        assert!(error.contains("producer create"), "error was: {error}");
+        assert!(!empty.join(KEYSTORE_FILE_NAME).exists());
+        assert!(!empty.join(PRODUCER_KEY_FILE_NAME).exists());
+
+        // A legacy hex file at the keystore path is not a keystore.
+        let legacy_dir = dir.path().join("legacy");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let (secret, _) = BLSScheme::keygen();
+        write_producer_key(&legacy_dir.join(KEYSTORE_FILE_NAME), &secret).unwrap();
+        assert!(unlock_producer_keystore(&legacy_dir, None, &credential).is_err());
     }
 }

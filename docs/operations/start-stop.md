@@ -40,6 +40,10 @@ subhost node --validator \
   `--rpc-auth-token-file`. There is no server-side TLS; the supported public
   deployment terminates TLS at a reverse proxy.
 - Omit `--p2p-listen` to run offline. `--bootstrap-peer` requires it.
+- `--producer-credential-file FILE` (requires `--validator`) boots from the
+  encrypted producer keystore instead of the plaintext `producer.key`;
+  fail-closed, no plaintext fallback. See
+  [producer-keystore.md](producer-keystore.md).
 
 ## Confirm it is healthy
 

@@ -4,15 +4,17 @@ S9.6 (ADR-011) adds an encrypted keystore for the BLS producer key — the
 validator's identity. The crate is `subhost-keystore`; the CLI surface is
 `subhost producer …` plus `subhost init --producer-credential-file`.
 
-**Status:** creation, inspection, unlock, migration and genesis init consume
-the keystore today. The node side is ready: `Node::bootstrap_with_producer_key`
-accepts an unlocked key with the same membership and proof-of-possession checks
-as a file-loaded one, and the legacy `producer.key` loader now uses the
-keystore crate's hardened owner-only reader (no symlinks, owner-only mode,
-effective-uid ownership, bounded read, explicit non-Unix refusal). The
-remaining step is a CLI flag that unlocks the keystore and calls that API;
-until it lands, `subhost node` keeps reading the plaintext `producer.key`, and
-a migrated data directory still starts from that preserved legacy file.
+**Status:** complete. Creation, inspection, unlock, migration and genesis init
+consume the keystore, and **encrypted node start-up is available**:
+`subhost node --validator --producer-credential-file FILE` unlocks
+`<data-dir>/producer.keystore.json` (or `--producer-key-file`) and boots via
+`Node::bootstrap_with_producer_key` with the same membership and
+proof-of-possession checks as a file-loaded key. The legacy `producer.key`
+loader uses the keystore crate's hardened owner-only reader (no symlinks,
+owner-only mode, effective-uid ownership, bounded read, explicit non-Unix
+refusal). Without the credential flag, `subhost node` keeps reading the
+plaintext `producer.key` — a migrated data directory still starts from that
+preserved legacy file until the operator switches to the encrypted path.
 
 ## Commands
 
@@ -35,6 +37,10 @@ subhost producer migrate --data-dir DIR --credential-file FILE
 
 # Genesis init consuming the keystore (proofs of possession are signed with it).
 subhost init --data-dir DIR --validator ADDRESS:10 \
+    --producer-credential-file /run/secrets/producer.pass
+
+# Encrypted node start-up: unlock the keystore and boot with the key.
+subhost node --validator --data-dir DIR \
     --producer-credential-file /run/secrets/producer.pass
 ```
 
