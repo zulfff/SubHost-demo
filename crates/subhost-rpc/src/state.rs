@@ -10,7 +10,7 @@ use subhost_core::{Address, Amount, Block, ChainId, Hash, Nonce, Receipt, Transa
 use subhost_mempool::Mempool;
 use subhost_metrics::Metrics;
 use subhost_state::{AccountProof, State};
-use subhost_storage::{LedgerStore, StorageError};
+use subhost_storage::{LedgerDiskStats, LedgerStore, StorageError};
 use tokio::sync::broadcast;
 
 #[derive(Debug, thiserror::Error)]
@@ -104,6 +104,9 @@ pub struct RpcState {
     /// Latest verified final-QC view, not inferred from restored block height.
     pub(crate) committed_view: Arc<AtomicU64>,
     pub(crate) verified_view: Arc<AtomicBool>,
+    /// Height of the newest block committed with a verified final Commit QC
+    /// (S8, ADR-013). Demo single-writer commits never advance it.
+    pub(crate) finalized_height: Arc<AtomicU64>,
     /// Optional canonical proposal bound configured before serving.
     pub(crate) proposal_bytes_limit: Option<usize>,
     /// Height of the newest committed block, backing `eth_blockNumber`.
@@ -166,6 +169,7 @@ impl RpcState {
             consensus_context: Hash::ZERO,
             committed_view: Arc::new(AtomicU64::new(0)),
             verified_view: Arc::new(AtomicBool::new(height == 0)),
+            finalized_height: Arc::new(AtomicU64::new(0)),
             proposal_bytes_limit: None,
             block_height: Arc::new(AtomicU64::new(height)),
             mempool: Arc::new(RwLock::new(Mempool::default())),
@@ -273,6 +277,23 @@ impl RpcState {
 
     pub fn block_height(&self) -> u64 {
         self.block_height.load(Ordering::SeqCst)
+    }
+
+    /// Newest height committed with a verified final Commit QC (S8, ADR-013).
+    /// Zero until such a commit happens: restored block height and demo
+    /// single-writer commits are not finality evidence.
+    pub fn finalized_height(&self) -> u64 {
+        self.finalized_height.load(Ordering::SeqCst)
+    }
+
+    /// Measure the active ledger footprint under the commit lock (S8, ADR-013).
+    ///
+    /// Serialized with persist/prune so the measurement names a consistent
+    /// manifest. Measurement only: no replay and no authentication. An error
+    /// means the active data is missing or invalid, never a false zero.
+    pub fn ledger_disk_stats(&self) -> Result<LedgerDiskStats, StorageError> {
+        let _commit_guard = lock(&self.commit_lock);
+        self.store.disk_stats()
     }
 
     /// Hash of the newest committed block, or [`Hash::ZERO`] at genesis.
@@ -384,6 +405,10 @@ pub(crate) fn write<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+#[cfg(test)]
+#[path = "finality_disk_tests.rs"]
+mod finality_disk_tests;
 
 #[cfg(test)]
 mod tests {

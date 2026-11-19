@@ -375,9 +375,11 @@ impl RpcState {
     ) -> Result<Vec<Receipt>, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
         self.validate_final_qc(&block, qc)?;
+        let height = block.header.height;
         let receipts = self.accept_validated(block)?;
         self.committed_view.store(qc.view, Ordering::SeqCst);
         self.verified_view.store(true, Ordering::SeqCst);
+        self.finalized_height.store(height, Ordering::SeqCst);
         Ok(receipts)
     }
 
@@ -414,6 +416,7 @@ impl RpcState {
         self.verify_final_qc(qc)?;
         self.committed_view.store(qc.view, Ordering::SeqCst);
         self.verified_view.store(true, Ordering::SeqCst);
+        self.finalized_height.store(block.header.height, Ordering::SeqCst);
         Ok(())
     }
 
