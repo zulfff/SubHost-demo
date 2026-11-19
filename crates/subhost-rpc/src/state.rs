@@ -7,14 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use subhost_consensus::ValidatorRegistry;
 use subhost_core::{
-    Address, Amount, Block, ChainId, FeePolicy, Gas, Hash, Nonce, Receipt, TransactionType,
-    BLOCK_GAS_LIMIT, FEE_HEADER_VERSION,
+    encode_canonical, Address, Amount, Block, ChainId, FeePolicy, Gas, Hash, Nonce, Receipt,
+    Transaction, TransactionType, BLOCK_GAS_LIMIT, FEE_HEADER_VERSION,
 };
-use subhost_mempool::Mempool;
+use subhost_mempool::{Mempool, MempoolStore};
 use subhost_metrics::Metrics;
 use subhost_state::{AccountProof, State};
 use subhost_storage::{LedgerDiskStats, LedgerStore, StorageError};
 use tokio::sync::broadcast;
+use tracing::{debug, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
@@ -153,6 +154,10 @@ pub struct RpcState {
     /// document. Defaults to [`BLOCK_GAS_LIMIT`]; a genesis that names a
     /// different limit is honoured end to end (S6.2 step 3).
     pub(crate) block_gas_limit: Gas,
+    /// Optional durable pending-transaction store (S6.1b). `None` keeps the
+    /// pre-S6.1b volatile behavior: the hooks below still run, but no
+    /// `mempool.bin` is written until a consumer configures a store.
+    pub(crate) pending_store: Option<MempoolStore>,
 }
 
 /// Buffered block events per subscriber. A node only needs the newest few.
@@ -199,6 +204,7 @@ impl RpcState {
             metrics: None,
             fee_policy: None,
             block_gas_limit: BLOCK_GAS_LIMIT,
+            pending_store: None,
         })
     }
 
@@ -272,6 +278,127 @@ impl RpcState {
     /// The fee policy in force, when this chain is fee-enabled.
     pub fn fee_policy(&self) -> Option<&FeePolicy> {
         self.fee_policy.as_ref()
+    }
+
+    /// Attach the durable pending-transaction store (S6.1b, Q-016/Q-034).
+    ///
+    /// Additive and opt-in: without it the pool stays volatile exactly as before,
+    /// while the runtime byte budget still binds. Attach it before serving, and
+    /// call [`Self::restore_pending`] only after the ledger and voting journal
+    /// have reconciled.
+    pub fn with_pending_store(mut self, store: MempoolStore) -> Self {
+        self.pending_store = Some(store);
+        self
+    }
+
+    /// Install a candidate pool: persist it first, publish only on success.
+    ///
+    /// This is the acknowledgement boundary. A persistence failure leaves the
+    /// live pool untouched and propagates, so a caller can never return a
+    /// transaction hash for an admission that is not durable. With no store
+    /// configured it is a plain swap.
+    pub fn publish_pool(&self, candidate: Mempool) -> Result<(), RpcError> {
+        if let Some(store) = &self.pending_store {
+            store.persist(&candidate).map_err(|error| RpcError::Persistence(error.to_string()))?;
+        }
+        *write(&self.mempool) = candidate;
+        Ok(())
+    }
+
+    /// Retire mined transactions from the **live** pool after a durable commit.
+    ///
+    /// Best-effort by contract: the block is already committed, so a pending-file
+    /// cleanup failure is logged and counted, never propagated. Use this only at
+    /// a site that owns the live pool; a candidate that may never be installed
+    /// must use [`Self::retire_mined_candidate`] instead.
+    pub fn retire_mined(&self, mined: &[Transaction], committed: &State) {
+        {
+            let mut pool = write(&self.mempool);
+            Self::retire_mined_candidate(&mut pool, mined, committed);
+        }
+        self.persist_pending_best_effort();
+    }
+
+    /// Retire mined transactions from a **candidate** pool. Pure mutation, no I/O.
+    ///
+    /// The seal path builds a candidate that its caller installs only on success,
+    /// so writing a snapshot here would publish a pool that may never become live.
+    /// The pending file is written by [`Self::publish_pool`] when the candidate is
+    /// actually installed.
+    pub fn retire_mined_candidate(pool: &mut Mempool, mined: &[Transaction], committed: &State) {
+        for tx in mined {
+            pool.remove(&tx.hash());
+            pool.prune_below_nonce(&tx.from, committed.nonce(&tx.from));
+        }
+    }
+
+    /// Write the live pool to the pending store, tolerating failure.
+    ///
+    /// A failure means the pending file is stale, not that the chain is broken:
+    /// the next restore filters mined nonces again. Counted separately from the
+    /// pool lifecycle events, and any increase deserves a ticket.
+    pub fn persist_pending_best_effort(&self) {
+        let Some(store) = &self.pending_store else {
+            return;
+        };
+        let pool = read(&self.mempool).clone();
+        if let Err(error) = store.persist(&pool) {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_pending_cleanup_failure();
+            }
+            warn!(%error, "pending snapshot write failed; the committed block stands");
+        }
+    }
+
+    /// Restore the pending pool after ledger and journal reconciliation.
+    ///
+    /// Loads and validates the snapshot, drops entries below each sender's
+    /// committed nonce, and rebuilds a candidate under the current count,
+    /// per-sender, calldata, proposal-byte and runtime-byte limits in
+    /// deterministic sender/nonce order. Only then does it become the live pool.
+    ///
+    /// An entry that is merely underpriced is **preserved**, not dropped: Q-017
+    /// requires parked entries to survive a restart and a fee-floor change, so
+    /// the restore path admits without the local gas-price floor. Cap-driven
+    /// drops are logged with a count. With no store configured this is a no-op.
+    pub fn restore_pending(&self) -> Result<(), RpcError> {
+        let Some(store) = &self.pending_store else {
+            return Ok(());
+        };
+        let stored = store.load().map_err(|error| RpcError::Persistence(error.to_string()))?;
+        if stored.is_empty() {
+            return Ok(());
+        }
+        let committed = read(&self.state).clone();
+        let config = read(&self.mempool).config().clone();
+        let proposal_budget = self.proposal_bytes_limit.map(|limit| limit.saturating_sub(512));
+        let mut candidate = Mempool::new(config);
+        let mut ordered = stored;
+        ordered.sort_by(|left, right| {
+            left.from.cmp(&right.from).then_with(|| left.nonce.cmp(&right.nonce))
+        });
+
+        let (mut mined, mut oversized, mut refused) = (0usize, 0usize, 0usize);
+        for tx in ordered {
+            if tx.nonce < committed.nonce(&tx.from) {
+                mined += 1;
+                continue;
+            }
+            if proposal_budget.is_some_and(|budget| encode_canonical(&tx).len() > budget) {
+                oversized += 1;
+                continue;
+            }
+            match candidate.admit_restored(tx) {
+                Ok(admission) if admission.accepted => {}
+                Ok(_) | Err(_) => refused += 1,
+            }
+        }
+        debug!(mined, oversized, refused, restored = candidate.len(), "pending pool restored");
+        *write(&self.mempool) = candidate;
+        // The filtered pool is now live; rewriting the file is best-effort so a
+        // pending-file problem cannot stop a node whose ledger is durable.
+        self.persist_pending_best_effort();
+        Ok(())
     }
 
     /// Require blocks from peers to be signed by a registered validator.
@@ -502,6 +629,7 @@ mod finality_disk_tests;
 mod tests {
     use super::*;
     use crate::test_support::{signed_transfer, signing_key};
+    use ed25519_dalek::Signer;
     use tempfile::tempdir;
 
     #[test]
@@ -561,5 +689,181 @@ mod tests {
         bytes[last] ^= 0x01;
         std::fs::write(&path, bytes).unwrap();
         assert!(RpcState::with_data_dir(1, dir.path()).is_err());
+    }
+
+    // --- S6.1b pending-store hooks (Q-016/Q-034) ---
+
+    fn pending_store(dir: &std::path::Path) -> MempoolStore {
+        MempoolStore::open(1, Hash::ZERO, dir).unwrap()
+    }
+
+    fn stored_pool(txs: Vec<Transaction>) -> Mempool {
+        let mut pool = Mempool::default();
+        for tx in txs {
+            pool.add(tx).unwrap();
+        }
+        pool
+    }
+
+    #[test]
+    fn publish_pool_persists_before_the_candidate_is_live() {
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let state = RpcState::in_memory(1).unwrap().with_pending_store(store.clone());
+        let key = signing_key(11);
+        let tx = signed_transfer(&key, 0, 1);
+        let mut candidate = read(&state.mempool).clone();
+        candidate.add(tx.clone()).unwrap();
+
+        state.publish_pool(candidate).unwrap();
+        assert!(state.mempool.read().unwrap().contains(&tx.hash()));
+        let on_disk = store.load().unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].hash(), tx.hash());
+    }
+
+    #[test]
+    fn publish_pool_failure_keeps_the_live_pool_and_refuses_the_ack() {
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        // A directory where the snapshot file belongs makes every write fail.
+        std::fs::create_dir(store.path()).unwrap();
+        let state = RpcState::in_memory(1).unwrap().with_pending_store(store);
+        let key = signing_key(12);
+        let tx = signed_transfer(&key, 0, 1);
+        let mut candidate = read(&state.mempool).clone();
+        candidate.add(tx.clone()).unwrap();
+
+        let error = state.publish_pool(candidate).unwrap_err();
+        assert!(matches!(error, RpcError::Persistence(_)), "{error:?}");
+        assert!(!state.mempool.read().unwrap().contains(&tx.hash()));
+        assert_eq!(state.pending_count(), 0);
+    }
+
+    #[test]
+    fn retire_mined_survives_a_pending_file_failure_and_counts_it() {
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        std::fs::create_dir(store.path()).unwrap();
+        let metrics = Metrics::new().unwrap();
+        let key = signing_key(13);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let mut state = RpcState::in_memory(1).unwrap().with_pending_store(store);
+        state.set_metrics(metrics.clone());
+        state.seed_accounts([(sender, 1_000_000)]).unwrap();
+        let tx = signed_transfer(&key, 0, 1);
+        state.mempool.write().unwrap().add(tx.clone()).unwrap();
+
+        // The block is already durable: cleanup must not propagate a failure.
+        let committed = read(&state.state).clone();
+        state.retire_mined(std::slice::from_ref(&tx), &committed);
+        assert!(!state.mempool.read().unwrap().contains(&tx.hash()));
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(
+            rendered.contains("subhost_mempool_pending_cleanup_failures_total 1"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn retire_mined_candidate_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let state = RpcState::in_memory(1).unwrap().with_pending_store(store.clone());
+        let key = signing_key(14);
+        let tx = signed_transfer(&key, 0, 1);
+        let mut candidate = stored_pool(vec![tx.clone()]);
+        let committed = read(&state.state).clone();
+
+        RpcState::retire_mined_candidate(&mut candidate, std::slice::from_ref(&tx), &committed);
+        assert!(!candidate.contains(&tx.hash()));
+        // A candidate that may never be installed must not publish a snapshot.
+        assert!(!store.path().exists());
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[test]
+    fn restore_pending_drops_mined_nonces_and_preserves_parked_entries() {
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let key = signing_key(15);
+        let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+        let state = RpcState::in_memory(1).unwrap().with_pending_store(store.clone());
+        state.seed_accounts([(sender, 1_000_000)]).unwrap();
+
+        // Nonce 0 is mined by the demo commit path; 1 and 2 stay pending. The
+        // stored pool also holds an entry below the *current* local floor.
+        let mined = signed_transfer(&key, 0, 1);
+        state.submit_transaction(mined.clone()).unwrap();
+        let parked = signed_transfer(&key, 1, 1);
+        let later = signed_transfer(&key, 2, 1);
+        store.persist(&stored_pool(vec![mined.clone(), parked.clone(), later.clone()])).unwrap();
+
+        // Raise the local admission floor after the snapshot was written: a
+        // merely underpriced entry must survive the restart (Q-017).
+        *write(&state.mempool) =
+            Mempool::new(subhost_mempool::MempoolConfig { min_gas_price: 5, ..Default::default() });
+        state.restore_pending().unwrap();
+
+        let pool = read(&state.mempool);
+        assert!(!pool.contains(&mined.hash()), "a mined nonce must be dropped");
+        assert!(pool.contains(&parked.hash()), "a parked underpriced entry must survive");
+        assert!(pool.contains(&later.hash()));
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn restore_pending_without_a_store_is_a_noop() {
+        let state = RpcState::in_memory(1).unwrap();
+        let key = signing_key(16);
+        let tx = signed_transfer(&key, 0, 1);
+        state.mempool.write().unwrap().add(tx.clone()).unwrap();
+        state.restore_pending().unwrap();
+        assert!(state.mempool.read().unwrap().contains(&tx.hash()));
+    }
+
+    #[test]
+    fn restore_pending_refuses_a_corrupt_snapshot_without_touching_the_pool() {
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let state = RpcState::in_memory(1).unwrap().with_pending_store(store.clone());
+        let key = signing_key(17);
+        let live = signed_transfer(&key, 0, 1);
+        state.mempool.write().unwrap().add(live.clone()).unwrap();
+        std::fs::write(store.path(), b"not a snapshot").unwrap();
+
+        let error = state.restore_pending().unwrap_err();
+        assert!(matches!(error, RpcError::Persistence(_)), "{error:?}");
+        assert!(state.mempool.read().unwrap().contains(&live.hash()));
+    }
+
+    #[test]
+    fn restore_pending_drops_over_budget_entries_deterministically() {
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let key = signing_key(18);
+        let state = RpcState::in_memory(1).unwrap().with_pending_store(store.clone());
+        let mut txs = Vec::new();
+        for nonce in 0..6 {
+            let mut tx = signed_transfer(&key, nonce, 1);
+            tx.data = vec![0; 4096];
+            let signature = key.sign(&tx.signing_payload()).to_bytes();
+            tx.signature = subhost_core::TransactionSignature::from_ed25519(&signature);
+            txs.push(tx);
+        }
+        store.persist(&stored_pool(txs.clone())).unwrap();
+
+        // A budget that fits roughly two entries: the drop order must be the
+        // deterministic sender/nonce order, not iteration order.
+        let one = encode_canonical(&txs[0]).len();
+        *write(&state.mempool) = Mempool::new(subhost_mempool::MempoolConfig {
+            max_pending_bytes: one * 2 + 64,
+            ..Default::default()
+        });
+        state.restore_pending().unwrap();
+        let pool = read(&state.mempool);
+        assert!(pool.len() < txs.len());
+        assert!(pool.pending_bytes() <= pool.config().max_pending_bytes);
+        assert!(pool.contains(&txs[0].hash()), "the lowest nonces are restored first");
     }
 }

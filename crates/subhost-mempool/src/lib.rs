@@ -26,6 +26,10 @@ pub struct MempoolConfig {
     pub min_gas_price: u128,
     /// Maximum calldata size accepted for one pending transaction.
     pub max_tx_data_bytes: usize,
+    /// Aggregate encoded-byte budget for the live pool, enforced with
+    /// persistence on or off. Count and per-sender caps alone do not bound
+    /// memory: `max_pending * max_tx_data_bytes` is over a GiB at the defaults.
+    pub max_pending_bytes: usize,
 }
 
 impl Default for MempoolConfig {
@@ -35,6 +39,9 @@ impl Default for MempoolConfig {
             max_per_sender: 64,
             min_gas_price: 1,
             max_tx_data_bytes: 128 * 1024,
+            // Half the snapshot file cap, so a pool that fits the runtime budget
+            // still fits `mempool.bin` with its framing overhead.
+            max_pending_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -51,8 +58,23 @@ impl MempoolConfig {
         if self.max_per_sender == 0 {
             return Err(MempoolError::InvalidConfig("max_per_sender must be > 0".into()));
         }
+        if self.max_pending_bytes == 0 {
+            return Err(MempoolError::InvalidConfig("max_pending_bytes must be > 0".into()));
+        }
         Ok(())
     }
+}
+
+/// Encoded size of one pending transaction, measured the same way the snapshot
+/// writer measures it. Deterministic per transaction, so insert and removal
+/// account the same number and the running total cannot drift. An unencodable
+/// transaction saturates instead of counting as zero: it is then refused by the
+/// byte budget rather than silently admitted for free.
+fn encoded_bytes(tx: &Transaction) -> usize {
+    bincode::serialized_size(tx)
+        .ok()
+        .and_then(|size| usize::try_from(size).ok())
+        .unwrap_or(usize::MAX)
 }
 
 /// The outcome of accepting a transaction into the pool.
@@ -88,6 +110,9 @@ pub struct Mempool {
     /// fails, so events must travel with the pool and only reach the registry
     /// once the candidate is committed; see [`Mempool::flush_events`].
     events: Vec<MempoolEvent>,
+    /// Sum of the encoded sizes of the pending transactions, kept in step with
+    /// `txs` so the byte budget never needs a full re-measure.
+    pending_bytes: usize,
 }
 
 impl Default for Mempool {
@@ -109,11 +134,22 @@ impl Mempool {
 
     pub fn try_new(config: MempoolConfig) -> Result<Self, MempoolError> {
         config.validate()?;
-        Ok(Self { config, txs: HashMap::new(), by_sender: HashMap::new(), events: Vec::new() })
+        Ok(Self {
+            config,
+            txs: HashMap::new(),
+            by_sender: HashMap::new(),
+            events: Vec::new(),
+            pending_bytes: 0,
+        })
     }
 
     pub fn config(&self) -> &MempoolConfig {
         &self.config
+    }
+
+    /// Encoded bytes currently held by the live pool.
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
     }
 
     /// Insert a transaction, returning the hash that owns the nonce slot.
@@ -124,6 +160,26 @@ impl Mempool {
     /// Insert a transaction and report what it displaced, so a caller whose
     /// downstream commit fails can put the pool back exactly as it was.
     pub fn admit(&mut self, tx: Transaction) -> Result<Admission, MempoolError> {
+        self.admit_inner(tx, true)
+    }
+
+    /// Restore-path admission: every cap and validity rule applies, but the
+    /// local gas-price floor does not.
+    ///
+    /// Q-017 requires an entry that is merely underpriced against the current
+    /// base fee to stay parked across a restart rather than be deleted, so a
+    /// fee-floor change must not silently shrink a restored pool. Count,
+    /// per-sender, calldata and byte-budget limits still bind, and a transaction
+    /// that cannot fit is dropped deterministically by the caller.
+    pub fn admit_restored(&mut self, tx: Transaction) -> Result<Admission, MempoolError> {
+        self.admit_inner(tx, false)
+    }
+
+    fn admit_inner(
+        &mut self,
+        tx: Transaction,
+        enforce_floor: bool,
+    ) -> Result<Admission, MempoolError> {
         if tx.data.len() > self.config.max_tx_data_bytes {
             return Err(MempoolError::DataTooLarge {
                 provided: tx.data.len(),
@@ -131,6 +187,15 @@ impl Mempool {
             });
         }
         let hash = tx.hash();
+        let tx_bytes = encoded_bytes(&tx);
+        // Refuse before mutating anything: a transaction that cannot fit an empty
+        // pool must leave the pool exactly as it was.
+        if tx_bytes > self.config.max_pending_bytes {
+            return Err(MempoolError::PendingBytesExceeded {
+                provided: tx_bytes,
+                max: self.config.max_pending_bytes,
+            });
+        }
 
         // Idempotent: the identical transaction is already pending.
         if self.txs.contains_key(&hash) {
@@ -140,7 +205,7 @@ impl Mempool {
         if tx.gas_limit == 0 {
             return Err(MempoolError::InvalidTransaction("gas limit must be > 0".into()));
         }
-        if tx.gas_price < self.config.min_gas_price {
+        if enforce_floor && tx.gas_price < self.config.min_gas_price {
             return Err(MempoolError::GasPriceTooLow {
                 provided: tx.gas_price,
                 min: self.config.min_gas_price,
@@ -166,7 +231,8 @@ impl Mempool {
                 return Ok(Admission { hash: existing_hash, accepted: false, displaced: None });
             }
             displaced = self.txs.remove(&existing_hash);
-            if displaced.is_some() {
+            if let Some(replaced) = &displaced {
+                self.pending_bytes = self.pending_bytes.saturating_sub(encoded_bytes(replaced));
                 self.events.push(MempoolEvent::Replaced);
             }
             if let Some(nonces) = self.by_sender.get_mut(&sender) {
@@ -191,8 +257,23 @@ impl Mempool {
             }
         }
 
+        // (4) Aggregate byte budget: same deterministic victim order as the count
+        // cap. The upfront check guarantees an empty pool fits this transaction,
+        // so the loop always terminates without evicting the newcomer.
+        while self.pending_bytes.saturating_add(tx_bytes) > self.config.max_pending_bytes {
+            let evicted = self.evict_lowest_priority()?;
+            if evicted.is_none() {
+                break;
+            }
+            self.events.push(MempoolEvent::Evicted);
+            if displaced.is_none() {
+                displaced = evicted;
+            }
+        }
+
         self.by_sender.entry(sender).or_default().insert(nonce, hash);
         self.txs.insert(hash, tx);
+        self.pending_bytes = self.pending_bytes.saturating_add(tx_bytes);
         self.events.push(MempoolEvent::Admitted);
         debug!(%sender, nonce, pool_size = self.txs.len(), "mempool admitted transaction");
 
@@ -227,6 +308,7 @@ impl Mempool {
         let Some(tx) = self.txs.remove(tx_hash) else {
             return false;
         };
+        self.pending_bytes = self.pending_bytes.saturating_sub(encoded_bytes(&tx));
         if let Some(nonces) = self.by_sender.get_mut(&tx.from) {
             nonces.remove(&tx.nonce);
             if nonces.is_empty() {
@@ -320,16 +402,14 @@ impl Mempool {
     /// Drop every pending transaction for `sender` below `next_nonce`, which is
     /// how a node prunes transactions that state has already executed.
     pub fn prune_below_nonce(&mut self, sender: &Address, next_nonce: Nonce) -> usize {
-        let Some(nonces) = self.by_sender.get_mut(sender) else {
-            return 0;
+        let stale: Vec<Hash> = match self.by_sender.get(sender) {
+            Some(nonces) => nonces.range(..next_nonce).map(|(_, hash)| *hash).collect(),
+            None => return 0,
         };
-        let stale: Vec<Hash> = nonces.range(..next_nonce).map(|(_, hash)| *hash).collect();
+        // `remove` also drops the sender entry when its last nonce goes, and is
+        // the single place the byte total is decremented.
         for hash in &stale {
-            self.txs.remove(hash);
-        }
-        nonces.retain(|nonce, _| *nonce >= next_nonce);
-        if nonces.is_empty() {
-            self.by_sender.remove(sender);
+            self.remove(hash);
         }
         stale.len()
     }
@@ -372,6 +452,9 @@ pub enum MempoolError {
 
     #[error("sender queue is full: {0}")]
     SenderQueueFull(Address),
+
+    #[error("transaction needs {provided} encoded bytes, above the pool budget of {max}")]
+    PendingBytesExceeded { provided: usize, max: usize },
 
     #[error("transaction data is too large: {provided} bytes (max {max})")]
     DataTooLarge { provided: usize, max: usize },
@@ -682,5 +765,98 @@ mod tests {
         assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 1"));
         assert!(rendered.contains("subhost_mempool_transactions_total{event=\"replaced\"} 0"));
         assert!(rendered.contains("subhost_mempool_transactions_total{event=\"evicted\"} 0"));
+    }
+
+    /// Independent re-measure of the live pool, to prove the running total never
+    /// drifts from the entries actually held.
+    fn measured(pool: &Mempool) -> usize {
+        pool.pending().iter().map(encoded_bytes).sum()
+    }
+
+    #[test]
+    fn byte_budget_evicts_the_cheapest_and_reports_it() {
+        let metrics = Metrics::new().unwrap();
+        let one = usize::try_from(bincode::serialized_size(&tx(1, 0, 1)).unwrap()).unwrap();
+        let mut pool =
+            Mempool::new(MempoolConfig { max_pending_bytes: one * 2 + 1, ..Default::default() });
+        pool.add(tx(1, 0, 10)).unwrap();
+        pool.add(tx(2, 0, 5)).unwrap();
+        assert_eq!(pool.pending_bytes(), one * 2);
+
+        // Three entries cannot fit: the cheapest goes, exactly as the count cap.
+        let admission = pool.admit(tx(3, 0, 30)).unwrap();
+        assert_eq!(admission.displaced.unwrap().gas_price, 5);
+        assert_eq!(pool.len(), 2);
+        assert!(pool.pending_bytes() <= one * 2 + 1);
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"admitted\"} 3"));
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"evicted\"} 1"));
+    }
+
+    #[test]
+    fn a_transaction_over_the_budget_is_refused_without_mutating_the_pool() {
+        let mut pool =
+            Mempool::new(MempoolConfig { max_pending_bytes: 4096, ..Default::default() });
+        let kept = pool.add(tx(1, 0, 10)).unwrap();
+        let before = pool.pending_bytes();
+
+        let mut huge = tx(2, 0, 10);
+        huge.data = vec![0; 8192];
+        let error = pool.admit(huge).unwrap_err();
+        assert!(matches!(error, MempoolError::PendingBytesExceeded { .. }), "{error:?}");
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.pending_bytes(), before);
+        assert!(pool.contains(&kept));
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+    }
+
+    #[test]
+    fn replacement_removal_and_prune_keep_the_byte_total_exact() {
+        let mut pool = Mempool::default();
+        pool.add(tx(1, 0, 10)).unwrap();
+        pool.add(tx(1, 1, 10)).unwrap();
+        pool.add(tx(2, 0, 10)).unwrap();
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+
+        let mut replacement = tx(1, 0, 20);
+        replacement.data = vec![0; 1024];
+        pool.admit(replacement).unwrap();
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+
+        assert_eq!(pool.prune_below_nonce(&Address::new([1; 20]), 1), 1);
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+
+        let mined = pool.get_by_sender_nonce(&Address::new([2; 20]), 0).unwrap().0;
+        assert!(pool.remove(&mined));
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+        assert!(!pool.remove(&mined));
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+    }
+
+    #[test]
+    fn the_byte_budget_binds_with_no_persistence_configured() {
+        // No store, no snapshot: the runtime budget is the only memory bound.
+        let mut pool = Mempool::new(MempoolConfig { max_per_sender: 1_000, ..Default::default() });
+        let mut template = tx(1, 0, 10);
+        template.data = vec![0; 128 * 1024];
+        for nonce in 0..400 {
+            let mut next = template.clone();
+            next.nonce = nonce;
+            pool.add(next).unwrap();
+            assert!(pool.pending_bytes() <= pool.config().max_pending_bytes);
+        }
+        assert!(pool.len() < 400, "the budget must evict before 50 MiB accumulates");
+        assert_eq!(pool.pending_bytes(), measured(&pool));
+    }
+
+    #[test]
+    fn a_zero_byte_budget_is_an_invalid_config() {
+        assert!(matches!(
+            Mempool::try_new(MempoolConfig { max_pending_bytes: 0, ..Default::default() }),
+            Err(MempoolError::InvalidConfig(_))
+        ));
     }
 }

@@ -224,6 +224,9 @@ fn oversized_total_snapshot_preserves_the_previous_file() {
     let mut large = Mempool::new(MempoolConfig {
         max_per_sender: 256,
         max_tx_data_bytes: 512 * 1024,
+        // This fixture exercises the snapshot *file* cap, so the runtime byte
+        // budget must not evict the entries before persist ever sees them.
+        max_pending_bytes: usize::MAX,
         ..Default::default()
     });
     for nonce in 0..130 {

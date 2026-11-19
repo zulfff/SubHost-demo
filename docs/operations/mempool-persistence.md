@@ -37,19 +37,40 @@ As with filesystem durability errors generally, an error after rename can leave
 the complete new snapshot visible; it must not be treated as a successful RPC
 acknowledgement. Startup validates whichever complete snapshot survived.
 
-S6.1b must reconcile the committed ledger and voting journal first, load and
-validate the pending snapshot, drop transactions below each sender's committed
-nonce, and rebuild a candidate under the current pool and proposal-byte policy.
-Only then may that candidate become the live pool. Changed limits/fee policy need
-an explicit re-admission/drop policy, rather than a blind in-memory restore.
-An aggregate runtime byte budget is also S6.1b work, including when persistence
-is disabled; snapshot limits alone do not bound the live pool's bytes.
+S6.1b's consumer hooks are landed in `subhost-rpc` (Q-034); the node call-site
+wiring is the remaining step. `RpcState::with_pending_store` attaches a store,
+`publish_pool` persists a candidate before it becomes live, `retire_mined`
+cleans the live pool after a durable commit, `retire_mined_candidate` is the
+pure no-I/O variant for a candidate that may never be installed, and
+`restore_pending` reconciles the snapshot against committed nonces.
+
+`restore_pending` runs only after the ledger and voting journal reconcile. It
+drops entries below each sender's committed nonce, entries that cannot fit the
+current count/per-sender/calldata/proposal-byte limits, and entries over the
+runtime byte budget, in deterministic sender/nonce order with a logged count.
+It **never drops an entry merely for being underpriced**: Q-017 requires parked
+entries to survive a restart and a fee-floor change, so restore admits without
+the local gas-price floor (`Mempool::admit_restored`). Rewriting the filtered
+pool to `mempool.bin` is best-effort, so a pending-file problem cannot stop a
+node whose ledger is durable.
+
+The aggregate runtime byte budget (`MempoolConfig::max_pending_bytes`, default
+32 MiB) binds with persistence on or off; count and per-sender caps alone do not
+bound memory, since `max_pending * max_tx_data_bytes` exceeds a GiB at the
+defaults. Over-budget admission evicts in the same deterministic lowest-priority
+order as the count cap and reports an `evicted` event; a single transaction
+larger than the whole budget is refused before the pool is mutated.
 
 Admission/replacement/eviction candidates must persist successfully before live
-pool replacement and before returning their transaction hash. Cleanup of mined
-entries after a durable block commit is best-effort/retryable: a pending-file
-cleanup error must not falsely fail a committed block or stop driver adoption.
-Stale mined entries are discarded when restoring against the committed nonces.
+pool replacement and before returning their transaction hash: `publish_pool`
+propagates a persistence failure and leaves the live pool untouched, so no hash
+is acknowledged for a non-durable admission. Cleanup of mined entries after a
+durable block commit is best-effort/retryable: a pending-file cleanup error is
+logged and counted in `subhost_mempool_pending_cleanup_failures_total`, and must
+not falsely fail a committed block or stop driver adoption. Stale mined entries
+are discarded when restoring against the committed nonces. Until the node
+call-site wiring lands, no store is configured by default and the pool stays
+volatile exactly as before.
 
 ## Compatibility and operator boundaries
 

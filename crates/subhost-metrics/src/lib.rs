@@ -95,6 +95,7 @@ pub struct Metrics {
     ledger_active_bytes: Gauge,
     ledger_snapshot_modified: Gauge,
     mempool_events: CounterVec,
+    pending_cleanup_failures: Counter,
 }
 
 impl Metrics {
@@ -177,6 +178,14 @@ impl Metrics {
             mempool_events.with_label_values(&[event.label()]);
         }
 
+        // Registered at zero, and unlike `reorg_total` this one *will* increment:
+        // S6.1b's best-effort pending-file cleanup counts its failures here once
+        // the node wiring lands. A committed block never fails because of it.
+        let pending_cleanup_failures = Counter::new(
+            "subhost_mempool_pending_cleanup_failures_total",
+            "Failed best-effort pending-snapshot writes after a durable block commit; 0 until the S6.1b consumer wiring lands",
+        )?;
+
         registry.register(Box::new(rpc_requests.clone()))?;
         registry.register(Box::new(rpc_errors.clone()))?;
         registry.register(Box::new(rpc_latency.clone()))?;
@@ -189,6 +198,7 @@ impl Metrics {
         registry.register(Box::new(ledger_snapshot_modified.clone()))?;
         registry.register(Box::new(reorgs.clone()))?;
         registry.register(Box::new(mempool_events.clone()))?;
+        registry.register(Box::new(pending_cleanup_failures.clone()))?;
 
         Ok(Self {
             registry: Arc::new(registry),
@@ -204,6 +214,7 @@ impl Metrics {
             ledger_active_bytes,
             ledger_snapshot_modified,
             mempool_events,
+            pending_cleanup_failures,
         })
     }
 
@@ -291,6 +302,15 @@ impl Metrics {
             .map(|elapsed| elapsed.as_secs_f64())
             .unwrap_or(0.0);
         self.ledger_snapshot_modified.set(timestamp);
+    }
+
+    /// Count one failed best-effort pending-snapshot cleanup.
+    ///
+    /// Deliberately separate from `transactions_total{event}`: this is a
+    /// durability degradation of the pending file after an already durable block
+    /// commit, not a pool lifecycle event. Any increase deserves a ticket.
+    pub fn record_pending_cleanup_failure(&self) {
+        self.pending_cleanup_failures.inc();
     }
 
     /// Count one bounded mempool lifecycle event.
@@ -414,6 +434,7 @@ mod tests {
             "subhost_ledger_snapshot_modified_seconds",
             "subhost_reorg_total",
             "subhost_mempool_transactions_total",
+            "subhost_mempool_pending_cleanup_failures_total",
         ] {
             assert!(rendered.contains(name), "{name} is missing from the exposition");
         }

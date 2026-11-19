@@ -316,6 +316,26 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   code, metric or API change. Rotation is documented as genesis-bound (no online
   validator-set change protocol), and ledger recovery as restore-from-backup
   (append-only, no in-place rewrite of finalized history).
+- **Durable pending-pool consumer hooks and a runtime byte budget (S6.1b,
+  contracts Q-016/Q-034).** `RpcState::with_pending_store` attaches the landed
+  `MempoolStore`; `publish_pool` persists a candidate before it becomes live and
+  propagates failure, so no transaction hash is acknowledged for a non-durable
+  admission; `retire_mined` cleans the live pool after a durable commit
+  best-effort, while `retire_mined_candidate` is the pure no-I/O variant for a
+  candidate that may never be installed; `restore_pending` reconciles the
+  snapshot against committed nonces and re-admits under the current caps in
+  deterministic sender/nonce order. Restore never drops an entry merely for
+  being underpriced (Q-017): `Mempool::admit_restored` applies every cap without
+  the local gas-price floor, so parked entries survive a restart and a fee-floor
+  change. `MempoolConfig::max_pending_bytes` (default 32 MiB) bounds live-pool
+  memory with persistence on or off, evicting in the existing deterministic
+  lowest-priority order and refusing an individually oversized transaction
+  before mutating the pool. New counter
+  `subhost_mempool_pending_cleanup_failures_total` (no labels, registered at 0,
+  will increment once the node wiring lands) with a ticket alert; a cleanup
+  failure never fails an already durable block commit. Additive and opt-in: no
+  store is configured by default, so node behavior is unchanged until the
+  call-site wiring lands.
 
 - **Encrypted producer keystore (S9.6, ADR-011).** New Track B crate
   `subhost-keystore`: purpose-specific JSON v1 (`subhost-producer-keystore/v1`,

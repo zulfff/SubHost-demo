@@ -50,6 +50,7 @@ All names live in the one `Metrics` registry (ADR-004); cloning shares it.
 | `subhost_ledger_snapshot_modified_seconds` | gauge | Same measurement; Unix seconds. **0 means unavailable**, not a real epoch time. |
 | `subhost_reorg_total` | counter | Registered at 0 with no increment API: reorgs are unsupported until a reviewed reorg protocol ships. Safety incidents are not reorgs. |
 | `subhost_mempool_transactions_total{event}` | counter | Pool lifecycle: `admitted`, `replaced`, `evicted`, `expired` (S6.3). Labels come from `MempoolEvent` only. Counts pool-committed admissions only; see below. |
+| `subhost_mempool_pending_cleanup_failures_total` | counter | Failed best-effort `mempool.bin` writes after an already durable block commit (S6.1b). Registered at 0 and **will increment** once the consumer wiring lands — unlike `subhost_reorg_total`, whose 0 is permanent. Not a pool lifecycle event, so it is deliberately separate from `transactions_total{event}`. Any increase means the pending file is stale while the chain is fine: ticket, not page. |
 
 Existing families (`subhost_rpc_*`, `subhost_connected_peers`,
 `subhost_block_height`, `subhost_pending_transactions`) are unchanged; see
