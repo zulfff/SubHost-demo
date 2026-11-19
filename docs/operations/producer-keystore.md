@@ -38,6 +38,11 @@ There is **no password argument**. Passwords come from non-echo terminal
 prompts (`/dev/tty`; creation asks twice and the entries must match) or from an
 owner-only credential file. Without a terminal, use `--credential-file`.
 
+With `--producer-credential-file`, `init` targets
+`<data-dir>/producer.keystore.json` by default (override with
+`--producer-key-file`). Without a credential, `init` refuses when a keystore
+is present rather than shadowing it with a newly generated plaintext key.
+
 ## Credential file convention
 
 One shared convention everywhere the CLI reads a credential file:
@@ -83,6 +88,11 @@ supports it); ordinary deletion cannot promise physical erasure on
 SSD/COW/backup systems. Until Track A's bootstrap loader lands, keep the legacy
 file if the node still needs to start from it.
 
+If a write reports a post-publication failure (directory sync or read-back),
+the destination **may already exist and be complete**. Inspect it
+(`subhost producer inspect` / `unlock`) before retrying; no-clobber publication
+refuses a blind recreation, which is safe but intentional.
+
 `subhost producer create` refuses to run next to a live `producer.key` at the
 default destination: creating a second identity beside the first is almost
 always a mistake — migrate instead. An explicit `--keystore-file` destination
@@ -93,7 +103,9 @@ is allowed for genuinely separate identities.
 JSON v1, purpose `subhost-producer-keystore/v1` (a Subhost format, **not**
 ERC-2335). scrypt-derived AES-256-GCM over the canonical 32-byte BLS scalar;
 purpose, version, public key, KDF parameters and salt are authenticated as
-domain-separated binary associated data. Accepted scrypt costs: `log_n`
+domain-separated binary associated data. Unknown fields, duplicate fields
+(at any nesting level) and trailing content are refused before any KDF work.
+Accepted scrypt costs: `log_n`
 15..=18, `r = 8`, `p = 1`, `dklen = 32`; default `log_n = 17` (~128 MiB,
 roughly half a second per derivation). Checked estimates cap the KDF working
 set at 256 MiB before any allocation — the same ceiling as the wallet fix

@@ -30,10 +30,13 @@ no interoperability claim with Ethereum BLS keystores. Fields:
   (`BLSScheme::encode_secret_key`) plus the 16-byte AES-GCM tag.
 
 Unknown/duplicate JSON fields, wrong lengths and trailing content fail before
-KDF execution. The file is capped at 16 KiB. No chain/genesis binding and no
-proof of possession live in the file: genesis membership is a bootstrap check,
-the public key is authenticated, and genesis independently supplies the PoP for
-the active signing suite.
+KDF execution. Duplicate rejection is explicit: `serde_json`'s derived
+`Deserialize` keeps the last value of a repeated field, so the file is first
+parsed into a strict value that rejects duplicate object keys at every level,
+then converted into the typed record (R-59-01). The file is capped at 16 KiB.
+No chain/genesis binding and no proof of possession live in the file: genesis
+membership is a bootstrap check, the public key is authenticated, and genesis
+independently supplies the PoP for the active signing suite.
 
 Purpose, version, public key, KDF parameters and salt are authenticated as
 AES-GCM associated data using an explicitly specified, domain-separated binary
@@ -82,15 +85,23 @@ default/cost range remain policy; other hardware will differ.
 
 - Reads open with `O_NOFOLLOW`, require a regular file, an owner-only mode
   (no group/other bits) and an ownership check, and use bounded reads even if
-  metadata races. Ownership uses `/proc/self` on Linux and a documented
-  parent-directory-owner fallback on other Unix. Non-Unix platforms fail
-  explicitly with `UnsupportedPlatform`; there is no silent permission bypass.
+  metadata races. Ownership compares the file's uid against the process's
+  effective uid via `rustix::process::geteuid` (a safe wrapper; the locked
+  libc marks `geteuid` unsafe and this workspace forbids `unsafe`) on every
+  Unix, so a root process loading another user's key is refused.
+  Non-Unix platforms fail explicitly with `UnsupportedPlatform`; there is no
+  silent permission bypass.
 - Writes publish a `0600` sibling tempfile, sync it, publish with a no-clobber
   hard link (an existing destination is never replaced), remove the tempfile,
-  and sync the directory. A post-publication sync error is an error even if a
-  complete file is visible. Cleanup never deletes a preexisting destination.
+  and sync the directory. Cleanup never deletes a preexisting destination.
 - Every write is verified by an authenticated decrypt read-back that must
   reproduce the written secret and derive the authenticated public key.
+- **Durability uncertainty (as in ADR-009):** a directory-sync failure after
+  the hard link, or a failed read-back, is reported as an error even though the
+  complete destination may already be visible (`PublishedButUnsynced`,
+  `ReadBackMismatch`). The errors say the file may exist and must be inspected
+  before retrying; no-clobber publication refuses a blind recreation. This is
+  documented durability uncertainty, not a successful write.
 
 ### Migration and compatibility
 
@@ -137,7 +148,11 @@ lifecycle with the bootstrap API.
   credential file and fails closed without one; a legacy hex file keeps the
   original loader. With a credential file but no key file, init refuses rather
   than generating: encrypted keys are created explicitly with
-  `subhost producer create`.
+  `subhost producer create`. Known residual (Track A dependency): the init
+  consumer reads the key file twice — once to route, once through the loader —
+  and the legacy loader's second read still follows symlinks until Track A's
+  `symlink_metadata`/`O_NOFOLLOW` fix lands. The keystore path itself is
+  symlink-safe on both reads.
 
 ## Rejected alternatives
 

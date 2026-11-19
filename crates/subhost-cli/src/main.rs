@@ -656,7 +656,23 @@ fn resolve_validators(
     if specs.is_empty() {
         return Ok(Vec::new());
     }
-    let key_path = producer_key_file.unwrap_or_else(|| data_dir.join(PRODUCER_KEY_FILE_NAME));
+    // Resolve the producer key path fail-closed. With a credential, the
+    // default target is the keystore, never the legacy file. Without one, a
+    // present keystore must not be shadowed by generating a new plaintext key.
+    let key_path = match producer_key_file {
+        Some(path) => path,
+        None if producer_credential_file.is_some() => data_dir.join(KEYSTORE_FILE_NAME),
+        None => {
+            let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+            if keystore.exists() {
+                bail!(
+                    "{} is an encrypted producer keystore; pass --producer-credential-file to unlock it",
+                    keystore.display()
+                );
+            }
+            data_dir.join(PRODUCER_KEY_FILE_NAME)
+        }
+    };
     let mut secret = None;
     if specs.iter().any(|spec| spec.proof_of_possession.is_none()) {
         secret = Some(load_or_create_producer_key(&key_path, producer_credential_file)?);
@@ -1995,5 +2011,318 @@ mod tests {
         assert!(error.to_string().contains("--rpc-auth-token-file"));
 
         server.await.unwrap();
+    }
+
+    /// Owner-only credential file with the shared trailing-newline convention.
+    fn write_credential(dir: &Path, name: &str, password: &[u8]) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, password).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    const KEYSTORE_PASSWORD: &[u8] = b"correct horse battery staple\n";
+
+    #[test]
+    fn producer_create_and_init_share_one_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+
+        let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+        assert!(keystore.exists());
+        assert!(
+            !data_dir.join(PRODUCER_KEY_FILE_NAME).exists(),
+            "create must not leave a plaintext key behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&keystore).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(credential.clone()),
+            false,
+        )
+        .unwrap();
+
+        // The genesis identity, the keystore header and the unlocked secret
+        // must all be the same key, and the stored proof must verify.
+        let genesis = GenesisConfig::load(&data_dir.join(GENESIS_FILE_NAME)).unwrap();
+        let validator = &genesis.initial_validators[0];
+        assert_eq!(validator.public_key, read_public_key(&keystore).unwrap());
+        let password = load_credential_file(&credential).unwrap();
+        let secret = read_encrypted_producer_key(&keystore, password.as_slice()).unwrap();
+        assert_eq!(
+            validator.public_key,
+            BLSScheme::encode_public_key(&BLSScheme::public_key(&secret))
+        );
+        let public = BLSScheme::decode_public_key(&validator.public_key).unwrap();
+        let proof = BLSScheme::decode_signature(&validator.proof_of_possession).unwrap();
+        assert!(BLSScheme::verify_possession(&public, &proof));
+    }
+
+    #[test]
+    fn init_refuses_a_keystore_without_a_credential_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            false,
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("--producer-credential-file"), "error was: {error}");
+        assert!(
+            !data_dir.join(GENESIS_FILE_NAME).exists(),
+            "a refused init must not write a genesis"
+        );
+    }
+
+    #[test]
+    fn init_refuses_a_wrong_credential_and_a_loose_credential_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+
+        let wrong = write_credential(dir.path(), "wrong", b"another password entirely\n");
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(wrong),
+            false,
+        );
+        assert!(result.is_err());
+        assert!(!data_dir.join(GENESIS_FILE_NAME).exists());
+
+        // A group-readable credential file is refused before any KDF work.
+        let loose = dir.path().join("loose");
+        std::fs::write(&loose, KEYSTORE_PASSWORD).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(loose),
+            false,
+        );
+        assert!(result.is_err());
+        assert!(!data_dir.join(GENESIS_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn init_with_a_credential_but_no_key_refuses_to_generate() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+
+        let result = init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            Some(credential),
+            false,
+        );
+        assert!(result.is_err());
+        assert!(!data_dir.join(PRODUCER_KEY_FILE_NAME).exists());
+        assert!(!data_dir.join(KEYSTORE_FILE_NAME).exists());
+        assert!(!data_dir.join(GENESIS_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn migrate_preserves_the_source_and_the_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let source = data_dir.join(PRODUCER_KEY_FILE_NAME);
+        let source_bytes = std::fs::read(&source).unwrap();
+        let genesis_bytes = std::fs::read(data_dir.join(GENESIS_FILE_NAME)).unwrap();
+
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_migrate(Some(data_dir.clone()), None, None, Some(&credential)).unwrap();
+
+        let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes, "the source must survive");
+        assert_eq!(
+            std::fs::read(data_dir.join(GENESIS_FILE_NAME)).unwrap(),
+            genesis_bytes,
+            "migration must not touch the genesis"
+        );
+        let password = load_credential_file(&credential).unwrap();
+        let migrated = read_encrypted_producer_key(&keystore, password.as_slice()).unwrap();
+        assert_eq!(
+            BLSScheme::encode_secret_key(&migrated),
+            BLSScheme::encode_secret_key(&read_producer_key(&source).unwrap())
+        );
+
+        // A second migration must not replace the keystore or the source.
+        let keystore_bytes = std::fs::read(&keystore).unwrap();
+        assert!(producer_migrate(Some(data_dir.clone()), None, None, Some(&credential)).is_err());
+        assert_eq!(std::fs::read(&keystore).unwrap(), keystore_bytes);
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+
+        // With both files present, init without a credential must refuse
+        // rather than silently keep using the legacy identity.
+        assert!(init_genesis(
+            9,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            true,
+        )
+        .is_err());
+        assert_eq!(
+            std::fs::read(data_dir.join(GENESIS_FILE_NAME)).unwrap(),
+            genesis_bytes,
+            "the refused init must not rewrite the genesis"
+        );
+    }
+
+    #[test]
+    fn migrate_refuses_a_key_that_is_not_in_the_genesis() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let (genesis_secret, genesis_public) = BLSScheme::keygen();
+        let public_hex = hex::encode(BLSScheme::encode_public_key(&genesis_public));
+        let proof_hex = hex::encode(BLSScheme::encode_signature(&BLSScheme::proof_of_possession(
+            &genesis_secret,
+        )));
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec![format!(
+                "0x2222222222222222222222222222222222222222=0x{public_hex}:10:0x{proof_hex}"
+            )],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // A different local key: migrating it would encrypt the wrong identity.
+        let (other_secret, _) = BLSScheme::keygen();
+        let source = data_dir.join(PRODUCER_KEY_FILE_NAME);
+        write_producer_key(&source, &other_secret).unwrap();
+        let source_bytes = std::fs::read(&source).unwrap();
+
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        assert!(producer_migrate(Some(data_dir.clone()), None, None, Some(&credential)).is_err());
+        assert!(!data_dir.join(KEYSTORE_FILE_NAME).exists());
+        assert_eq!(std::fs::read(&source).unwrap(), source_bytes);
+    }
+
+    #[test]
+    fn migrate_without_a_source_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        assert!(producer_migrate(Some(dir.path().to_path_buf()), None, None, Some(&credential))
+            .is_err());
+        assert!(!dir.path().join(KEYSTORE_FILE_NAME).exists());
+    }
+
+    #[test]
+    fn unlock_and_inspect_follow_the_credential_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+        producer_create(Some(data_dir.clone()), None, Some(&credential)).unwrap();
+        let keystore = data_dir.join(KEYSTORE_FILE_NAME);
+
+        producer_inspect(&keystore).unwrap();
+        producer_unlock(&keystore, Some(&credential)).unwrap();
+
+        let wrong = write_credential(dir.path(), "wrong", b"another password entirely\n");
+        assert!(producer_unlock(&keystore, Some(&wrong)).is_err());
+
+        // A legacy hex file is not a keystore: inspect refuses it.
+        let legacy = dir.path().join("legacy.key");
+        let (secret, _) = BLSScheme::keygen();
+        write_producer_key(&legacy, &secret).unwrap();
+        assert!(producer_inspect(&legacy).is_err());
+    }
+
+    #[test]
+    fn create_refuses_a_second_identity_next_to_a_live_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        init_genesis(
+            7,
+            Some(data_dir.clone()),
+            Vec::new(),
+            vec!["0x2222222222222222222222222222222222222222:10".to_string()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let credential = write_credential(dir.path(), "credential", KEYSTORE_PASSWORD);
+
+        // Default destination: the legacy key must be migrated, not shadowed.
+        let error = producer_create(Some(data_dir.clone()), None, Some(&credential))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("migrate"), "error was: {error}");
+        assert!(!data_dir.join(KEYSTORE_FILE_NAME).exists());
+
+        // An explicit destination is allowed, but never replaced.
+        let explicit = dir.path().join("other.keystore.json");
+        producer_create(Some(data_dir.clone()), Some(explicit.clone()), Some(&credential)).unwrap();
+        let bytes = std::fs::read(&explicit).unwrap();
+        assert!(producer_create(Some(data_dir.clone()), Some(explicit.clone()), Some(&credential))
+            .is_err());
+        assert_eq!(std::fs::read(&explicit).unwrap(), bytes);
+    }
+
+    #[test]
+    fn creation_password_pair_must_match_and_meet_the_policy() {
+        assert!(creation_password_from_pair(b"twelve bytes", b"twelve bytez").is_err());
+        assert!(creation_password_from_pair(b"eleven byte", b"eleven byte").is_err());
+        let over_cap = vec![b'x'; subhost_keystore::MAX_PASSWORD_BYTES + 1];
+        assert!(creation_password_from_pair(&over_cap, &over_cap).is_err());
+        let password = creation_password_from_pair(b"  spaced pass  ", b"  spaced pass  ").unwrap();
+        assert_eq!(password.as_slice(), b"  spaced pass  ");
     }
 }

@@ -4011,6 +4011,7 @@ dependencies = [
  "hex",
  "libc",
  "rand 0.10.4",
+ "rustix",
  "scrypt",
  "serde",
  "serde_json",

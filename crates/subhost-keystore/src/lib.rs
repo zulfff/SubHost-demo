@@ -204,9 +204,17 @@ pub enum ProducerKeystoreError {
     #[error("keystore destination already exists")]
     DestinationExists,
 
-    /// Reading the new file back did not reproduce the written key.
-    #[error("keystore read-back did not reproduce the written key")]
+    /// Reading the new file back did not reproduce the written key. The
+    /// destination is already published and may exist; inspect it before
+    /// retrying, since no-clobber publication refuses a blind recreation.
+    #[error("keystore read-back did not reproduce the written key; the destination may exist - inspect it before retrying")]
     ReadBackMismatch,
+
+    /// The destination was published but the directory sync afterwards failed.
+    /// The file may exist and be complete; inspect it before retrying, since
+    /// no-clobber publication refuses a blind recreation.
+    #[error("keystore published but directory sync failed; the destination may exist - inspect it before retrying")]
+    PublishedButUnsynced(#[source] std::io::Error),
 
     /// The password is longer than the accepted cap.
     #[error("password is longer than the accepted limit")]
@@ -305,7 +313,10 @@ fn write_with_params(
     publish_new(path, json.as_slice())?;
 
     // The write is only complete when the file unlocks back to the same key.
-    let read_back = read_encrypted_producer_key(path, password)?;
+    // Any failure here happens after publication: the destination may exist,
+    // so the error says to inspect it rather than blindly retry.
+    let read_back = read_encrypted_producer_key(path, password)
+        .map_err(|_| ProducerKeystoreError::ReadBackMismatch)?;
     let written = Zeroizing::new(BLSScheme::encode_secret_key(secret));
     let found = Zeroizing::new(BLSScheme::encode_secret_key(&read_back));
     if written.as_slice() != found.as_slice() {
@@ -391,7 +402,7 @@ pub fn load_credential_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, ProducerK
     Ok(password)
 }
 
-/// Enforce the creation timeout: minimum length and the hard cap.
+/// Enforce the creation policy: minimum length and the hard cap.
 pub fn check_creation_password(password: &[u8]) -> Result<(), ProducerKeystoreError> {
     check_password_cap(password)?;
     if password.len() < MIN_CREATION_PASSWORD_BYTES {
@@ -444,9 +455,103 @@ fn associated_data(public_key: &[u8], kdf: &KdfParams, salt: &[u8]) -> Vec<u8> {
     aad
 }
 
+/// A JSON value parsed with duplicate object keys rejected at every level.
+///
+/// `serde_json`'s derived `Deserialize` (even with `deny_unknown_fields`)
+/// accepts a repeated known field and keeps the last value. Q-018 requires
+/// duplicate fields to fail before any KDF work, so the file is first parsed
+/// into this strict value and only then converted into [`KeystoreFile`].
+struct StrictValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for StrictValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictValueVisitor)
+    }
+}
+
+struct StrictValueVisitor;
+
+impl<'de> serde::de::Visitor<'de> for StrictValueVisitor {
+    type Value = StrictValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::json!(value)))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(StrictValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(StrictValueVisitor)
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::SeqAccess<'de>,
+    {
+        let mut items = Vec::new();
+        while let Some(item) = seq.next_element::<StrictValue>()? {
+            items.push(item.0);
+        }
+        Ok(StrictValue(serde_json::Value::Array(items)))
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if object.contains_key(&key) {
+                return Err(serde::de::Error::custom("duplicate JSON field"));
+            }
+            let value = map.next_value::<StrictValue>()?;
+            object.insert(key, value.0);
+        }
+        Ok(StrictValue(serde_json::Value::Object(object)))
+    }
+}
+
 fn parse(bytes: &[u8]) -> Result<ParsedFile, ProducerKeystoreError> {
-    let file: KeystoreFile =
+    let strict: StrictValue =
         serde_json::from_slice(bytes).map_err(|_| ProducerKeystoreError::InvalidFormat)?;
+    let file: KeystoreFile =
+        serde_json::from_value(strict.0).map_err(|_| ProducerKeystoreError::InvalidFormat)?;
     if file.purpose != PURPOSE {
         return Err(ProducerKeystoreError::UnsupportedPurpose);
     }
@@ -504,7 +609,7 @@ fn open_owner_only(path: &Path) -> Result<File, ProducerKeystoreError> {
             return Err(ProducerKeystoreError::InsecurePermissions { mode });
         }
     }
-    check_owner(path, &metadata)?;
+    check_owner(&metadata)?;
     Ok(file)
 }
 
@@ -514,22 +619,14 @@ fn open_owner_only(_path: &Path) -> Result<File, ProducerKeystoreError> {
 }
 
 #[cfg(unix)]
-fn check_owner(path: &Path, metadata: &std::fs::Metadata) -> Result<(), ProducerKeystoreError> {
+fn check_owner(metadata: &std::fs::Metadata) -> Result<(), ProducerKeystoreError> {
     use std::os::unix::fs::MetadataExt;
-    #[cfg(target_os = "linux")]
-    if let Ok(me) = std::fs::metadata("/proc/self") {
-        return if metadata.uid() == me.uid() {
-            Ok(())
-        } else {
-            Err(ProducerKeystoreError::InsecureOwner)
-        };
-    }
-    // Portability fallback: the containing directory is expected to be under the
-    // same owner. This is weaker than the /proc/self check and documented as
-    // such; the mode check remains the primary control.
-    let parent = path.parent().filter(|dir| !dir.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let parent_metadata = std::fs::metadata(parent).map_err(ProducerKeystoreError::Io)?;
-    if metadata.uid() == parent_metadata.uid() {
+    // rustix::process::geteuid is a safe wrapper, so every Unix compares the
+    // file against the real effective user of this process (the locked libc
+    // marks geteuid unsafe, and this workspace forbids unsafe). A root process
+    // loading another user's key fails here, which is the case the ownership
+    // check exists for.
+    if metadata.uid() == rustix::process::geteuid().as_raw() {
         Ok(())
     } else {
         Err(ProducerKeystoreError::InsecureOwner)
@@ -585,7 +682,11 @@ fn publish_new(path: &Path, contents: &[u8]) -> Result<(), ProducerKeystoreError
     }
 
     // Survive a crash between publication and the directory entry hitting disk.
-    File::open(parent).and_then(|dir| dir.sync_all()).map_err(ProducerKeystoreError::Io)
+    // A failure here leaves the destination published: report it distinctly so
+    // the operator inspects the file instead of blindly recreating it.
+    File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(ProducerKeystoreError::PublishedButUnsynced)
 }
 
 #[cfg(not(unix))]
@@ -726,17 +827,30 @@ mod tests {
             Err(ProducerKeystoreError::InvalidFormat)
         ));
 
-        // Duplicate field.
-        std::fs::write(
-            &path,
-            br#"{"purpose":"subhost-producer-keystore/v1","purpose":"subhost-producer-keystore/v1"}"#,
-        )
-        .unwrap();
-        set_mode(&path, 0o600);
-        assert!(matches!(
-            read_encrypted_producer_key(&path, PASSWORD),
-            Err(ProducerKeystoreError::InvalidFormat)
-        ));
+        // Duplicate fields: a complete, otherwise valid file with one repeated
+        // key must fail on the duplication itself, not on missing fields
+        // (R-59-01). Top-level and nested (`kdf`) duplicates are both refused.
+        let dir = tempfile::tempdir().unwrap();
+        let (valid_path, secret, _) = keystore_and_secret(&dir);
+        let text = std::fs::read_to_string(&valid_path).unwrap();
+        for injected in [
+            format!("{{\"version\":{KEYSTORE_VERSION},"),
+            "{\"kdf\":{\"log_n\":15,\"r\":8,\"p\":1,\"dklen\":32},".to_string(),
+        ] {
+            let duplicated = text.replacen('{', &injected, 1);
+            std::fs::write(&path, duplicated).unwrap();
+            set_mode(&path, 0o600);
+            assert!(matches!(
+                read_encrypted_producer_key(&path, PASSWORD),
+                Err(ProducerKeystoreError::InvalidFormat)
+            ));
+        }
+        // The untouched original still unlocks to the fixture key: the refusals
+        // above were the duplication, not damage to the fixture.
+        assert_eq!(
+            BLSScheme::encode_secret_key(&read(&valid_path)),
+            BLSScheme::encode_secret_key(&secret)
+        );
 
         // Trailing content after the object.
         std::fs::write(&path, b"{} trailing").unwrap();

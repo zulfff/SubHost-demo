@@ -103,6 +103,7 @@ hdrhistogram = "7.5"
 tempfile = "3.9"
 libc = "0.2"
 rpassword = "7"
+rustix = { version = "1", features = ["process"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
