@@ -50,8 +50,11 @@ and before any work buffer is allocated, checked estimates enforce
 ceiling and is accepted) and `N * r * p <= 2^22`. These are the same ceilings
 as the wallet fix (SUBHOST-2026-002, PR #49), so the two loaders cannot drift
 apart silently. The bounds constrain the KDF working set, not total process RSS
-or guaranteed unlock latency. Default/cost range remain policy pending
-target-hardware measurement.
+or guaranteed unlock latency. Measured on the development machine (release
+profile, 2026-11-19, `cargo run -p subhost-keystore --example measure-cost`,
+disposable fixture material): default `log_n = 17` unlock ≈ 0.51 s, write
+including the authenticated read-back (two derivations) ≈ 0.93 s. The
+default/cost range remain policy; other hardware will differ.
 
 ### Passwords and credentials
 

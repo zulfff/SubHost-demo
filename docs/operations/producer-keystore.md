@@ -104,6 +104,16 @@ owner-only mode and ownership; reads are bounded. Non-Unix platforms are
 refused explicitly (`UnsupportedPlatform`) rather than silently skipping
 permission checks.
 
+To measure the default cost on your own hardware (disposable fixture key,
+never a live identity):
+
+```sh
+cargo run --release -p subhost-keystore --example measure-cost
+```
+
+On the development machine this is ≈ 0.5 s per unlock and ≈ 0.9 s per write
+(the write pays two derivations because of the authenticated read-back).
+
 ## Security scope
 
 - Encryption protects the key **at rest**. A running node holds the unlocked
