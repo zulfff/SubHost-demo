@@ -50,6 +50,12 @@ struct Cli {
     /// Only log warnings and errors.
     #[arg(short, long, global = true, conflicts_with = "verbose")]
     quiet: bool,
+
+    /// Export tracing spans over OTLP HTTP/protobuf to this collector endpoint,
+    /// used verbatim including the signal path (e.g.
+    /// http://localhost:4318/v1/traces). Unset means no export.
+    #[arg(long, global = true, env = "SUBHOST_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -448,12 +454,49 @@ enum QueryCommands {
     },
 }
 
+/// Normalize a configured OTLP endpoint: trimmed, and an empty value means
+/// export stays off. The endpoint is used verbatim by the exporter, so it must
+/// include the signal path (`/v1/traces`).
+fn normalize_otlp_endpoint(value: Option<String>) -> Option<String> {
+    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+}
+
+/// Install CLI telemetry. With an OTLP endpoint configured, spans export
+/// through the provider and the returned shutdown guard must be retained for
+/// the process lifetime (drop flushes). Construction or install failure is
+/// reported and falls back to plain logging — never fatal to boot (Q-035).
+/// Must be called inside a tokio runtime: the OTLP batch processor needs one.
+fn init_telemetry(
+    otlp_endpoint: Option<String>,
+    verbosity: Verbosity,
+) -> Option<subhost_telemetry::otlp::OtlpGuard> {
+    match normalize_otlp_endpoint(otlp_endpoint) {
+        Some(endpoint) => {
+            let otlp = subhost_telemetry::otlp::OtlpConfig {
+                endpoint,
+                ..subhost_telemetry::otlp::OtlpConfig::default()
+            };
+            match subhost_telemetry::otlp::init_with_otlp(
+                TelemetryConfig::from_env(verbosity),
+                otlp,
+            ) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    eprintln!("warning: OTLP export disabled: {error}");
+                    subhost_telemetry::init_or_warn(TelemetryConfig::from_env(verbosity));
+                    None
+                }
+            }
+        }
+        None => {
+            subhost_telemetry::init_or_warn(TelemetryConfig::from_env(verbosity));
+            None
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    subhost_telemetry::init_or_warn(TelemetryConfig::from_env(Verbosity::from_flags(
-        cli.verbose,
-        cli.quiet,
-    )));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -461,6 +504,11 @@ fn main() -> Result<()> {
         .context("cannot start the async runtime")?;
 
     runtime.block_on(async move {
+        // Retained for the process lifetime; dropping it flushes pending spans.
+        // Installed inside the runtime: the OTLP batch processor needs a tokio
+        // context (Q-035).
+        let _otlp_guard =
+            init_telemetry(cli.otlp_endpoint, Verbosity::from_flags(cli.verbose, cli.quiet));
         match cli.command {
             Commands::Init {
                 chain_id,
@@ -1607,6 +1655,55 @@ mod tests {
     #[test]
     fn cli_definition_has_no_argument_collisions() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn the_otlp_endpoint_flag_is_global_and_optional() {
+        // `chain` lives under `query`, not at the top level; pin that so this
+        // test never silently parses a different command than it claims to.
+        assert!(Cli::try_parse_from(["subhost", "chain"]).is_err());
+        let cli = Cli::try_parse_from(["subhost", "query", "chain"]).unwrap();
+        assert_eq!(cli.otlp_endpoint, None);
+        for args in [
+            vec!["subhost", "--otlp-endpoint", "http://127.0.0.1:4318/v1/traces", "query", "chain"],
+            vec!["subhost", "query", "chain", "--otlp-endpoint", "http://127.0.0.1:4318/v1/traces"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.otlp_endpoint.as_deref(), Some("http://127.0.0.1:4318/v1/traces"));
+        }
+    }
+
+    #[test]
+    fn an_unset_or_empty_otlp_endpoint_means_no_export() {
+        assert_eq!(normalize_otlp_endpoint(None), None);
+        assert_eq!(normalize_otlp_endpoint(Some(String::new())), None);
+        assert_eq!(normalize_otlp_endpoint(Some("   ".into())), None);
+        assert_eq!(
+            normalize_otlp_endpoint(Some("  http://127.0.0.1:4318/v1/traces  ".into())),
+            Some("http://127.0.0.1:4318/v1/traces".into())
+        );
+    }
+
+    #[test]
+    fn a_malformed_otlp_endpoint_is_refused_before_any_global_install() {
+        let otlp = subhost_telemetry::otlp::OtlpConfig {
+            endpoint: "not a valid url".into(),
+            timeout: std::time::Duration::from_millis(50),
+        };
+        let result = subhost_telemetry::otlp::init_with_otlp(TelemetryConfig::default(), otlp);
+        assert!(result.is_err(), "exporter construction must refuse a malformed endpoint");
+    }
+
+    #[test]
+    fn telemetry_init_falls_back_to_plain_logging_without_panicking() {
+        // No endpoint: plain logging, no guard. A global subscriber may already
+        // exist in this test binary; init_or_warn tolerates that by contract.
+        assert!(init_telemetry(None, Verbosity::Normal).is_none());
+        // Malformed endpoint: construction fails, the fallback installs plain
+        // logging (or warns), and boot continues without a guard.
+        assert!(init_telemetry(Some("not a valid url".into()), Verbosity::Quiet).is_none());
+        // Empty endpoint behaves exactly like unset.
+        assert!(init_telemetry(Some("  ".into()), Verbosity::Normal).is_none());
     }
 
     #[test]

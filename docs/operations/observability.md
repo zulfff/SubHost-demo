@@ -121,6 +121,30 @@ Caveat: spans exist only when a metrics registry is supplied via
 `RpcServer::with_metrics` — they ride that middleware. The node always
 supplies one; a library consumer running without metrics gets no spans.
 
+## OTLP export wiring (`subhost` CLI, S8.1 / Q-035)
+
+The `subhost` binary compiles the `subhost-telemetry` `otlp` feature in, but
+export stays **off until an endpoint is configured** — default behaviour and
+log output are unchanged, and no exporter is constructed.
+
+- Enable with the global flag `--otlp-endpoint <URL>` or the environment
+  variable `SUBHOST_OTLP_ENDPOINT`, on any subcommand (e.g.
+  `subhost node --otlp-endpoint http://localhost:4318/v1/traces ...`).
+- The endpoint is used **verbatim**, so include the signal path `/v1/traces`.
+  The per-export timeout defaults to 10 s; the exporter honours
+  `OTEL_EXPORTER_OTLP_TIMEOUT`.
+- Telemetry is installed inside the tokio runtime (the batch processor needs a
+  runtime context). The shutdown guard is retained for the process lifetime;
+  on exit it flushes pending spans.
+- Exporter construction or install failure is reported as a warning and falls
+  back to plain logging — never fatal to boot. An empty endpoint value behaves
+  exactly like unset.
+- What exports is governed by the same per-layer `EnvFilter` as the logs
+  (`RUST_LOG`, else the verbosity directive): info spans such as `rpc_call`
+  pass the default. Only bounded operational fields enter spans, never secrets.
+- The `sync-relay` example still uses plain logging; relay span export is a
+  follow-up slice.
+
 ## Sample alert rules (S8.5)
 
 The canonical, expanded rule set — including a no-quorum finality-stall proxy
@@ -179,8 +203,9 @@ quorum certificates exist), so that alert must stay disabled for demo deployment
   accessor and stays 0 until then.
 - OTLP tracing export provider (S8.1) is published behind the `subhost-telemetry`
   `otlp` feature (Q-035): `otlp::init_with_otlp` installs the export layer and
-  returns a retained shutdown guard. RPC method spans are landed (#69) and
-  export through it once a binary installs the provider; binary wiring (CLI flag
-  / node) and the Track A block/consensus spans follow (contract agreed, Q-035).
+  returns a retained shutdown guard. The `subhost` CLI now wires it (global
+  `--otlp-endpoint` / `SUBHOST_OTLP_ENDPOINT`, opt-in at runtime); RPC method
+  spans (#69) export once an endpoint is set. The Track A block/consensus spans
+  and the sync-relay export wiring follow.
 - The exporter is unauthenticated: bind loopback or a private interface, or
   front it with an authenticating proxy. `/health/*` reveals readiness state.

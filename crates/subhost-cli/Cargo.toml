@@ -28,7 +28,7 @@ subhost-network = { workspace = true }
 subhost-node = { workspace = true }
 subhost-rpc = { workspace = true }
 subhost-storage = { workspace = true }
-subhost-telemetry = { workspace = true }
+subhost-telemetry = { workspace = true, features = ["otlp"] }
 subhost-wallet = { workspace = true }
 subhost-keystore = { workspace = true }
 anyhow = { workspace = true }
