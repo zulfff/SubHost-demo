@@ -44,6 +44,7 @@ fn full_block(budget: usize) -> Block {
             gas_used: u64::MAX,
             gas_limit: u64::MAX,
             extra_data: Vec::new(),
+            base_fee_per_gas: 0,
         },
         transactions: vec![Transaction {
             tx_type: TransactionType::Transfer,

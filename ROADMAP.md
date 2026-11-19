@@ -472,6 +472,19 @@ the metrics match a request-count test.
   parent block's utilisation, bounded by a change denominator.
 - Keep `eth_gasPrice` and `eth_maxPriorityFeePerGas` consistent with it.
 - Ledger records the base fee per block; replay recomputes it.
+- Landing in three steps (ADR-010, Q-017/Q-030) so `main` never holds a
+  fee-enabled chain its storage cannot verify: (1) `s6/fee-market-api` —
+  additive core/state API + version-2 header codec, nothing enables a policy;
+  (2) Track B storage — manifest `fee_policy`, `LedgerStore::with_fee_policy`,
+  fail-closed binding rules, re-execution + settlement in both replay paths;
+  (3) `s6/fee-market-v2` — genesis/node/RPC wiring, empty v2 blocks, admission
+  policy, durable non-empty v2 tests.
+- Track A follow-ups recorded here, not widened into the fee contract: the
+  demo seal-then-Err pool/commit inconsistency in `subhost-rpc/src/block.rs`
+  (the underpriced include case is refused up front in step 3), and the
+  pre-existing genesis `gas_limit` inconsistency — `GenesisConfig::validate`
+  checks the policy against `genesis.gas_limit` while the node never reads it
+  and the block path hardcodes `BLOCK_GAS_LIMIT`.
 
 **S6.3 Eviction and metrics**
 - Count admitted, replaced, evicted, expired; expose a pool-depth gauge per sender

@@ -240,6 +240,7 @@ impl RpcState {
                     gas_used,
                     gas_limit: BLOCK_GAS_LIMIT,
                     extra_data: Vec::new(),
+                    base_fee_per_gas: 0,
                 },
                 transactions,
                 signatures: Vec::new(),
