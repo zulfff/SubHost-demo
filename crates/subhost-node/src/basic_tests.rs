@@ -1073,6 +1073,7 @@ pub(super) fn node_commit<'a>(
         fork_log: node.fork_log.as_deref(),
         candidates,
         metrics: Some(&node.metrics),
+        runtime: Some(&node.runtime),
     }
 }
 

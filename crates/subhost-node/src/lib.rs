@@ -19,6 +19,8 @@ mod fork_incident;
 #[cfg(test)]
 mod liveness_tests;
 #[cfg(test)]
+mod runtime_health_tests;
+#[cfg(test)]
 mod testnet_tests;
 
 use bincode::Options;
@@ -153,6 +155,8 @@ pub struct Node {
     fork_log: Option<Arc<Mutex<ForkLog>>>,
     /// Set while a certified range is being adopted; signing stays suppressed.
     catching_up: Arc<AtomicBool>,
+    /// Truthful S8 health predicates and proposal-latency observations.
+    runtime: Arc<RuntimeHealth>,
 }
 
 impl Node {
@@ -420,11 +424,13 @@ impl Node {
         let metrics = Metrics::new()?;
         metrics.set_block_height(state.block_height());
         metrics.set_pending_transactions(state.pending_count());
-        metrics.set_health(HealthStatus {
-            ledger_loaded: true,
-            syncing: false,
-            consensus_alive: false,
-        });
+        metrics.set_finalized_height(state.finalized_height());
+        let catching_up = Arc::new(AtomicBool::new(false));
+        let runtime = Arc::new(RuntimeHealth::new(catching_up.clone()));
+        // Genesis, ledger, registry, journal and archive recovery reconciled
+        // above; the block pipeline has not started, so readiness stays false.
+        runtime.ledger_loaded.store(true, Ordering::SeqCst);
+        runtime.publish(&metrics, false);
 
         Ok(Self {
             state,
@@ -435,7 +441,8 @@ impl Node {
             consensus_journal,
             certified_history,
             fork_log,
-            catching_up: Arc::new(AtomicBool::new(false)),
+            catching_up,
+            runtime,
         })
     }
 
@@ -503,35 +510,50 @@ impl Node {
                     ticker.tick().await;
                     metrics.set_block_height(state.block_height());
                     metrics.set_pending_transactions(state.pending_count());
+                    // Finalized height only ever comes from a verified final
+                    // Commit QC (ADR-013); demo commits leave it at zero.
+                    metrics.set_finalized_height(state.finalized_height());
+                    // Measured under the commit lock; an unavailable measurement
+                    // keeps the previous value instead of publishing a false zero.
+                    publish_disk_stats(&metrics, &state);
                 }
             });
         }
         match (self.config.network.clone(), self.consensus.clone()) {
             (Some(config), driver) => {
                 let state = self.state.clone();
+                let runtime = self.runtime.clone();
                 let node_services = NodeServices {
                     journal: self.consensus_journal.clone(),
                     history: self.certified_history.clone(),
                     fork_log: self.fork_log.clone(),
                     catching_up: self.catching_up.clone(),
                     metrics: Some(self.metrics.clone()),
+                    runtime: self.runtime.clone(),
                 };
                 services.spawn(async move {
-                    run_network_inner(state, config, driver, node_services).await?;
+                    runtime.pipeline_alive.store(true, Ordering::SeqCst);
+                    let outcome = run_network_inner(state, config, driver, node_services).await;
+                    runtime.pipeline_alive.store(false, Ordering::SeqCst);
+                    outcome?;
                     Err(NodeError::ServiceStopped("peer gossip"))
                 });
             }
             (None, Some(driver)) => {
                 let state = self.state.clone();
+                let runtime = self.runtime.clone();
                 let node_services = NodeServices {
                     journal: self.consensus_journal.clone(),
                     history: self.certified_history.clone(),
                     fork_log: self.fork_log.clone(),
                     catching_up: self.catching_up.clone(),
                     metrics: Some(self.metrics.clone()),
+                    runtime: self.runtime.clone(),
                 };
                 services.spawn(async move {
+                    runtime.pipeline_alive.store(true, Ordering::SeqCst);
                     produce_blocks(state, Some(driver), None, node_services).await;
+                    runtime.pipeline_alive.store(false, Ordering::SeqCst);
                     Err(NodeError::ServiceStopped("consensus producer"))
                 });
             }
@@ -541,10 +563,18 @@ impl Node {
         let (_, handle) = match rpc.start(rpc_config).await {
             Ok(server) => server,
             Err(error) => {
+                self.runtime.pipeline_alive.store(false, Ordering::SeqCst);
+                self.runtime.publish(&self.metrics, false);
                 services.shutdown().await;
                 return Err(error.into());
             }
         };
+        // In explicit single-writer demo mode the local sealer/acceptance loop
+        // served by RPC is the block pipeline (Q-020).
+        if self.consensus.is_none() {
+            self.runtime.pipeline_alive.store(true, Ordering::SeqCst);
+            self.runtime.publish(&self.metrics, false);
+        }
         let on_drop_handle = handle.clone();
         let _rpc_guard = OnDrop(move || {
             let _ = on_drop_handle.stop();
@@ -558,6 +588,9 @@ impl Node {
                 None => Err(NodeError::ServiceStopped("node service set")),
             },
         };
+        // Controlled shutdown clears readiness before the pipeline stops.
+        self.runtime.pipeline_alive.store(false, Ordering::SeqCst);
+        self.runtime.publish(&self.metrics, false);
         let _ = handle.stop();
         handle.stopped().await;
         services.shutdown().await;
@@ -694,6 +727,7 @@ struct NodeServices {
     fork_log: Option<Arc<Mutex<ForkLog>>>,
     catching_up: Arc<AtomicBool>,
     metrics: Option<Metrics>,
+    runtime: Arc<RuntimeHealth>,
 }
 
 /// Pump gossip until the process shuts down.
@@ -762,6 +796,7 @@ async fn run_network_inner(
                 fork_log: services.fork_log.as_deref(),
                 catching_up: &services.catching_up,
                 metrics: services.metrics.as_ref(),
+                runtime: &services.runtime,
             },
         ) => {
             Ok(())
@@ -1043,8 +1078,13 @@ fn handle_consensus_message_inner(
                 validate_timeout_blocks(state, driver, tc)?;
             }
             let mut candidate = driver.clone();
+            let view = proposal.view;
             let vote = candidate.observe_proposal(proposal)?;
             adopt_pending(driver, candidate, commit.journal)?;
+            // Authenticated and adopted: start the proposal-to-commit clock.
+            if let Some(runtime) = commit.runtime {
+                runtime.note_proposal(view);
+            }
             commit_ready(state, driver, commit.journal, commit.history)?;
             Ok(vote)
         }
@@ -1154,6 +1194,7 @@ struct CertifiedSync<'a> {
     fork_log: Option<&'a Mutex<ForkLog>>,
     catching_up: &'a AtomicBool,
     metrics: Option<&'a Metrics>,
+    runtime: &'a RuntimeHealth,
 }
 
 impl SyncState {
@@ -1268,20 +1309,127 @@ struct CommitContext<'a> {
     fork_log: Option<&'a Mutex<ForkLog>>,
     candidates: &'a mut CandidateBuffer,
     metrics: Option<&'a Metrics>,
+    runtime: Option<&'a RuntimeHealth>,
 }
 
 impl CommitContext<'_> {
     /// Context for callers that only verify without persisting (unit helpers).
     #[cfg(test)]
     fn empty(candidates: &mut CandidateBuffer) -> CommitContext<'_> {
-        CommitContext { journal: None, history: None, fork_log: None, candidates, metrics: None }
+        CommitContext {
+            journal: None,
+            history: None,
+            fork_log: None,
+            candidates,
+            metrics: None,
+            runtime: None,
+        }
     }
 }
 
-/// Publish readiness. A halted driver refuses every signature, so it is not a
-/// live consensus participant until an operator clears the incident.
-fn publish_health(metrics: &Metrics, syncing: bool, halted: bool) {
-    metrics.set_health(HealthStatus { ledger_loaded: true, syncing, consensus_alive: !halted });
+/// Truthful runtime predicates for the S8 health snapshot (Q-020, ADR-013).
+///
+/// `ledger_loaded` is set only after genesis/ledger/registry/journal/archive
+/// recovery reconciles. `pipeline_alive` tracks the configured block-pipeline
+/// task — not peers, height growth or a timeout tick. `catching_up` is the native
+/// S3 syncing predicate, unchanged from S3.3. Readiness is exactly
+/// `ledger_loaded && !syncing && consensus_alive`; a safety incident clears
+/// `consensus_alive` without being relabelled as a reorg.
+#[derive(Default)]
+struct RuntimeHealth {
+    ledger_loaded: AtomicBool,
+    pipeline_alive: AtomicBool,
+    catching_up: Arc<AtomicBool>,
+    /// First authenticated observation of a proposal per view, for the
+    /// proposal-to-final-commit latency sample. Bounded; oldest view evicted.
+    proposal_seen: Mutex<BTreeMap<u64, std::time::Instant>>,
+}
+
+/// Views retained for latency measurement. A commit older than this window has
+/// no local proposal observation and produces no sample rather than a guess.
+const MAX_LATENCY_VIEWS: usize = 128;
+
+impl RuntimeHealth {
+    fn new(catching_up: Arc<AtomicBool>) -> Self {
+        Self {
+            ledger_loaded: AtomicBool::new(false),
+            pipeline_alive: AtomicBool::new(false),
+            catching_up,
+            proposal_seen: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn publish(&self, metrics: &Metrics, halted: bool) {
+        metrics.set_health(HealthStatus {
+            ledger_loaded: self.ledger_loaded.load(Ordering::SeqCst),
+            syncing: self.catching_up.load(Ordering::SeqCst),
+            consensus_alive: self.pipeline_alive.load(Ordering::SeqCst) && !halted,
+        });
+    }
+
+    /// Remember when a proposal was first authenticated locally. First wins: a
+    /// retransmission must not restart the latency clock.
+    fn note_proposal(&self, view: u64) {
+        let Ok(mut seen) = self.proposal_seen.lock() else { return };
+        if seen.contains_key(&view) {
+            return;
+        }
+        if seen.len() >= MAX_LATENCY_VIEWS {
+            if let Some(oldest) = seen.keys().next().copied() {
+                seen.remove(&oldest);
+            }
+        }
+        seen.insert(view, std::time::Instant::now());
+    }
+
+    /// Take the latency sample for a committed view, if this node observed the
+    /// proposal. Catch-up commits never observed it and yield `None`.
+    fn take_qc_latency(&self, view: u64) -> Option<f64> {
+        let mut seen = self.proposal_seen.lock().ok()?;
+        seen.remove(&view).map(|at| at.elapsed().as_secs_f64())
+    }
+}
+
+/// Publish readiness from actual runtime state. A halted driver refuses every
+/// signature, so it is not a live consensus participant until an operator clears
+/// the incident; a pipeline that exited is not alive either.
+fn publish_health(metrics: &Metrics, runtime: &RuntimeHealth, halted: bool) {
+    runtime.publish(metrics, halted);
+}
+
+/// Publish the ledger footprint gauges, keeping the last value on failure.
+///
+/// ADR-013: a missing or invalid active file is an error, never a false zero, so
+/// a failed measurement must not rewrite the gauges.
+fn publish_disk_stats(metrics: &Metrics, state: &RpcState) {
+    match state.ledger_disk_stats() {
+        Ok(stats) => {
+            metrics.set_ledger_disk_stats(stats.active_file_bytes, stats.snapshot_modified)
+        }
+        Err(error) => {
+            debug!(%error, "ledger disk measurement unavailable; keeping last value")
+        }
+    }
+}
+
+/// Publish finality measurements after a verified final commit (S8, ADR-013).
+///
+/// Finalized height comes only from the verified commit boundary, never from a
+/// peer announcement. A latency sample exists only when this node authenticated
+/// the proposal itself; catch-up commits produce no sample rather than a guess.
+fn publish_finality(
+    metrics: Option<&Metrics>,
+    runtime: Option<&RuntimeHealth>,
+    state: &RpcState,
+    driver: &ConsensusDriver,
+) {
+    let Some(metrics) = metrics else { return };
+    metrics.set_finalized_height(state.finalized_height());
+    if let (Some(runtime), Some(qc)) = (runtime, driver.committed_qc()) {
+        if let Some(sample) = runtime.take_qc_latency(qc.view) {
+            metrics.record_qc_latency(sample);
+        }
+    }
 }
 
 fn unix_now() -> u64 {
@@ -1313,6 +1461,7 @@ fn apply_certified_item(
     if let Some(journal) = commit.journal {
         journal.save(driver)?;
     }
+    publish_finality(commit.metrics, commit.runtime, state, driver);
     Ok(())
 }
 
@@ -1426,8 +1575,8 @@ fn record_conflict(
         log.record(incident)?;
     }
     driver.halt(HaltReason::ConflictingFinalEvidence { height });
-    if let Some(metrics) = commit.metrics {
-        publish_health(metrics, false, true);
+    if let (Some(metrics), Some(runtime)) = (commit.metrics, commit.runtime) {
+        publish_health(metrics, runtime, true);
     }
     warn!(
         height,
@@ -1533,7 +1682,7 @@ async fn produce_blocks(
     outbound: Option<tokio::sync::mpsc::Sender<NetworkMessage>>,
     services: NodeServices,
 ) {
-    let NodeServices { journal, history, catching_up, metrics, .. } = services;
+    let NodeServices { journal, history, catching_up, metrics, runtime, .. } = services;
     let Some(driver) = driver else {
         std::future::pending::<()>().await;
         return;
@@ -1558,12 +1707,12 @@ async fn produce_blocks(
             if let Some(reason) = driver.halted() {
                 warn!(?reason, "consensus is halted; refusing to propose or sign");
                 if let Some(metrics) = &metrics {
-                    publish_health(metrics, false, true);
+                    publish_health(metrics, &runtime, true);
                 }
                 return Ok(Vec::new());
             }
             if let Some(metrics) = &metrics {
-                publish_health(metrics, catching_up.load(Ordering::SeqCst), false);
+                publish_health(metrics, &runtime, false);
             }
             commit_ready(&state, &mut driver, journal.as_deref(), history.as_deref())?;
             let mut candidate = driver.clone();
@@ -1576,6 +1725,14 @@ async fn produce_blocks(
             adopt_pending(&mut driver, candidate, journal.as_deref())?;
             let round =
                 produce_once_inner(&state, &mut driver, journal.as_deref(), history.as_deref())?;
+            // A locally produced proposal starts its own latency clock; the
+            // verified commit below (or in a later cycle) closes the sample.
+            if let Some(round) = &round {
+                if !round.proposal.signature.is_empty() {
+                    runtime.note_proposal(round.proposal.view);
+                }
+            }
+            publish_finality(metrics.as_ref(), Some(runtime.as_ref()), &state, &driver);
             let mut messages = current_round_messages(&driver);
             // A just-completed round can still supply its original proposal/vote
             // to a lagging peer before the final certificate is relayed.
@@ -1648,7 +1805,7 @@ async fn pump_gossip(
     driver: Option<&Arc<Mutex<ConsensusDriver>>>,
     certified: CertifiedSync<'_>,
 ) {
-    let CertifiedSync { journal, history, fork_log, catching_up, metrics } = certified;
+    let CertifiedSync { journal, history, fork_log, catching_up, metrics, runtime } = certified;
     let mut sync = SyncState::default();
     // Q-028: one node-owned store for the whole pump. It is never handed to the
     // driver, so an unauthenticated card cannot reach the ordered commit path.
@@ -1679,6 +1836,7 @@ async fn pump_gossip(
                                 fork_log,
                                 candidates: &mut candidates,
                                 metrics,
+                                runtime: Some(runtime),
                             };
                             let applied =
                                 apply_certified_range(state, &mut driver, &mut commit, &items)
@@ -1706,11 +1864,11 @@ async fn pump_gossip(
                             sync.progressed();
                             if let Some(request) = advance_sync(&mut sync, height, catching_up) {
                                 if let Some(metrics) = metrics {
-                                    publish_health(metrics, true, false);
+                                    publish_health(metrics, runtime, false);
                                 }
                                 relay(outbound, request);
                             } else if let Some(metrics) = metrics {
-                                publish_health(metrics, false, false);
+                                publish_health(metrics, runtime, false);
                             }
                         }
                         Ok((0, _, height)) if sync.target.is_some_and(|target| height >= target) => {
@@ -1719,7 +1877,7 @@ async fn pump_gossip(
                             sync.progressed_at = None;
                             catching_up.store(false, Ordering::SeqCst);
                             if let Some(metrics) = metrics {
-                                publish_health(metrics, false, false);
+                                publish_health(metrics, runtime, false);
                             }
                         }
                         Ok(_) => {}
@@ -1738,6 +1896,7 @@ async fn pump_gossip(
                                 fork_log,
                                 candidates: &mut candidates,
                                 metrics,
+                                runtime: Some(runtime),
                             };
                             // S3.1: classification and application happen together,
                             // so a gap beyond the next height buffers rather than drops.
@@ -1747,6 +1906,9 @@ async fn pump_gossip(
                                 message,
                                 &mut commit,
                             );
+                            if result.is_ok() {
+                                publish_finality(metrics, Some(runtime), state, &driver);
+                            }
                             let mut fresh = Vec::new();
                             if result.is_ok() {
                                 if driver.halted().is_some() {
@@ -1778,7 +1940,7 @@ async fn pump_gossip(
                                             fresh.push(request);
                                         } else if let Some(metrics) = metrics {
                                             // The reached target cleared `catching_up`.
-                                            publish_health(metrics, false, false);
+                                            publish_health(metrics, runtime, false);
                                         }
                                     } else if let Some(announced) = commit.candidates.highest() {
                                         // Missing certified ancestors: ask for the range and
@@ -1788,7 +1950,7 @@ async fn pump_gossip(
                                         sync.begin(announced);
                                         catching_up.store(true, Ordering::SeqCst);
                                         if let Some(metrics) = metrics {
-                                            publish_health(metrics, true, false);
+                                            publish_health(metrics, runtime, false);
                                         }
                                         debug!(
                                             announced,
@@ -1839,7 +2001,7 @@ async fn pump_gossip(
                              unserved range"
                         );
                         if let Some(metrics) = metrics {
-                            publish_health(metrics, false, false);
+                            publish_health(metrics, runtime, false);
                         }
                     } else if let Some(driver) = driver {
                         if let Ok(driver) = driver.lock() {

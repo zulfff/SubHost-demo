@@ -324,6 +324,23 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   steps, and the S12.3 soak/abort rules. Prep-only — activation waits on the
   gate; no keys or tokens are committed. Docs only.
 
+- **S8 node runtime hooks (Q-020/Q-032, ADR-013).** Health predicates now come
+  from actual runtime state instead of constants: `ledger_loaded` is set only
+  after genesis/ledger/registry/journal/archive recovery reconciles,
+  `consensus_alive` is block-pipeline task liveness AND not halted (a safety
+  incident clears readiness without being relabelled as syncing or a reorg), and
+  `syncing` stays exactly the native catch-up flag. Readiness clears before
+  controlled shutdown and on pipeline exit; explicit single-writer demo mode
+  counts the RPC sealer/acceptance loop as its block pipeline. Finalized height
+  and proposal-to-final-commit latency are published at the verified commit path:
+  a latency sample exists only for a proposal this node authenticated (bounded
+  128-view observation map, retransmissions do not restart the clock), and
+  catch-up commits produce no sample. Ledger footprint and snapshot age are
+  measured every 5 s under the commit lock; a failed measurement keeps the
+  previous gauge value, never a false zero. `subhost_connected_peers` remains
+  gated pending a network handle accessor. Nine unit tests in a new module; the
+  live-cluster test files are untouched.
+
 - **Opt-in OTLP tracing export provider (S8.1, Q-020/Q-035).** `subhost-telemetry`
   gains an `otlp` feature; default builds carry no OpenTelemetry dependency and
   behave exactly as before. `otlp::init_with_otlp` installs a
