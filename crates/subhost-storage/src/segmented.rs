@@ -20,13 +20,14 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use subhost_core::{Block, ChainId, Hash, Receipt};
+use subhost_core::{Block, ChainId, FeePolicy, Hash, Receipt};
 use subhost_state::{State, StateSnapshot};
 use tracing::debug;
 
 use crate::{
-    lock_cache, HeadCache, LedgerSnapshot, PruneOutcome, RestoredLedger, StorageError,
-    VerifiedHead, LEDGER_BACKUP_FILE_NAME, LEDGER_DIR_NAME, LEDGER_FILE_NAME, MANIFEST_FILE_NAME,
+    bind_fee_policy, lock_cache, replay_blocks, HeadCache, LedgerSnapshot, PruneOutcome,
+    RestoredLedger, StorageError, VerifiedHead, LEDGER_BACKUP_FILE_NAME, LEDGER_DIR_NAME,
+    LEDGER_FILE_NAME, MANIFEST_FILE_NAME,
 };
 
 /// Target size for one segment file. A record is never split, so a segment may
@@ -88,6 +89,11 @@ struct ManifestFile {
     /// version 1, where it is always zero.
     #[serde(default)]
     base_height: u64,
+    /// Genesis-bound fee policy of a fee-enabled chain (Q-030). Absent on every
+    /// legacy manifest, so policy-less files stay byte-identical; an older build
+    /// refuses the field outright because this struct denies unknown fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fee_policy: Option<FeePolicy>,
     snapshot: SnapshotFile,
     segments: Vec<SegmentFile>,
 }
@@ -133,6 +139,8 @@ pub(crate) struct CommittedLedger {
     pub head_hash: Hash,
     /// Height of the last pruned block; the retained segments start after it.
     pub base_height: u64,
+    /// The fee policy this ledger commits to, if it is fee-enabled.
+    pub fee_policy: Option<FeePolicy>,
     pub snapshot: Option<SnapshotRef>,
     pub segments: Vec<SegmentRef>,
 }
@@ -240,6 +248,7 @@ pub(crate) fn read_manifest(
         head_height: manifest.head_height,
         head_hash: parse_hash(&manifest.head_hash, "head_hash")?,
         base_height: manifest.base_height,
+        fee_policy: manifest.fee_policy.clone(),
         snapshot: Some(snapshot),
         segments,
     };
@@ -343,7 +352,14 @@ fn parse_hash(value: &str, field: &str) -> Result<Hash, StorageError> {
 }
 
 /// Load and fully validate the segmented ledger.
-pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger, StorageError> {
+///
+/// `supplied` is the policy the caller opened the store with; `None` means "use
+/// the recorded one", which is how offline tools validate a fee-enabled ledger.
+pub(crate) fn load(
+    chain_id: ChainId,
+    data_dir: &Path,
+    supplied: Option<&FeePolicy>,
+) -> Result<RestoredLedger, StorageError> {
     let committed = read_manifest(data_dir, chain_id)?;
     let base_height = committed.base_height;
     let snapshot = committed
@@ -403,16 +419,14 @@ pub(crate) fn load(chain_id: ChainId, data_dir: &Path) -> Result<RestoredLedger,
         .checked_sub(base_height)
         .and_then(|offset| usize::try_from(offset).ok())
         .ok_or_else(|| StorageError::Manifest("snapshot height does not fit in memory".into()))?;
-    for block in blocks.iter().skip(replay_from) {
-        for transaction in &block.transactions {
-            state.apply_transaction(transaction).map_err(|error| {
-                StorageError::Snapshot(format!(
-                    "cannot replay block {} on the snapshot: {error}",
-                    block.header.height
-                ))
-            })?;
-        }
-    }
+    let policy = bind_fee_policy(committed.fee_policy.as_ref(), supplied, &blocks, true, false)?;
+    let parent =
+        replay_from.checked_sub(1).and_then(|index| blocks.get(index)).map(|block| &block.header);
+    replay_blocks(&blocks[replay_from..], parent, policy.as_ref(), &mut state, "on the snapshot")
+        .map_err(|error| match error {
+        StorageError::Invalid(message) => StorageError::Snapshot(message),
+        other => other,
+    })?;
 
     crate::validate_chain_from(base_height, &blocks, &receipts, chain_id, &state)?;
     debug!(
@@ -664,11 +678,19 @@ pub(crate) fn persist(
     segment_max_bytes: u64,
     snapshot_interval: u64,
     head_cache: &HeadCache,
+    supplied: Option<&FeePolicy>,
 ) -> Result<(), StorageError> {
     let previous = read_previous(chain_id, data_dir)?;
     let base_height = previous.as_ref().map_or(0, |previous| previous.base_height);
     let new_height = snapshot.blocks.last().map_or(0, |block| block.header.height);
     let committed_records = previous.as_ref().map_or(Ok(0), CommittedLedger::records)?;
+    let policy = bind_fee_policy(
+        previous.as_ref().and_then(|previous| previous.fee_policy.as_ref()),
+        supplied,
+        &snapshot.blocks,
+        previous.is_some(),
+        true,
+    )?;
     // Validate before any write, against the base the manifest commits to. A
     // full history offered to a pruned store is rejected here rather than being
     // silently re-anchored.
@@ -678,9 +700,25 @@ pub(crate) fn persist(
         snapshot,
         chain_id,
         committed_records,
+        policy.as_ref(),
     )? {
         Some(state) => state,
-        None => crate::validate_snapshot_from(snapshot, chain_id, base_height)?,
+        None => {
+            // A fee-enabled full validation replays from the committed snapshot;
+            // a legacy one keeps the commitment-only check and reads nothing.
+            let anchor = if snapshot.blocks.iter().any(|block| block.header.version >= 2) {
+                committed_anchor(previous.as_ref(), data_dir, chain_id, snapshot, base_height)?
+            } else {
+                None
+            };
+            crate::validate_snapshot_from(
+                snapshot,
+                chain_id,
+                base_height,
+                policy.as_ref(),
+                anchor.as_ref(),
+            )?
+        }
     };
     check_append_only(previous.as_ref(), snapshot, new_height)?;
 
@@ -725,6 +763,7 @@ pub(crate) fn persist(
         head_height: new_height,
         head_hash: snapshot.blocks.last().map_or(Hash::ZERO, Block::hash),
         base_height,
+        fee_policy: policy,
         snapshot: Some(snapshot_ref),
         segments,
     };
@@ -758,6 +797,7 @@ fn validate_appended_suffix(
     snapshot: &LedgerSnapshot,
     chain_id: ChainId,
     committed_records: u64,
+    policy: Option<&FeePolicy>,
 ) -> Result<Option<State>, StorageError> {
     let Some(previous) = previous else {
         return Ok(None);
@@ -780,7 +820,7 @@ fn validate_appended_suffix(
     let start = usize::try_from(committed_records).map_err(|_| {
         StorageError::Invalid("retained record count does not fit in memory".into())
     })?;
-    validate_suffix_on(cached, start, snapshot, chain_id)
+    validate_suffix_on(cached, start, snapshot, chain_id, policy)
 }
 
 /// Validate the blocks an ephemeral store appends on top of its last successful
@@ -794,6 +834,7 @@ fn validate_ephemeral_suffix(
     head_cache: &HeadCache,
     snapshot: &LedgerSnapshot,
     chain_id: ChainId,
+    policy: Option<&FeePolicy>,
 ) -> Result<Option<State>, StorageError> {
     let guard = lock_cache(head_cache);
     let Some(cached) = guard.as_ref() else {
@@ -802,9 +843,10 @@ fn validate_ephemeral_suffix(
     let Some(retained) = cached.height.checked_sub(cached.base_height) else {
         return Ok(None);
     };
-    let start = usize::try_from(retained)
-        .map_err(|_| StorageError::Invalid("retained record count does not fit in memory".into()))?;
-    validate_suffix_on(cached, start, snapshot, chain_id)
+    let start = usize::try_from(retained).map_err(|_| {
+        StorageError::Invalid("retained record count does not fit in memory".into())
+    })?;
+    validate_suffix_on(cached, start, snapshot, chain_id, policy)
 }
 
 /// Validate only the append: `start` counts the already-verified blocks the
@@ -817,6 +859,7 @@ fn validate_suffix_on(
     start: usize,
     snapshot: &LedgerSnapshot,
     chain_id: ChainId,
+    policy: Option<&FeePolicy>,
 ) -> Result<Option<State>, StorageError> {
     // Only growth is covered here. An unchanged or shortened history keeps the
     // full validation, which must also re-check the offered prefix: genesis
@@ -843,17 +886,14 @@ fn validate_suffix_on(
 
     // Replaying the suffix enforces nonce ordering across the whole history:
     // a transaction already committed below the head cannot be applied again.
+    // Version 2 blocks also settle their fees here, exactly as the block path
+    // does, so the replayed root carries the producer credit.
+    let parent = start
+        .checked_sub(1)
+        .and_then(|index| snapshot.blocks.get(index))
+        .map(|block| &block.header);
     let mut state = cached.state.clone();
-    for block in suffix {
-        for transaction in &block.transactions {
-            state.apply_transaction(transaction).map_err(|error| {
-                StorageError::Invalid(format!(
-                    "cannot replay block {} on the verified head: {error}",
-                    block.header.height
-                ))
-            })?;
-        }
-    }
+    replay_blocks(suffix, parent, policy, &mut state, "on the verified head")?;
 
     let receipts: Vec<Receipt> = snapshot
         .receipts
@@ -883,11 +923,22 @@ pub(crate) fn validate_ephemeral(
     chain_id: ChainId,
     snapshot: &LedgerSnapshot,
     head_cache: &HeadCache,
+    supplied: Option<&FeePolicy>,
 ) -> Result<(), StorageError> {
+    // Nothing is recorded on disk, so the supplied policy is the only one; the
+    // binding still refuses a version 2 history offered without any policy.
+    let policy = bind_fee_policy(None, supplied, &snapshot.blocks, false, true)?;
     let new_height = snapshot.blocks.last().map_or(0, |block| block.header.height);
-    let verified = match validate_ephemeral_suffix(head_cache, snapshot, chain_id)? {
+    let verified = match validate_ephemeral_suffix(head_cache, snapshot, chain_id, policy.as_ref())?
+    {
         Some(state) => state,
-        None => crate::validate_snapshot(snapshot, chain_id)?,
+        None => {
+            // An unchanged or shortened history keeps the full validation. The
+            // cache is the only anchor an ephemeral store has, so it serves here
+            // exactly as the committed snapshot does for a durable store.
+            let anchor = ephemeral_anchor(head_cache, snapshot);
+            crate::validate_snapshot_from(snapshot, chain_id, 0, policy.as_ref(), anchor.as_ref())?
+        }
     };
     check_ephemeral_append_only(head_cache, snapshot, new_height)?;
     *lock_cache(head_cache) = Some(VerifiedHead {
@@ -897,6 +948,77 @@ pub(crate) fn validate_ephemeral(
         state: verified,
     });
     Ok(())
+}
+
+/// The cached head as a replay anchor, when the offered history still carries
+/// the block it names. Used only by the ephemeral full validation.
+fn ephemeral_anchor(
+    head_cache: &HeadCache,
+    snapshot: &LedgerSnapshot,
+) -> Option<crate::ReplayAnchor> {
+    let guard = lock_cache(head_cache);
+    let cached = guard.as_ref()?;
+    let header = if cached.height == 0 {
+        None
+    } else {
+        let index = cached
+            .height
+            .checked_sub(cached.base_height)
+            .and_then(|retained| retained.checked_sub(1))
+            .and_then(|offset| usize::try_from(offset).ok())?;
+        let block = snapshot.blocks.get(index)?;
+        if block.header.height != cached.height || block.hash() != cached.hash {
+            return None;
+        }
+        Some(block.header.clone())
+    };
+    Some(crate::ReplayAnchor { state: cached.state.clone(), height: cached.height, header })
+}
+
+/// The committed snapshot's state, plus the header of the block at its height
+/// when the offered history still carries it.
+///
+/// This is the replay anchor for a fee-enabled full validation whose head cache
+/// cannot serve: the snapshot is the only intermediate state storage commits to,
+/// and `prune` guarantees the block at its height is retained.
+fn committed_anchor(
+    previous: Option<&CommittedLedger>,
+    data_dir: &Path,
+    chain_id: ChainId,
+    snapshot: &LedgerSnapshot,
+    base_height: u64,
+) -> Result<Option<crate::ReplayAnchor>, StorageError> {
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let Some(committed_snapshot) = previous.snapshot.as_ref() else {
+        return Ok(None);
+    };
+    let state = read_snapshot(data_dir, chain_id, committed_snapshot)?;
+    let header = if committed_snapshot.height == 0 {
+        None
+    } else {
+        let index = committed_snapshot
+            .height
+            .checked_sub(base_height)
+            .and_then(|offset| offset.checked_sub(1))
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| {
+                StorageError::Invalid("committed snapshot height does not fit in memory".into())
+            })?;
+        let anchor = snapshot.blocks.get(index).ok_or_else(|| {
+            StorageError::Invalid(
+                "the offered history does not carry the committed snapshot anchor".into(),
+            )
+        })?;
+        if anchor.header.state_root != committed_snapshot.state_root {
+            return Err(StorageError::Invalid(
+                "offered anchor block does not match the committed snapshot root".into(),
+            ));
+        }
+        Some(anchor.header.clone())
+    };
+    Ok(Some(crate::ReplayAnchor { state, height: committed_snapshot.height, header }))
 }
 
 /// Read whatever history the directory currently commits to: the manifest if it
@@ -920,6 +1042,7 @@ fn read_previous(
         head_height: legacy.blocks.last().map_or(0, |block| block.header.height),
         head_hash: legacy.blocks.last().map_or(Hash::ZERO, Block::hash),
         base_height: 0,
+        fee_policy: None,
         snapshot: None,
         segments: Vec::new(),
     }))
@@ -1029,6 +1152,7 @@ pub(crate) fn prune(
         head_height: committed.head_height,
         head_hash: committed.head_hash,
         base_height,
+        fee_policy: committed.fee_policy.clone(),
         snapshot: Some(snapshot.clone()),
         segments: committed.segments[dropped_segments..].to_vec(),
     };
@@ -1317,6 +1441,7 @@ fn write_manifest(
         head_height: committed.head_height,
         head_hash: committed.head_hash.to_string(),
         base_height: committed.base_height,
+        fee_policy: committed.fee_policy.clone(),
         snapshot: SnapshotFile {
             file: snapshot.file.clone(),
             height: snapshot.height,

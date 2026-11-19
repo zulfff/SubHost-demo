@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use subhost_core::{
     Address, BlockHeader, Transaction, TransactionSignature, TransactionType, BLOCK_GAS_LIMIT,
+    FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER,
 };
 use subhost_state::State;
 
@@ -1584,4 +1585,462 @@ fn an_unchanged_history_with_a_tampered_state_is_still_refused() {
         "{error}"
     );
     assert_eq!(store.load().unwrap().height(), 1);
+}
+
+// --- S6.2 fee-enabled replay (Q-017 / Q-030) ---
+
+fn fee_policy() -> FeePolicy {
+    FeePolicy {
+        initial_base_fee_per_gas: 8,
+        min_base_fee_per_gas: 1,
+        max_base_fee_per_gas: 1_000_000,
+        elasticity_multiplier: FEE_ELASTICITY_MULTIPLIER,
+        change_denominator: FEE_CHANGE_DENOMINATOR,
+    }
+}
+
+fn other_policy() -> FeePolicy {
+    FeePolicy { initial_base_fee_per_gas: 9, ..fee_policy() }
+}
+
+fn producer() -> Address {
+    Address::new([7; 20])
+}
+
+fn genesis_state() -> State {
+    let mut state = State::with_chain_id(1);
+    state.credit(sender(), 10_000_000_000_000).unwrap();
+    state
+}
+
+fn priced_transfer(nonce: u64, gas_price: u128) -> Transaction {
+    let mut tx = transfer(nonce);
+    tx.gas_price = gas_price;
+    let signature = key().sign(&tx.signing_payload()).to_bytes();
+    tx.signature = TransactionSignature::from_ed25519(&signature);
+    tx
+}
+
+/// Cumulative fee-enabled snapshots for heights 1..=count, each settled exactly
+/// as the block path settles: execute, aggregate, credit the producer, then root.
+fn v2_history(count: u64, policy: &FeePolicy, validator: Address) -> Vec<LedgerSnapshot> {
+    v2_history_settled(count, policy, validator, true)
+}
+
+/// `credit: false` seals the producer's tip into the header without applying it
+/// to the state: the shortcut a fee-enabled replay must refuse.
+fn v2_history_settled(
+    count: u64,
+    policy: &FeePolicy,
+    validator: Address,
+    credit: bool,
+) -> Vec<LedgerSnapshot> {
+    let mut state = genesis_state();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut receipts: Vec<Receipt> = Vec::new();
+    let mut snapshots = Vec::new();
+    for height in 1..=count {
+        let transactions = vec![priced_transfer(height - 1, 10)];
+        let context = match blocks.last() {
+            Some(parent) => policy.next_context(&parent.header, BLOCK_GAS_LIMIT).unwrap(),
+            None => policy.initial_context(BLOCK_GAS_LIMIT).unwrap(),
+        };
+        let mut hashes = Vec::new();
+        let mut commitments = Vec::new();
+        let mut gas_used = 0u64;
+        for (tx_index, tx) in transactions.iter().enumerate() {
+            state.apply_transaction(tx).unwrap();
+            gas_used += tx.gas_limit;
+            hashes.push(tx.hash());
+            commitments.push(receipt_commitment(
+                tx.hash(),
+                height,
+                u32::try_from(tx_index).unwrap(),
+                tx.gas_limit,
+                gas_used,
+            ));
+        }
+        let settlement =
+            settle_block_fees(&context, transactions.iter().map(|tx| (tx, tx.gas_limit))).unwrap();
+        if credit {
+            state
+                .credit_block_priority(
+                    (validator != Address::ZERO).then_some(validator),
+                    settlement.priority,
+                )
+                .unwrap();
+        }
+        let header = BlockHeader {
+            version: FEE_HEADER_VERSION,
+            chain_id: 1,
+            height,
+            timestamp: 1_700_000_000 + height,
+            parent_hash: blocks.last().map_or(Hash::ZERO, Block::hash),
+            state_root: state.root(),
+            tx_root: tx_root_of(&hashes),
+            receipt_root: receipts_root(&commitments),
+            validator,
+            gas_used,
+            gas_limit: BLOCK_GAS_LIMIT,
+            extra_data: Vec::new(),
+            base_fee_per_gas: context.base_fee_per_gas,
+        };
+        let block = Block { header, transactions, signatures: Vec::new() };
+        let mut cumulative_gas_used = 0u64;
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            cumulative_gas_used += tx.gas_limit;
+            receipts.push(Receipt {
+                tx_hash: tx.hash(),
+                block_hash: block.hash(),
+                block_height: height,
+                transaction_index: u32::try_from(tx_index).unwrap(),
+                gas_used: tx.gas_limit,
+                cumulative_gas_used,
+                status: ReceiptStatus::Success,
+                logs: Vec::new(),
+                contract_address: None,
+            });
+        }
+        blocks.push(block);
+        snapshots.push(LedgerSnapshot {
+            chain_id: 1,
+            state: state.snapshot(),
+            blocks: blocks.clone(),
+            receipts: receipts.clone(),
+        });
+    }
+    snapshots
+}
+
+/// Seal a v2 block with honest commitments and the given state root, without
+/// applying its transactions: the producer shortcut replay must catch.
+fn seal_v2_without_replay(
+    parent: &Block,
+    transactions: Vec<Transaction>,
+    state: &State,
+    policy: &FeePolicy,
+    validator: Address,
+) -> (Block, Vec<Receipt>) {
+    let height = parent.header.height + 1;
+    let context = policy.next_context(&parent.header, BLOCK_GAS_LIMIT).unwrap();
+    let mut hashes = Vec::new();
+    let mut commitments = Vec::new();
+    let mut gas_used = 0u64;
+    for (tx_index, tx) in transactions.iter().enumerate() {
+        gas_used += tx.gas_limit;
+        hashes.push(tx.hash());
+        commitments.push(receipt_commitment(
+            tx.hash(),
+            height,
+            u32::try_from(tx_index).unwrap(),
+            tx.gas_limit,
+            gas_used,
+        ));
+    }
+    let header = BlockHeader {
+        version: FEE_HEADER_VERSION,
+        chain_id: 1,
+        height,
+        timestamp: 1_700_000_000 + height,
+        parent_hash: parent.hash(),
+        state_root: state.root(),
+        tx_root: tx_root_of(&hashes),
+        receipt_root: receipts_root(&commitments),
+        validator,
+        gas_used,
+        gas_limit: BLOCK_GAS_LIMIT,
+        extra_data: Vec::new(),
+        base_fee_per_gas: context.base_fee_per_gas,
+    };
+    let block = Block { header, transactions, signatures: Vec::new() };
+    let mut cumulative_gas_used = 0u64;
+    let receipts = block
+        .transactions
+        .iter()
+        .enumerate()
+        .map(|(tx_index, tx)| {
+            cumulative_gas_used += tx.gas_limit;
+            Receipt {
+                tx_hash: tx.hash(),
+                block_hash: block.hash(),
+                block_height: height,
+                transaction_index: u32::try_from(tx_index).unwrap(),
+                gas_used: tx.gas_limit,
+                cumulative_gas_used,
+                status: ReceiptStatus::Success,
+                logs: Vec::new(),
+                contract_address: None,
+            }
+        })
+        .collect();
+    (block, receipts)
+}
+
+fn open_with_policy(dir: &Path, policy: FeePolicy) -> LedgerStore {
+    LedgerStore::open(1, dir).unwrap().with_fee_policy(policy).unwrap()
+}
+
+fn ephemeral_with_policy(policy: FeePolicy) -> LedgerStore {
+    LedgerStore::ephemeral(1).unwrap().with_fee_policy(policy).unwrap()
+}
+
+/// Persist the height-0 genesis state: the anchor every v2 replay starts from.
+fn seed(store: &LedgerStore) {
+    store
+        .persist(&LedgerSnapshot {
+            chain_id: 1,
+            state: genesis_state().snapshot(),
+            blocks: Vec::new(),
+            receipts: Vec::new(),
+        })
+        .unwrap();
+}
+
+#[test]
+fn a_v2_history_persists_loads_and_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let policy = fee_policy();
+    let history = v2_history(3, &policy, producer());
+    let store = open_with_policy(dir.path(), policy.clone());
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+    store.persist(&history[2]).unwrap();
+
+    let reopened = open_with_policy(dir.path(), policy);
+    let restored = reopened.load().unwrap();
+    assert_eq!(restored.height(), 3);
+    assert_eq!(restored.state.root(), history[2].blocks.last().unwrap().header.state_root);
+    assert_eq!(manifest_value(dir.path())["fee_policy"]["initial_base_fee_per_gas"], 8);
+}
+
+#[test]
+fn v2_roots_agree_across_durable_and_ephemeral_warm_and_cold() {
+    let policy = fee_policy();
+    let history = v2_history(3, &policy, producer());
+    let expected = history[2].blocks.last().unwrap().header.state_root;
+
+    // Durable warm: the second persist extends the cached head.
+    let warm_dir = tempfile::tempdir().unwrap();
+    let warm = open_with_policy(warm_dir.path(), policy.clone());
+    seed(&warm);
+    warm.persist(&history[1]).unwrap();
+    warm.persist(&history[2]).unwrap();
+    assert_eq!(warm.load().unwrap().state.root(), expected);
+
+    // Durable cold: a fresh store with no cache takes the full path, replaying
+    // from the committed snapshot anchor.
+    let cold_dir = tempfile::tempdir().unwrap();
+    let cold_seed = open_with_policy(cold_dir.path(), policy.clone());
+    seed(&cold_seed);
+    cold_seed.persist(&history[1]).unwrap();
+    let cold = open_with_policy(cold_dir.path(), policy.clone());
+    cold.persist(&history[2]).unwrap();
+    assert_eq!(cold.load().unwrap().state.root(), expected);
+
+    // Ephemeral warm: same suffix route, no filesystem.
+    let warm_mem = ephemeral_with_policy(policy.clone());
+    seed(&warm_mem);
+    warm_mem.persist(&history[1]).unwrap();
+    warm_mem.persist(&history[2]).unwrap();
+
+    // Ephemeral cold: an unchanged history takes the full path with the cached
+    // head as its anchor, and still accepts the same root.
+    let cold_mem = ephemeral_with_policy(policy);
+    seed(&cold_mem);
+    cold_mem.persist(&history[2]).unwrap();
+    cold_mem.persist(&history[2]).unwrap();
+}
+
+#[test]
+fn v2_suffix_refuses_a_nonce_skip_on_durable_and_ephemeral() {
+    let policy = fee_policy();
+    let history = v2_history(1, &policy, producer());
+    let first = &history[0];
+    let state = State::from_snapshot(first.state.clone()).unwrap();
+    // Honest commitments, but nonce 5 skips the nonce the head state expects.
+    // Only re-execution catches this; the commitment checks would accept it.
+    let (block, receipts) = seal_v2_without_replay(
+        &first.blocks[0],
+        vec![priced_transfer(5, 10)],
+        &state,
+        &policy,
+        producer(),
+    );
+    let mut offered = first.clone();
+    offered.blocks.push(block);
+    offered.receipts.extend(receipts);
+
+    let dir = tempfile::tempdir().unwrap();
+    let durable = open_with_policy(dir.path(), policy.clone());
+    seed(&durable);
+    durable.persist(first).unwrap();
+    let error = durable.persist(&offered).unwrap_err();
+    assert!(error.to_string().contains("cannot replay block 2"), "{error}");
+    assert_eq!(durable.load().unwrap().height(), 1);
+
+    let ephemeral = ephemeral_with_policy(policy);
+    seed(&ephemeral);
+    ephemeral.persist(first).unwrap();
+    let error = ephemeral.persist(&offered).unwrap_err();
+    assert!(error.to_string().contains("cannot replay block 2"), "{error}");
+}
+
+#[test]
+fn ephemeral_append_refuses_a_transaction_the_state_cannot_replay() {
+    // Legacy in-memory appends used to take the never-re-executing full path.
+    // They now re-execute on the cached head, exactly like durable appends.
+    let store = LedgerStore::ephemeral(1).unwrap();
+    let (first, state) = ledger(1);
+    store.persist(&first).unwrap();
+    let (block, receipts) = seal_without_replay(&first.blocks[0], vec![transfer(5)], &state);
+    let mut offered = first.clone();
+    offered.blocks.push(block);
+    offered.receipts.extend(receipts);
+    let error = store.persist(&offered).unwrap_err();
+    assert!(error.to_string().contains("cannot replay block 2"), "{error}");
+}
+
+#[test]
+fn ephemeral_unchanged_v2_history_with_a_tampered_state_is_refused() {
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let store = ephemeral_with_policy(policy);
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+
+    let mut tampered = history[1].clone();
+    let mut state = State::from_snapshot(tampered.state.clone()).unwrap();
+    state.credit(Address::new([9; 20]), 1).unwrap();
+    tampered.state = state.snapshot();
+    let error = store.persist(&tampered).unwrap_err();
+    assert!(error.to_string().contains("does not match the replayed history"), "{error}");
+}
+
+#[test]
+fn v2_append_refuses_a_wrong_recorded_base_fee() {
+    let policy = fee_policy();
+    let mut history = v2_history(1, &policy, producer());
+    history[0].blocks[0].header.base_fee_per_gas += 1;
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy);
+    seed(&store);
+    let error = store.persist(&history[0]).unwrap_err();
+    assert!(error.to_string().contains("records base fee"), "{error}");
+}
+
+#[test]
+fn v2_append_refuses_an_uncredited_producer() {
+    let policy = fee_policy();
+    // The header attributes the block to a producer and commits to a root taken
+    // without the tip credit. Replay credits it, so the offered root mismatches.
+    let history = v2_history_settled(1, &policy, producer(), false);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy);
+    seed(&store);
+    let error = store.persist(&history[0]).unwrap_err();
+    assert!(
+        error.to_string().contains("state does not match the newest block state root"),
+        "{error}"
+    );
+    assert_eq!(store.load().unwrap().height(), 0);
+}
+
+#[test]
+fn v2_without_a_committed_anchor_is_refused() {
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy.clone());
+    let error = store.persist(&history[1]).unwrap_err();
+    assert!(error.to_string().contains("persist the genesis state first"), "{error}");
+
+    let ephemeral = ephemeral_with_policy(policy);
+    let error = ephemeral.persist(&history[1]).unwrap_err();
+    assert!(error.to_string().contains("persist the genesis state first"), "{error}");
+}
+
+#[test]
+fn offline_load_uses_the_recorded_policy_but_persist_cannot_drop_it() {
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy);
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+
+    // No supplied policy: load uses the recorded one, which is the offline case.
+    let offline = open(dir.path());
+    assert_eq!(offline.load().unwrap().height(), 2);
+    // Persisting without it would drop the recorded policy, so it is refused.
+    let error = offline.persist(&history[1]).unwrap_err();
+    assert!(error.to_string().contains("cannot drop the recorded fee policy"), "{error}");
+}
+
+#[test]
+fn a_different_supplied_policy_is_refused_on_load_and_persist() {
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy);
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+
+    let other = open_with_policy(dir.path(), other_policy());
+    let error = other.load().unwrap_err();
+    assert!(error.to_string().contains("differs from the recorded one"), "{error}");
+    let error = other.persist(&history[1]).unwrap_err();
+    assert!(error.to_string().contains("differs from the recorded one"), "{error}");
+}
+
+#[test]
+fn a_policy_cannot_be_bound_to_a_legacy_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(2).0).unwrap();
+    let error = open_with_policy(dir.path(), fee_policy()).load().unwrap_err();
+    assert!(error.to_string().contains("cannot be bound to a legacy"), "{error}");
+}
+
+#[test]
+fn version_two_blocks_without_a_recorded_policy_are_refused() {
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy.clone());
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+
+    let mut value = manifest_value(dir.path());
+    value.as_object_mut().unwrap().remove("fee_policy");
+    write_manifest_value(dir.path(), &value);
+    let error = open_with_policy(dir.path(), policy).load().unwrap_err();
+    assert!(error.to_string().contains("records no fee policy"), "{error}");
+}
+
+#[test]
+fn prune_round_trips_the_fee_policy() {
+    let policy = fee_policy();
+    let history = v2_history(5, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy.clone());
+    seed(&store);
+    for snapshot in &history {
+        store.persist_with_limits(snapshot, 1, 1).unwrap();
+    }
+    let before = manifest_value(dir.path())["fee_policy"].clone();
+    store.prune(2).unwrap();
+    assert_eq!(manifest_value(dir.path())["fee_policy"], before);
+    let restored = open_with_policy(dir.path(), policy).load().unwrap();
+    assert_eq!(restored.height(), 5);
+    assert_eq!(restored.state.root(), history[4].blocks.last().unwrap().header.state_root);
+}
+
+#[test]
+fn a_policy_less_manifest_stays_byte_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(2).0).unwrap();
+    let value = manifest_value(dir.path());
+    assert!(value.get("fee_policy").is_none(), "{value}");
+    assert_eq!(value["version"], 2);
 }

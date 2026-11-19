@@ -278,6 +278,30 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   validators (n-f = 43, and more reports than registered validators is refused).
   79 consensus tests, no protocol or wire change. ROADMAP S2.4/S2.4b wording is
   corrected to the landed API.
+- **Fee-enabled ledger replay (S6.2 step 2, ADR-010, contracts Q-017/Q-030).**
+  `LedgerStore::with_fee_policy` binds the genesis policy before the first
+  load/persist; a durable store records it in `manifest.json` as an additive
+  `fee_policy` field (manifest version stays 2, policy-less files stay
+  byte-identical, and an older build refuses the field because the manifest
+  denies unknown fields). Binding is fail-closed: version 2 blocks with no
+  recorded policy, a supplied policy that differs from the recorded one, a
+  policy bound to a legacy ledger, and a persist that tries to drop a recorded
+  policy are all refused. `load()` with no supplied policy uses the recorded
+  one, so offline tools verify a fee-enabled ledger unaided. Both replay paths
+  re-execute and settle version 2 histories: the warm suffix on the cached head,
+  and the full path from the committed snapshot anchor, calling the same
+  `settle_block_fees` + `State::credit_block_priority` sequence as the block
+  path, checking the recorded base fee against the derived one and per-block fee
+  conservation. A version 2 history with no anchor is refused with the
+  operator's fix named (persist the genesis state first). Legacy histories keep
+  their exact previous behavior: no execution added to the full path, no
+  settlement, no credit. `prune` round-trips the recorded policy unchanged.
+- **Ephemeral stores anchor appends on the verified head.** An in-memory persist
+  now records the head it verified and takes the same suffix route as a durable
+  store, with append-only enforced against that head. Deliberate behavior
+  change: legacy in-memory appends now re-execute on the cached head, so a
+  replayed or nonce-skipping transaction with honest commitments is refused
+  there too, instead of passing the never-re-executing full path.
 
 - **Fee-market core/state API and version-2 header codec (S6.2 step 1, ADR-010,
   contracts Q-017/Q-030).** Additive only: `subhost_core::fee` supplies
@@ -481,7 +505,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   defaults to off, so an existing node without flags behaves exactly as before.
   Documented limitations: the rate limit is per connection because jsonrpsee 0.24
   does not expose the peer address, WebSocket tokens are checked only at the
-  upgrade handshake, and there is no in-process TLS — the public deployment mode
+  upgrade handshake, and there is no in-process TLS: the public deployment mode
   is a TLS-terminating reverse proxy. 8 new unit tests plus 4 RPC integration
   tests, and client tests in the CLI (2), faucet (2), and explorer (2).
 - **Segment pruning and height mapping.** `subhost db prune --keep-segments N`

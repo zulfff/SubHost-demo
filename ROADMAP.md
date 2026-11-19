@@ -499,8 +499,9 @@ the metrics match a request-count test.
 - Landing in three steps (ADR-010, Q-017/Q-030) so `main` never holds a
   fee-enabled chain its storage cannot verify: (1) `s6/fee-market-api` —
   additive core/state API + version-2 header codec, nothing enables a policy;
-  (2) Track B storage — manifest `fee_policy`, `LedgerStore::with_fee_policy`,
-  fail-closed binding rules, re-execution + settlement in both replay paths;
+  (2) Track B storage, implemented on `s6/storage-fee-replay` — manifest
+  `fee_policy`, `LedgerStore::with_fee_policy`, fail-closed binding rules,
+  re-execution + settlement in both replay paths, ephemeral head anchoring;
   (3) `s6/fee-market-v2` — genesis/node/RPC wiring, empty v2 blocks, admission
   policy, durable non-empty v2 tests.
 - Track A follow-ups recorded here, not widened into the fee contract: the
