@@ -33,6 +33,23 @@ cargo test --workspace --all-features
 CI additionally runs `cargo deny --all-features check`, a 1.89 MSRV check, a
 release build, and `cargo doc` with warnings denied. All of them are required.
 
+> **Sandbox note (deny gate).** Some sandboxes ship `/usr/local/bin/cargo` as a
+> wrapper that forces a read-only `CARGO_HOME`, so `cargo deny` fails to acquire
+> its advisory-database lock (`Permission denied`) before any check runs. This is
+> an environment issue, not a dependency defect — CI runs the same command on a
+> writable cargo home and stays green. In such a sandbox, call the direct binary
+> with a writable home instead:
+>
+> ```bash
+> RUSTUP_HOME=/usr/local/rustup CARGO_HOME="$HOME/.cargo" \
+> CARGO=/usr/local/cargo/bin/cargo \
+>   "$HOME/.local/bin/cargo-deny" deny --all-features check
+> ```
+>
+> `CARGO` points cargo-deny's metadata subprocess at the real binary so the
+> wrapper cannot re-force `CARGO_HOME`. See Q-029 (agreed) and
+> `security-audit/2026-11-19-four-gate-baseline/` for the verified root cause.
+
 ## What the code must satisfy
 
 - **No warnings.** Clippy runs with `-D warnings` over every target and feature.
