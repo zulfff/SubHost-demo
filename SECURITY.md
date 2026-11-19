@@ -19,7 +19,9 @@ Include the affected commit, the exact file and line, the impact, and the steps 
 reproduce. Never include real private keys, credentials, or production data.
 
 We aim to acknowledge a report within five business days and to coordinate
-disclosure once a fix or mitigation is available. There is no bug bounty program.
+disclosure once a fix or mitigation is available. There is no funded bug bounty
+program; see [`docs/security/bug-bounty.md`](docs/security/bug-bounty.md) for the
+research scope, safe harbor, and disclosure policy.
 
 ## Scope
 
