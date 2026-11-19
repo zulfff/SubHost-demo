@@ -114,16 +114,20 @@ must use a fresh data directory.
   version check. The node supplies the genesis policy before the first persist;
   storage never reads genesis files, so offline tools verify v2 ledgers from the
   recorded policy alone.
-- A genesis with a non-default `gas_limit` is already inconsistent before fees:
-  `GenesisConfig::validate` checks the policy against `genesis.gas_limit`, but
-  the node never reads that field and the block path hardcodes
-  `BLOCK_GAS_LIMIT`. Replay uses the policy-bound context limit and refuses a
-  mismatched header. Honouring the genesis limit end to end is a separate
-  Track A follow-up, not part of this contract.
+- The genesis `gas_limit` is honoured end to end from step 3: the node binds it
+  into `RpcState`, the fee policy is validated against it, and every produced
+  and accepted header carries it. Previously the block path hardcoded
+  `BLOCK_GAS_LIMIT` while `GenesisConfig::validate` checked the policy against
+  `genesis.gas_limit`, so a non-default genesis limit produced headers the
+  policy could not extend. A restored ledger refuses a genesis limit that
+  differs from its recorded headers; a default genesis is byte-identical.
 
-- Full-history replay verification is not in this slice; a restored fee-enabled
-  ledger is checked for extendability, not re-executed. Track B's storage PR
-  supplies the replay gate.
+- Replay verification is supplied by step 2 (Track B, `s6/storage-fee-replay`):
+  both re-executing paths settle v2 blocks before comparing roots, and a v2
+  history with no committed state anchor is refused. Step 3 binds the policy to
+  `LedgerStore` before `RpcState::with_store`, so the node's own load and persist
+  paths use it; `RpcState::with_fee_policy` additionally checks extendability
+  (policy bounds and gas-limit frame) rather than re-executing history itself.
 - The demo synchronous path can still seal a block and then report a failure
   for an unrelated reason (the seal-then-Err family). The underpriced include
   case is now refused up front; the remaining inconsistency is a recorded

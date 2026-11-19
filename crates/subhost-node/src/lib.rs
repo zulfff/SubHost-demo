@@ -225,7 +225,28 @@ impl Node {
 
         let store = LedgerStore::open(chain_id, &config.data_dir)?;
         let fresh = !store.exists();
+        // Bind the policy to the store *before* `with_store` loads it: a
+        // restored version-2 ledger replays and settles with that policy, and
+        // the first persist records it in the manifest (Q-030). Offline tools
+        // supply nothing and use the recorded policy.
+        let fee_policy = genesis.as_ref().and_then(|genesis| genesis.fee_policy.clone());
+        let store = match &fee_policy {
+            Some(policy) => store.with_fee_policy(policy.clone())?,
+            None => store,
+        };
         let mut state = RpcState::with_store(store)?.with_consensus_context(protocol_context);
+        // Honour the genesis block gas limit end to end: the fee policy is
+        // validated against it and every produced/accepted header carries it.
+        // Absent a genesis document the default limit applies unchanged.
+        if let Some(genesis) = &genesis {
+            state = state.with_block_gas_limit(genesis.gas_limit)?;
+        }
+        // A fee-enabled genesis owns the fee rules for this chain; the node
+        // refuses to extend a legacy ledger with it. Absent policy keeps the
+        // legacy fixed-price behaviour byte-for-byte.
+        if let Some(policy) = fee_policy {
+            state = state.with_fee_policy(policy)?;
+        }
         if let Some(limit) = proposal_limit {
             state = state.with_proposal_bytes_limit(limit);
         }
@@ -258,11 +279,20 @@ impl Node {
 
         if fresh {
             if let Some(genesis) = &genesis {
-                if !genesis.allocations.is_empty() {
+                // A fee-enabled ledger needs its height-0 state anchor persisted
+                // before the first v2 block, even with no allocations: storage
+                // refuses a v2 append with no committed snapshot and no verified
+                // head (Q-030). `seed_accounts` always persists, so an empty
+                // allocation set still writes the anchor.
+                if !genesis.allocations.is_empty() || genesis.fee_policy.is_some() {
                     state.seed_accounts(
                         genesis.allocations.iter().map(|(address, balance)| (*address, *balance)),
                     )?;
-                    info!(accounts = genesis.allocations.len(), "applied genesis allocations");
+                    if genesis.allocations.is_empty() {
+                        info!("persisted the genesis state anchor for the fee-enabled ledger");
+                    } else {
+                        info!(accounts = genesis.allocations.len(), "applied genesis allocations");
+                    }
                 }
             }
         } else {

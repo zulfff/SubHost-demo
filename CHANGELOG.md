@@ -14,6 +14,14 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Breaking changes
 
+- **Fee-enabled chains start from a new genesis, not an upgrade (S6.2,
+  ADR-010).** A genesis `fee_policy` binds into the consensus context and
+  switches block headers to version 2: a 13-field binary layout whose base fee
+  is inside the header hash, signatures and QCs. Policy-less chains keep the
+  exact 12-field header bytes, the six-field genesis context and the
+  fixed-price burn rules. A fee-enabled node refuses a restored legacy ledger
+  rather than rewriting it; use a fresh devnet genesis and data directory.
+
 - **Legacy BLS validator proofs and signatures are refused.** RFC 9380 G2 hashing
   replaces a construction that allowed arbitrary signature forgery from a public
   PoP. Use fresh genesis proofs and signing/history directories; preserve old data
@@ -116,6 +124,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `four_validator_nodes_require_three_votes_before_a_ledger_write` now takes
   `NETWORK_TEST_LOCK` like the liveness and real-network suites, so the last
   in-process cluster no longer overlaps another live four-validator cluster.
+- **A genesis block gas limit is now honoured end to end (S6.2 step 3).**
+  `GenesisConfig::validate` checked the fee policy against `genesis.gas_limit`,
+  but the node never read that field and the block path hardcoded
+  `BLOCK_GAS_LIMIT` (30,000,000), so a genesis naming another limit produced
+  headers the policy could not extend. `RpcState::with_block_gas_limit` binds
+  the genesis limit, the fee context/selection/producer/verifier all use it,
+  and a restored ledger refuses a genesis limit that differs from its recorded
+  headers. A default genesis is byte-identical; a legacy genesis naming a
+  non-default limit now produces blocks at that limit instead of silently
+  ignoring the field.
 
 - **Wallet files could abort the process through their scrypt cost parameters.**
   `KdfParams::validate` now refuses file-supplied costs above 256 MiB of memory
@@ -369,6 +387,25 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   blocks with byte-identical headers, genesis bindings and burn rules. Ledger
   policy binding/replay (Track B) and the node/RPC behaviour change land in the
   next two steps of ADR-010.
+
+- **Fee-enabled block path and node bootstrap (S6.2 step 3, ADR-010, contracts
+  Q-017/Q-030).** The node binds the genesis fee policy at startup and the RPC
+  block path derives each block's base fee from the committed tip, records it in
+  a version-2 header, and settles burned/priority fees before taking the state
+  root. Fee-enabled chains seal and accept empty certified blocks so an idle or
+  fully underpriced chain still returns to the floor; a wrong base fee, version
+  or state root and underpriced inclusion are rejected. Admission refuses a bid
+  below the next block's base fee under the commit lock, while entries admitted
+  before a fee rise stay parked without skipping their sender's nonce.
+  Validatorless demo mode burns the tip and creates no `Address::ZERO` reward.
+  A fee-enabled node refuses a restored legacy ledger instead of rewriting it.
+  A fresh fee-enabled genesis persists its height-0 state anchor even with no
+  allocations, which storage requires before the first v2 append (Q-030), and
+  the genesis block gas limit is honoured end to end. The policy is bound to
+  `LedgerStore` before `RpcState::with_store` loads it, so a restored v2 ledger
+  replays and settles with the recorded policy and the node's own persist path
+  verifies the producer credit.
+  Legacy chains keep byte-identical headers, bindings and burn rules.
 
 - **Release engineering and checked optimized tests (S9).** Added exact tag/version
   validation, an immutable compiler-image binary build, deterministic archives
