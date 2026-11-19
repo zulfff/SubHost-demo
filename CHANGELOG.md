@@ -321,6 +321,13 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `docs/operations/observability.md`. Zero `methods.rs` edits per the Q-033
   coordination; `tracing-subscriber` gains the additive `registry` feature for
   the target-filtered test capture.
+- **`NodeConfig.retention_blocks` configuration surface (Q-036, S12.3).** The
+  field is the agreed home for `SUBHOST-2026-003` fix 3: `None` (the default)
+  keeps `subhost db prune --keep-segments` as the only prune path, and `Some(n)`
+  is reserved for automatic retention. The prune trigger, the boot warning below
+  the 4096-item archive window and the failure-path tests land in the S12.3
+  retention slice, after the storage-side `prune_to_height` contract; this entry
+  is the field only, so the CLI flag can stack on it. No behaviour change.
 
 - **Operations runbooks and sample alerts (S8.4/S8.5).** Added
   `docs/operations/` runbooks for start/stop, producer key handling and rotation,

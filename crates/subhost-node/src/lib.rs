@@ -95,6 +95,15 @@ pub struct NodeConfig {
     pub fallback_chain_id: ChainId,
     /// Peer gossip settings. `None` keeps the node single-node and offline.
     pub network: Option<NetworkConfig>,
+    /// Blocks to retain automatically, or `None` for today's offline-only prune.
+    ///
+    /// This is the configuration surface for `SUBHOST-2026-003` fix 3 (Q-036):
+    /// `Some(n)` will prune the ledger when `tip - base_height > n`, keeping the
+    /// newest snapshot as the replay anchor. The trigger lands in the S12.3
+    /// retention slice; until then the field is accepted and documented by the
+    /// CLI but has no effect on a running node. `None` is the default and keeps
+    /// `subhost db prune --keep-segments` as the only prune path.
+    pub retention_blocks: Option<u64>,
 }
 
 impl NodeConfig {
@@ -112,6 +121,7 @@ impl NodeConfig {
             producer_key_file: None,
             fallback_chain_id: 1,
             network: None,
+            retention_blocks: None,
         }
     }
 
