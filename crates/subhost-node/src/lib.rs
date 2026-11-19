@@ -43,6 +43,7 @@ use subhost_consensus::{
 };
 use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, GenesisConfig, Hash};
 use subhost_crypto::{BLSScheme, PrivateKey};
+use subhost_mempool::MempoolStore;
 use subhost_metrics::{HealthStatus, Metrics, MetricsConfig};
 use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessage};
 use subhost_rpc::{
@@ -106,6 +107,14 @@ pub struct NodeConfig {
     /// CLI but has no effect on a running node. `None` is the default and keeps
     /// `subhost db prune --keep-segments` as the only prune path.
     pub retention_blocks: Option<u64>,
+    /// Whether the pending pool is persisted to `<data_dir>/mempool.bin`.
+    ///
+    /// `false` (the default) keeps today's volatile pool and writes nothing.
+    /// `true` attaches the durable store before traffic is served, restores the
+    /// snapshot after ledger/journal reconciliation, and makes admission
+    /// persist before a transaction hash is acknowledged (Q-016/Q-034). The CLI
+    /// flag is `--mempool-persist`.
+    pub mempool_persist: bool,
 }
 
 impl NodeConfig {
@@ -124,6 +133,7 @@ impl NodeConfig {
             fallback_chain_id: 1,
             network: None,
             retention_blocks: None,
+            mempool_persist: false,
         }
     }
 
@@ -414,12 +424,35 @@ impl Node {
             }
         }
 
+        // Q-016/Q-034 consumer: the store is opt-in, so an operator who never
+        // enables `--mempool-persist` keeps today's volatile pool and no
+        // `mempool.bin`. The genesis binding is the same protocol context the
+        // journal and certified history use, so a fee-policy or calldata-schedule
+        // change makes an old snapshot foreign instead of silently reusable.
+        let pending_path = config.data_dir.join(subhost_mempool::MEMPOOL_FILE_NAME);
+        if config.mempool_persist {
+            let store = MempoolStore::open(chain_id, protocol_context, &config.data_dir).map_err(
+                |error| NodeError::PendingSnapshot {
+                    path: pending_path.clone(),
+                    detail: error.to_string(),
+                },
+            )?;
+            state = state.with_pending_store(store);
+        }
+
         // Q-034 requirement 1: a configured pending store is restored only after
         // the ledger, journal, archive, fork log and genesis seeding are
         // reconciled, and before the node serves traffic. Placing it before the
         // metrics construction makes the pending-depth gauge report the restored
         // pool. No store configured keeps today's volatile behaviour.
-        state.restore_pending()?;
+        //
+        // Q-038: a failed restore refuses boot rather than silently starting
+        // empty, and the operator-facing error names the file to remove. The
+        // path stays in this boot error; RPC persistence errors keep no detail.
+        state.restore_pending().map_err(|error| NodeError::PendingSnapshot {
+            path: pending_path,
+            detail: error.to_string(),
+        })?;
 
         let metrics = Metrics::new()?;
         metrics.set_block_height(state.block_height());
@@ -2312,6 +2345,9 @@ pub enum NodeError {
 
     #[error(transparent)]
     Network(#[from] subhost_network::NetworkError),
+
+    #[error("pending snapshot {path}: {detail}")]
+    PendingSnapshot { path: PathBuf, detail: String },
 }
 
 #[cfg(test)]

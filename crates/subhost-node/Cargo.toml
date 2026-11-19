@@ -17,6 +17,7 @@ bincode = { workspace = true }
 subhost-consensus = { workspace = true }
 subhost-crypto = { workspace = true }
 subhost-keystore = { workspace = true }
+subhost-mempool = { workspace = true }
 subhost-metrics = { workspace = true }
 subhost-network = { workspace = true }
 subhost-rpc = { workspace = true }

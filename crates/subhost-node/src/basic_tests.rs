@@ -5,6 +5,7 @@ use subhost_core::{
     Address, FeePolicy, Transaction, TransactionSignature, TransactionType, ValidatorInfo,
     BLOCK_GAS_LIMIT, FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER, FEE_HEADER_VERSION,
 };
+use subhost_mempool::{Mempool, MempoolStore, MEMPOOL_FILE_NAME};
 
 fn test_config(directory: impl Into<PathBuf>) -> NodeConfig {
     let directory = directory.into();
@@ -1506,13 +1507,10 @@ fn node_config_defaults_to_no_automatic_retention() {
 
 #[test]
 fn bootstrap_ignores_a_stray_pending_file_without_an_attached_store() {
-    // `subhost-node` does not depend on the mempool crate; this mirrors
-    // `subhost_mempool::MEMPOOL_FILE_NAME`. No store is attached in production
-    // yet (Q-016 lands that consumer), so the bootstrap restore must be inert:
-    // it may not decode, rewrite or fail on a file it does not own.
-    const PENDING_FILE: &str = "mempool.bin";
+    // With persistence opt-in unset, the bootstrap restore must be inert: it
+    // may not decode, rewrite or fail on a file it does not own.
     let dir = tempfile::tempdir().unwrap();
-    let pending = dir.path().join(PENDING_FILE);
+    let pending = dir.path().join(MEMPOOL_FILE_NAME);
     std::fs::write(&pending, b"not a snapshot").unwrap();
 
     let node = Node::bootstrap(test_config(dir.path())).unwrap();
@@ -1642,4 +1640,136 @@ fn a_supplied_producer_key_never_reads_the_configured_key_file() {
 
     let config = NodeConfig { validator: true, single_writer: false, ..test_config(dir.path()) };
     assert!(Node::bootstrap_with_producer_key(config, secret).is_ok());
+}
+
+fn persist_snapshot(
+    dir: &Path,
+    genesis: &GenesisConfig,
+    transactions: Vec<Transaction>,
+) -> PathBuf {
+    let store = MempoolStore::open(genesis.chain_id, genesis.consensus_context(), dir).unwrap();
+    let mut pool = Mempool::default();
+    for tx in transactions {
+        pool.add(tx).unwrap();
+    }
+    store.persist(&pool).unwrap();
+    store.path().to_path_buf()
+}
+
+fn persistence_config(dir: &Path) -> NodeConfig {
+    NodeConfig { mempool_persist: true, ..test_config(dir) }
+}
+
+#[test]
+fn node_config_defaults_to_no_mempool_persistence() {
+    // The CLI `--mempool-persist` flag stacks on this field: `false` must stay
+    // the default so an existing operator keeps today's volatile pool.
+    let dir = tempfile::tempdir().unwrap();
+    assert!(!test_config(dir.path()).mempool_persist);
+    let configured = NodeConfig { mempool_persist: true, ..test_config(dir.path()) };
+    assert!(configured.mempool_persist);
+}
+
+#[test]
+fn mempool_persist_restores_a_snapshot_bound_to_this_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = signing_key(7);
+    let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+    let genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let tx = signed_transfer(&key, 0, 10);
+    let path = persist_snapshot(dir.path(), &genesis, vec![tx.clone()]);
+
+    let node = Node::bootstrap(persistence_config(dir.path())).unwrap();
+
+    assert_eq!(node.state().pending_count(), 1);
+    // Restore rewrites the filtered snapshot in place; it must still hold the
+    // pending transaction under the same chain binding.
+    let store = MempoolStore::open(1, genesis.consensus_context(), dir.path()).unwrap();
+    let on_disk = store.load().unwrap();
+    assert_eq!(on_disk.len(), 1);
+    assert_eq!(on_disk[0].hash(), tx.hash());
+    assert!(path.exists());
+}
+
+#[test]
+fn mempool_persist_is_opt_in_even_when_a_valid_snapshot_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = signing_key(7);
+    let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+    let genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let path = persist_snapshot(dir.path(), &genesis, vec![signed_transfer(&key, 0, 10)]);
+    let before = std::fs::read(&path).unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+
+    assert_eq!(node.state().pending_count(), 0);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "disabled persistence must not touch the file"
+    );
+}
+
+#[test]
+fn mempool_persist_does_not_create_the_file_before_the_first_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = Node::bootstrap(persistence_config(dir.path())).unwrap();
+
+    assert_eq!(node.state().pending_count(), 0);
+    assert!(
+        !dir.path().join(MEMPOOL_FILE_NAME).exists(),
+        "attaching a store must not write a snapshot by itself"
+    );
+    drop(node);
+}
+
+#[test]
+fn mempool_persist_refuses_a_snapshot_from_another_genesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = signing_key(7);
+    let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+    let genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    // A syntactically valid snapshot bound to a different protocol context.
+    let store = MempoolStore::open(1, Hash::from_data(b"another chain"), dir.path()).unwrap();
+    let mut pool = Mempool::default();
+    pool.add(signed_transfer(&key, 0, 10)).unwrap();
+    store.persist(&pool).unwrap();
+
+    let error = match Node::bootstrap(persistence_config(dir.path())) {
+        Err(error) => error,
+        Ok(_) => panic!("a foreign pending snapshot must not be restored"),
+    };
+
+    // Q-038: the opt-in asked for durability, so a corrupt or foreign snapshot
+    // stops the boot with the cause and the exact file rather than silently
+    // starting empty. The path stays in the boot error, never in RPC errors.
+    match error {
+        NodeError::PendingSnapshot { path, ref detail } => {
+            assert_eq!(path, dir.path().join(MEMPOOL_FILE_NAME));
+            assert!(detail.contains("genesis mismatch"), "{detail}");
+        }
+        other => panic!("expected a pending-snapshot boot error, got: {other}"),
+    }
+}
+
+#[test]
+fn mempool_persist_refuses_a_corrupt_snapshot_instead_of_starting_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join(MEMPOOL_FILE_NAME), b"not a snapshot").unwrap();
+
+    let error = match Node::bootstrap(persistence_config(dir.path())) {
+        Err(error) => error,
+        Ok(_) => panic!("a corrupt snapshot must not be silently discarded"),
+    };
+
+    match error {
+        NodeError::PendingSnapshot { path, ref detail } => {
+            assert_eq!(path, dir.path().join(MEMPOOL_FILE_NAME));
+            assert!(detail.contains("invalid snapshot header"), "{detail}");
+        }
+        other => panic!("expected a pending-snapshot boot error, got: {other}"),
+    }
 }

@@ -68,9 +68,44 @@ is acknowledged for a non-durable admission. Cleanup of mined entries after a
 durable block commit is best-effort/retryable: a pending-file cleanup error is
 logged and counted in `subhost_mempool_pending_cleanup_failures_total`, and must
 not falsely fail a committed block or stop driver adoption. Stale mined entries
-are discarded when restoring against the committed nonces. Until the node
-call-site wiring lands, no store is configured by default and the pool stays
-volatile exactly as before.
+are discarded when restoring against the committed nonces. The node call sites
+consume these hooks: admission persists before a hash is returned, a mined
+candidate is published cleaned exactly once, and a committed block retires mined
+entries with best-effort persistence. A store is attached only when the operator
+opts in, so the default pool stays volatile exactly as before.
+
+## Node opt-in and boot recovery
+
+`NodeConfig.mempool_persist` (default `false`) chooses durability; the CLI flag
+is `--mempool-persist`. When it is false, no store is attached, `mempool.bin` is
+never read or written, and boot behaves exactly as before. When it is true, the
+node attaches a store at `<data_dir>/mempool.bin` during bootstrap and restores
+it after ledger, journal, archive and fork-log reconciliation and before serving
+traffic. The snapshot is bound to the chain's protocol context
+(`GenesisConfig::consensus_context()`), so a snapshot copied from another chain,
+or one written before a genesis fee-policy or calldata-schedule change, is a
+foreign snapshot and refuses to load. Without a genesis file the binding is
+`Hash::ZERO` plus the chain id: cross-chain copies are still refused, but two
+genesis-less demo chains with the same chain id are indistinguishable.
+
+A failed restore (corrupt, truncated, foreign, oversized, unauthenticated or
+partial snapshot) **refuses boot** rather than silently starting with an empty
+pool. The boot error names the snapshot path; RPC persistence errors keep no
+local detail. Recovery is a one-file action:
+
+1. stop the node;
+2. remove `<data_dir>/mempool.bin`;
+3. restart.
+
+Deleting the file is safe: it holds signed **pending** transactions only — no
+committed ledger history, no votes or QCs, no producer keys. The ledger,
+voting journal and archive are untouched. The only loss is accepted-but-unmined
+transactions, which clients can resubmit. An absent file is a normal empty
+start, not a failure.
+
+Capacity and per-sender flags are an explicit follow-up; the opt-in chooses
+durability only, and `Mempool` already enforces count, per-sender and runtime
+byte limits with persistence on or off.
 
 ## Compatibility and operator boundaries
 
@@ -82,7 +117,8 @@ rolling voting state back or certifying missing history.
 Retain `mempool.bin` in whole-directory offline backups once consumers enable it.
 Unknown versions, wrong context, invalid signatures, duplicate slots, size limits,
 truncation and checksum failure are errors. There is no implicit repair or format
-migration. Current CLI persistence/capacity flags are not exposed by S6.1a.
+migration. The node `mempool_persist` opt-in (CLI `--mempool-persist` in the stacked flag
+PR) is exposed; explicit capacity and per-sender flags remain a follow-up.
 
 Tests cover deterministic replacement/restart, empty snapshots, context mismatch,
 corruption/truncation, invalid signed entries, duplicate slots, record/file/count
