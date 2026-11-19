@@ -61,12 +61,15 @@ Core, consensus, RPC, storage. Adjacent crates an auditor will also need:
     trigger slice is pending (raka), so nothing prunes automatically on main.
     Reports: `2026-11-21-pr87-ledger-retention-review.md`,
     `2026-11-21-pr89-ret-height-self-check-review.md`.
-  - **Fix 1 (calldata pricing / intrinsic gas): L2 pre-reviewed, findings
-    closed** (Q-037, ADR-015). Intrinsic gas as a validity floor on `gas_limit`;
+  - **Fix 1 (calldata pricing / intrinsic gas): L2 reviewed; R-L2-03 open**
+    (Q-037, ADR-015). Intrinsic gas as a validity floor on `gas_limit`;
     consumed stays `gas_limit`; conservation unchanged; refunds deferred to S10.
     R-L2-01 (docs overclaim) and R-L2-02 (protocol length cap in `check_floor`)
-    both fixed; final head `94aa940` awaits PR, gates and merge. L3 (dewi) and
-    L4 (bima) follow; accept-only until L4 binds the policy.
+    both fixed. **R-L2-03 (blocking) open at head `94aa940`:** two node journal
+    size fixtures encode `version: u32::MAX`, refused by the new encode-time
+    header version check; one-line fixture fix recommended, APPROVE suspended
+    pending fix + green gates. L3 (dewi) and L4 (bima) follow; accept-only until
+    L4 binds the policy.
   The High closes only when fix 1 lands and the pricing + amplification mitigations
   are re-verified together (Q-024, Q-037).
 - **R-RET-01 (Medium):** fixed in #89 (merged); height self-check in
@@ -115,7 +118,8 @@ wiped mid-session).
 | R-59-01 | Keystore duplicate-field rejection gap | Low | Closed (#59) | `2026-11-19-pr59-keystore-review.md` (re-review) |
 
 **Open items an auditor should prioritize:** SUBHOST-2026-003 fix 1 (calldata
-pricing, Q-037 L2 reviewed with both findings closed; L3/L4 pending). Fix 3
+pricing, Q-037 L2 reviewed; R-L2-01/R-L2-02 closed, R-L2-03 blocking fixture
+regression open; L3/L4 pending). Fix 3
 (automatic retention) is merged (#87) with R-RET-01 fixed (#89), but the node
 trigger slice is still pending, so retention is not active on main yet; fix 2
 (suffix validation) is merged. R-57-01 (Medium) is fixed (#67 merged; residual
