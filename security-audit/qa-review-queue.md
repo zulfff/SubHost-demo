@@ -51,13 +51,17 @@ rebuilds cheap).
 
 Gate practice (2026-11-20/21): a killed gate (exit 143 / abrupt log end) is
 never green; re-run detached (`setsid nohup`), verify FMT_OK / CLIPPY_OK /
-TEST_OK / DENY_OK plus the exit line before treating a run as green. The
-sccache server was restarted after an S3-timeout wedge; a one-off cache
-connection error around the restart means re-run, not fail. Env note:
-`/usr/local/bin/cargo` is a root wrapper forcing `CARGO_HOME=/usr/local/cargo`
-(registry cache write warnings); nara runs call `/usr/local/cargo/bin/cargo`
-directly with `CARGO_HOME=$HOME/.cargo`, same pattern as the deny workaround
-(Q-029): `RUSTUP_HOME=/usr/local/rustup CARGO_HOME=$HOME/.cargo
+TEST_OK / DENY_OK plus the exit line before treating a run as green.
+**Cache bypass active (tech-lead decision):** the sccache S3 backend is
+degraded (reads ~20s, writes ~44s); gates run WITHOUT the wrapper
+(`unset RUSTC_WRAPPER`, `CARGO_INCREMENTAL=0`, no s3-env.sh sourcing) until
+the tech lead announces re-enable. Partial target/ artifacts are reused.
+Env note: `/usr/local/bin/cargo` is a root wrapper forcing
+`CARGO_HOME=/usr/local/cargo`, and the rustup proxy resets CARGO_HOME the
+same way; nara runs call `/usr/local/cargo/bin/cargo` directly with
+`CARGO_HOME=$HOME/.cargo` exported (registry cache write warnings under the
+root-owned home are cosmetic, not fatal). Deny workaround per Q-029:
+`RUSTUP_HOME=/usr/local/rustup CARGO_HOME=$HOME/.cargo
 CARGO=/usr/local/cargo/bin/cargo ~/.local/bin/cargo-deny --all-features check`.
 
 ## Recently reviewed and merged
