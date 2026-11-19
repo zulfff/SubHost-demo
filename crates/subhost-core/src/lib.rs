@@ -8,9 +8,13 @@ use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+pub mod calldata;
 pub mod fee;
 pub mod merkle;
 
+pub use calldata::{
+    CalldataPolicy, CALLDATA_HEADER_VERSION, CALLDATA_POLICY_VERSION, MAX_TX_DATA_BYTES,
+};
 pub use fee::{
     settle_block_fees, BlockFeeSettlement, FeeBreakdown, FeeContext, FeeError, FeePolicy,
     FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER, FEE_HEADER_VERSION,
@@ -135,7 +139,10 @@ pub type ChainId = u64;
 /// Version 1 keeps the exact legacy 12-field binary layout. Version 2
 /// (fee-enabled chains, Q-017) appends `base_fee_per_gas` as a 13th field;
 /// the field is part of the hash and therefore of every signature and QC
-/// commitment over the block. A version 1 header always carries
+/// commitment over the block. Version 3 (calldata floor, Q-037) keeps the
+/// same 13-field layout and adds no field: the version alone discriminates
+/// the validity rule, so replay and the sync path can dispatch from the
+/// header without a manifest. A version 1 header always carries
 /// `base_fee_per_gas == 0` in memory and never encodes the field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHeader {
@@ -162,12 +169,18 @@ impl BlockHeader {
 }
 
 /// Binary layout: a fixed tuple, 12 elements for version 1 and 13 for
-/// version 2. bincode's tuple access is length-based with no completeness
-/// check, so the decoder may stop after 12 elements for a legacy header and
-/// leave the rest of the stream to the next record. JSON uses named fields
-/// instead, with the base fee as a decimal string (u128-safe).
+/// versions 2 and 3. bincode's tuple access is length-based with no
+/// completeness check, so the decoder may stop after 12 elements for a legacy
+/// header and leave the rest of the stream to the next record. JSON uses
+/// named fields instead, with the base fee as a decimal string (u128-safe).
 impl Serialize for BlockHeader {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.version == 0 || self.version > CALLDATA_HEADER_VERSION {
+            return Err(serde::ser::Error::custom(format!(
+                "unsupported header version {}",
+                self.version
+            )));
+        }
         if self.version < FEE_HEADER_VERSION && self.base_fee_per_gas != 0 {
             return Err(serde::ser::Error::custom("a legacy header cannot carry a base fee"));
         }
@@ -216,7 +229,7 @@ impl<'de> Visitor<'de> for HeaderVisitor {
     type Value = BlockHeader;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a version 1 or 2 block header tuple")
+        formatter.write_str("a version 1, 2 or 3 block header tuple")
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
@@ -224,7 +237,7 @@ impl<'de> Visitor<'de> for HeaderVisitor {
             seq.next_element()?.ok_or_else(|| de::Error::custom("truncated block header"))
         }
         let version: u32 = next(&mut seq)?;
-        if version != 1 && version != FEE_HEADER_VERSION {
+        if version != 1 && version != FEE_HEADER_VERSION && version != CALLDATA_HEADER_VERSION {
             return Err(de::Error::custom(format!("unsupported header version {version}")));
         }
         let header = BlockHeader {
@@ -243,9 +256,9 @@ impl<'de> Visitor<'de> for HeaderVisitor {
             base_fee_per_gas: 0,
         };
         if version >= FEE_HEADER_VERSION {
-            let base_fee: Amount = seq
-                .next_element()?
-                .ok_or_else(|| de::Error::custom("version 2 header is missing base_fee_per_gas"))?;
+            let base_fee: Amount = seq.next_element()?.ok_or_else(|| {
+                de::Error::custom(format!("version {version} header is missing base_fee_per_gas"))
+            })?;
             return Ok(BlockHeader { base_fee_per_gas: base_fee, ..header });
         }
         Ok(header)
@@ -305,6 +318,12 @@ impl HeaderJson {
                 if json.version < FEE_HEADER_VERSION {
                     return Err(de::Error::custom("a legacy header cannot carry a base fee"));
                 }
+                if json.version > CALLDATA_HEADER_VERSION {
+                    return Err(de::Error::custom(format!(
+                        "unsupported header version {}",
+                        json.version
+                    )));
+                }
                 Ok(BlockHeader {
                     version: json.version,
                     chain_id: json.chain_id,
@@ -321,21 +340,34 @@ impl HeaderJson {
                     base_fee_per_gas: json.base_fee_per_gas,
                 })
             }
-            Self::V1(json) => Ok(BlockHeader {
-                version: json.version,
-                chain_id: json.chain_id,
-                height: json.height,
-                timestamp: json.timestamp,
-                parent_hash: json.parent_hash,
-                state_root: json.state_root,
-                tx_root: json.tx_root,
-                receipt_root: json.receipt_root,
-                validator: json.validator,
-                gas_used: json.gas_used,
-                gas_limit: json.gas_limit,
-                extra_data: json.extra_data,
-                base_fee_per_gas: 0,
-            }),
+            Self::V1(json) => {
+                if json.version == 0 || json.version > CALLDATA_HEADER_VERSION {
+                    return Err(de::Error::custom(format!(
+                        "unsupported header version {}",
+                        json.version
+                    )));
+                }
+                if json.version != 1 {
+                    return Err(de::Error::custom(
+                        "a version 2 or 3 header must carry base_fee_per_gas",
+                    ));
+                }
+                Ok(BlockHeader {
+                    version: json.version,
+                    chain_id: json.chain_id,
+                    height: json.height,
+                    timestamp: json.timestamp,
+                    parent_hash: json.parent_hash,
+                    state_root: json.state_root,
+                    tx_root: json.tx_root,
+                    receipt_root: json.receipt_root,
+                    validator: json.validator,
+                    gas_used: json.gas_used,
+                    gas_limit: json.gas_limit,
+                    extra_data: json.extra_data,
+                    base_fee_per_gas: 0,
+                })
+            }
         }
     }
 }
@@ -667,6 +699,12 @@ pub struct GenesisConfig {
     /// fresh genesis. Omitted from legacy documents so they stay byte-stable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_policy: Option<FeePolicy>,
+    /// Intrinsic calldata pricing (Q-037). Absent means legacy unpriced
+    /// calldata; like the fee policy it never upgrades in place — a priced
+    /// chain starts from a fresh genesis and produces version 3 headers.
+    /// Omitted from legacy documents so they stay byte-stable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calldata_policy: Option<CalldataPolicy>,
 }
 
 impl Default for GenesisConfig {
@@ -679,6 +717,7 @@ impl Default for GenesisConfig {
             gas_limit: BLOCK_GAS_LIMIT,
             genesis_time: unix_timestamp(),
             fee_policy: None,
+            calldata_policy: None,
         }
     }
 }
@@ -693,11 +732,13 @@ impl GenesisConfig {
             self.allocations.iter().map(|(address, balance)| (*address, *balance)).collect();
         allocations.sort_unstable();
         // Legacy policy absence keeps the exact pre-fee six-field tuple, so
-        // existing bindings are byte-identical. A policy appends its canonical
-        // encoding as a seventh element; the two layouts never coexist on one
-        // chain because fee-enabled chains require a fresh genesis.
-        match &self.fee_policy {
-            None => Hash::from_data(&encode_canonical(&(
+        // existing bindings are byte-identical. A fee policy alone appends its
+        // canonical encoding as a seventh element (the S6.2 layout, unchanged).
+        // A calldata policy appends the Option-encoded fee policy and the
+        // calldata policy as seventh and eighth elements; the layouts never
+        // coexist on one chain because priced chains require a fresh genesis.
+        match (&self.fee_policy, &self.calldata_policy) {
+            (None, None) => Hash::from_data(&encode_canonical(&(
                 self.chain_id,
                 &self.initial_validators,
                 allocations,
@@ -705,7 +746,7 @@ impl GenesisConfig {
                 self.gas_limit,
                 self.genesis_time,
             ))),
-            Some(policy) => Hash::from_data(&encode_canonical(&(
+            (Some(policy), None) => Hash::from_data(&encode_canonical(&(
                 self.chain_id,
                 &self.initial_validators,
                 allocations,
@@ -713,6 +754,16 @@ impl GenesisConfig {
                 self.gas_limit,
                 self.genesis_time,
                 encode_canonical(policy),
+            ))),
+            (fee_policy, Some(calldata)) => Hash::from_data(&encode_canonical(&(
+                self.chain_id,
+                &self.initial_validators,
+                allocations,
+                self.block_time_ms,
+                self.gas_limit,
+                self.genesis_time,
+                encode_canonical(fee_policy),
+                encode_canonical(calldata),
             ))),
         }
     }
@@ -736,6 +787,11 @@ impl GenesisConfig {
             policy
                 .validate(self.gas_limit)
                 .map_err(|error| CoreError::InvalidGenesis(format!("fee policy: {error}")))?;
+        }
+        if let Some(policy) = &self.calldata_policy {
+            policy
+                .validate(self.gas_limit)
+                .map_err(|error| CoreError::InvalidGenesis(format!("calldata policy: {error}")))?;
         }
         let mut seen = std::collections::HashSet::with_capacity(self.initial_validators.len());
         for validator in &self.initial_validators {
@@ -1212,23 +1268,45 @@ mod tests {
     }
 
     #[test]
+    fn v3_header_keeps_the_v2_layout_and_changes_the_hash() {
+        let v1 = sample_block().header;
+        let v2 = BlockHeader { version: 2, base_fee_per_gas: 8, ..v1.clone() };
+        let v3 = BlockHeader { version: CALLDATA_HEADER_VERSION, ..v2.clone() };
+        // Same 13 elements; only the version word differs.
+        let mut expected = encode_canonical(&v2);
+        expected[0..4].copy_from_slice(&CALLDATA_HEADER_VERSION.to_le_bytes());
+        assert_eq!(encode_canonical(&v3), expected);
+        assert_ne!(v2.hash(), v3.hash(), "the rule version is part of the commitment");
+        let decoded: BlockHeader = bincode::deserialize(&encode_canonical(&v3)).unwrap();
+        assert_eq!(decoded, v3);
+    }
+
+    #[test]
     fn malformed_headers_are_refused() {
         let v1 = sample_block().header;
         // Version 2 with the fee field missing.
         let mut truncated = legacy_tuple(&v1);
         truncated[0..4].copy_from_slice(&2u32.to_le_bytes());
         assert!(bincode::deserialize::<BlockHeader>(&truncated).is_err());
-        // Unknown version.
-        let mut unknown = legacy_tuple(&v1);
-        unknown[0..4].copy_from_slice(&3u32.to_le_bytes());
-        assert!(bincode::deserialize::<BlockHeader>(&unknown).is_err());
+        // Version 3 with the fee field missing.
+        let mut truncated_v3 = legacy_tuple(&v1);
+        truncated_v3[0..4].copy_from_slice(&CALLDATA_HEADER_VERSION.to_le_bytes());
+        assert!(bincode::deserialize::<BlockHeader>(&truncated_v3).is_err());
+        // Unknown versions, on both sides of the supported range.
+        for version in [0u32, 4, 99] {
+            let mut unknown = legacy_tuple(&v1);
+            unknown[0..4].copy_from_slice(&version.to_le_bytes());
+            assert!(bincode::deserialize::<BlockHeader>(&unknown).is_err());
+            let header = BlockHeader { version, ..v1.clone() };
+            assert!(bincode::serialize(&header).is_err(), "serialize must refuse too");
+        }
         // A legacy header cannot carry a fee in memory.
         let inconsistent = BlockHeader { base_fee_per_gas: 1, ..v1 };
         assert!(bincode::serialize(&inconsistent).is_err());
     }
 
     #[test]
-    fn header_json_round_trips_both_versions() {
+    fn header_json_round_trips_every_version() {
         let v1 = sample_block().header;
         let json = serde_json::to_string(&v1).unwrap();
         assert!(!json.contains("base_fee"), "legacy JSON keeps the exact field set");
@@ -1241,6 +1319,20 @@ mod tests {
         // A legacy document with a stray fee field is refused, not absorbed.
         let stray = json.replace("\"version\":2", "\"version\":1");
         assert!(serde_json::from_str::<BlockHeader>(&stray).is_err());
+
+        let v3 = BlockHeader { version: CALLDATA_HEADER_VERSION, ..v2.clone() };
+        let json = serde_json::to_string(&v3).unwrap();
+        assert_eq!(serde_json::from_str::<BlockHeader>(&json).unwrap(), v3);
+        // A fee-era version without the fee field is refused, not defaulted.
+        let mut feeless = serde_json::to_value(&v3).unwrap();
+        feeless.as_object_mut().unwrap().remove("base_fee_per_gas");
+        assert!(serde_json::from_value::<BlockHeader>(feeless).is_err());
+        // Unknown versions are refused in JSON as in binary.
+        for version in [0u32, 4, 99] {
+            let mut unknown = serde_json::to_value(&v3).unwrap();
+            unknown["version"] = serde_json::json!(version);
+            assert!(serde_json::from_value::<BlockHeader>(unknown).is_err());
+        }
     }
 
     fn fee_policy() -> FeePolicy {
@@ -1300,5 +1392,99 @@ mod tests {
         genesis.fee_policy = Some(fee_policy());
         genesis.gas_limit = BLOCK_GAS_LIMIT + 1;
         assert!(genesis.validate().is_err());
+    }
+
+    fn calldata_policy() -> CalldataPolicy {
+        CalldataPolicy { version: CALLDATA_POLICY_VERSION, gas_per_byte: 16 }
+    }
+
+    #[test]
+    fn genesis_calldata_policy_json_is_optional_and_validated() {
+        let mut genesis = GenesisConfig { genesis_time: 1_700_000_000, ..Default::default() };
+        let legacy_json = serde_json::to_string(&genesis).unwrap();
+        assert!(!legacy_json.contains("calldata_policy"), "legacy documents stay byte-stable");
+        assert_eq!(serde_json::from_str::<GenesisConfig>(&legacy_json).unwrap(), genesis);
+
+        // A fee-only document keeps its exact S6.2 field set.
+        genesis.fee_policy = Some(fee_policy());
+        let fee_json = serde_json::to_string(&genesis).unwrap();
+        assert!(!fee_json.contains("calldata_policy"));
+
+        genesis.calldata_policy = Some(calldata_policy());
+        assert!(genesis.validate().is_ok());
+        let json = serde_json::to_string(&genesis).unwrap();
+        assert_eq!(serde_json::from_str::<GenesisConfig>(&json).unwrap(), genesis);
+
+        let mut bad = calldata_policy();
+        bad.version = 2;
+        genesis.calldata_policy = Some(bad);
+        assert!(genesis.validate().is_err());
+        genesis.calldata_policy = Some(CalldataPolicy { gas_per_byte: 0, ..calldata_policy() });
+        assert!(genesis.validate().is_err());
+        // A rate that prices the maximum transaction out of the block is refused.
+        let too_high = BLOCK_GAS_LIMIT / MAX_TX_DATA_BYTES as u64 + 1;
+        genesis.calldata_policy =
+            Some(CalldataPolicy { gas_per_byte: too_high, ..calldata_policy() });
+        assert!(genesis.validate().is_err());
+
+        // The policies are independent: a priced chain without a fee policy
+        // still validates (v3 validity rule, legacy settlement).
+        genesis.calldata_policy = Some(calldata_policy());
+        genesis.fee_policy = None;
+        assert!(genesis.validate().is_ok());
+    }
+
+    #[test]
+    fn calldata_policy_binds_into_the_consensus_context() {
+        let mut genesis = GenesisConfig { genesis_time: 1_700_000_000, ..Default::default() };
+        genesis.allocations.insert(Address::new([5; ADDRESS_SIZE]), 42);
+        let legacy = genesis.consensus_context();
+        let mut allocations: Vec<_> = genesis.allocations.iter().map(|(a, b)| (*a, *b)).collect();
+        allocations.sort_unstable();
+
+        // The fee-only commitment stays the exact S6.2 seven-element tuple.
+        genesis.fee_policy = Some(fee_policy());
+        let fee_only = genesis.consensus_context();
+        let expected_fee_only = Hash::from_data(&encode_canonical(&(
+            genesis.chain_id,
+            &genesis.initial_validators,
+            allocations.clone(),
+            genesis.block_time_ms,
+            genesis.gas_limit,
+            genesis.genesis_time,
+            encode_canonical(&fee_policy()),
+        )));
+        assert_eq!(fee_only, expected_fee_only);
+
+        // A priced chain appends the Option-encoded fee policy and the schedule.
+        genesis.calldata_policy = Some(calldata_policy());
+        let priced = genesis.consensus_context();
+        assert_ne!(priced, fee_only);
+        assert_ne!(priced, legacy);
+        let expected_priced = Hash::from_data(&encode_canonical(&(
+            genesis.chain_id,
+            &genesis.initial_validators,
+            allocations,
+            genesis.block_time_ms,
+            genesis.gas_limit,
+            genesis.genesis_time,
+            encode_canonical(&genesis.fee_policy),
+            encode_canonical(&calldata_policy()),
+        )));
+        assert_eq!(priced, expected_priced);
+
+        // A different schedule is a different protocol instance.
+        let mut other = calldata_policy();
+        other.gas_per_byte = 4;
+        genesis.calldata_policy = Some(other);
+        assert_ne!(genesis.consensus_context(), priced);
+
+        // Calldata without a fee policy is yet another commitment, not a collision.
+        genesis.calldata_policy = Some(calldata_policy());
+        genesis.fee_policy = None;
+        let calldata_only = genesis.consensus_context();
+        assert_ne!(calldata_only, priced);
+        assert_ne!(calldata_only, fee_only);
+        assert_ne!(calldata_only, legacy);
     }
 }
