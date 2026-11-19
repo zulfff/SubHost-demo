@@ -846,12 +846,13 @@ fn a_lagging_designated_leader_persists_a_complete_timeout_certificate_from_the_
     let checkpoint = {
         let mut driver = node.consensus().unwrap().lock().unwrap();
         assert_eq!(driver.view(), 1);
+        let mut candidates = CandidateBuffer::default();
+        let mut commit = tests::node_commit(&node, &mut candidates);
         let _ = handle_consensus_message_inner(
             node.state(),
             &mut driver,
             NetworkMessage::TimeoutCertificate { data: encode_canonical(&certificate) },
-            node.consensus_journal.as_deref(),
-            node.certified_history.as_deref(),
+            &mut commit,
         )
         .unwrap();
         assert_eq!(driver.view(), 5);

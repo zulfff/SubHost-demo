@@ -147,24 +147,43 @@ decision.
 
 ### Catch-up
 
-- A `BlockCommit` at exactly `tip + 1` keeps the existing single-item path. A
-  higher height is a gap: the pump records the announced peer tip, sets a
-  node-owned `catching_up` flag, and requests
-  `[tip + 1, min(peer_tip, tip + 128)]`.
-- `Blocks` items are adopted one at a time on a **driver clone**, in the live
-  `BlockCommit` order: `receive_commit` → `validate_certified_block` →
-  `journal.prepare_commit` → archive append → `commit_qc` → swap the driver →
-  `journal.save`. The journal is saved per commit.
-- A non-contiguous or invalid item stops the run; everything already committed
-  stays, so the tip never skips a missing certificate. A 500 ms pump ticker
-  retries an unanswered window after one second and requests the next window
-  once the current one is adopted.
-- `catching_up` suppresses `produce_blocks` (proposal, vote, and timeout signing)
-  until the announced peer tip is reached. Like `HaltReason`, the flag is
-  node-owned; no `subhost-consensus` change is required.
-- Both signals are checked in the same place in the produce loop: a halted
-  driver never signs even when caught up, and a catching-up node never signs even
-  though it is not halted.
+- Every inbound `BlockCommit` is authenticated and classified before it can
+  touch state. `Duplicate` changes no obligation, `Next` commits, `Conflicting`
+  and a mismatched `Historical` persist an incident and halt, and
+  `MissingAncestors` buffers. An unauthenticated certificate is a plain rejection.
+- `Next` applies one at a time on a **driver clone**, in the live `BlockCommit`
+  order: `receive_commit` → `validate_certified_block` → `journal.prepare_commit`
+  → archive append → `commit_qc` → swap the driver → `journal.save`. The journal
+  is saved per commit (Q-027).
+- `MissingAncestors` keeps the authenticated `(block, QC)` pair in a bounded
+  node-owned store: 64 entries keyed by height, first pair per height wins, the
+  lowest height is evicted at the bound, and the pump requests
+  `[tip + 1, min(highest buffered, tip + 128)]`. The store is node-owned, never
+  driver-owned, so the ordered commit path stays the only way to the ledger
+  (Q-028).
+- After every commit the pump drains buffered descendants in ascending height
+  order, so a range that arrives together with its successors applies both
+  without another round trip.
+- `catching_up` is set only from an **authenticated** certificate, never from a
+  bare announcement. A run with no contiguous progress for 30 s drops the target
+  and resumes signing, so a peer cannot pin a validator mute by announcing a
+  height it never serves.
+- `produce_blocks` refuses both signals in the same place: a halted driver never
+  proposes, signs or extends local finality, and a catching-up node never signs
+  even though it is not halted. No `subhost-consensus` change is required for
+  either flag.
+
+### Durable incident
+
+- `fork-incidents.bin` sits beside the voting journal: magic `SUBFORK1`, the
+  consensus context hash, per-record FNV-1a checksum, and the newest 8 records.
+  A repeated contradiction is deduplicated by `(height, local hash, incoming
+  hash)`, so replayed gossip cannot fill the ring.
+- `Conflicting` and a mismatched `Historical` write a record, call `halt`, and
+  publish readiness with `consensus_alive: false`. The ledger is untouched.
+- Bootstrap reads the newest record and re-halts before the first tick, so a
+  restart cannot sign one view while the incident is unresolved. Clearing a halt
+  is an operator action, not a code path.
 
 ### Limits
 
@@ -175,6 +194,8 @@ decision.
   for one view before the first peer tip arrives. No quorum participates in that
   height, so it cannot finalize a competing block, but this is not a substitute
   for snapshot bootstrap.
+- Buffered candidates live only in memory. A restart drops them and refetches
+  from the archive; the bounded incident ring is the only new durable state.
 - Sync only extends the committed chain; it never rolls finalized history back.
 
 ### Evidence for the amendment
@@ -187,6 +208,14 @@ decision.
 - https://github.com/cometbft/cometbft/blob/main/blocksync/reactor.go — a
   fetched commit is verified before execution/persistence (re-checked 2026-11-19).
 - `crates/subhost-node/src/basic_tests.rs` — a lagging validator backfills three
-  certified blocks and restarts at the synced tip; range request/serve bounds.
-- `crates/subhost-node/src/certified_history.rs` — reopen, torn tail, genesis
-  binding, retention and wire-item tests.
+  certified blocks and restarts at the synced tip; range request/serve bounds;
+  conflicting evidence persists, halts and stays halted after restart; duplicate
+  and forged evidence never halt; a buffered candidate applies after backfill and
+  a forged far-ahead announcement creates no catch-up state; the stall budget
+  releases signing.
+- `crates/subhost-node/src/certified_history.rs` and
+  `crates/subhost-node/src/fork_incident.rs` — reopen, torn tail, genesis/context
+  binding, retention, deduplication and bounded-ring tests.
+- Sari's review of PR #57: gap state may only come from an authenticated
+  certificate and must have a bounded stall, which the classifier route and the
+  30 s budget implement.
