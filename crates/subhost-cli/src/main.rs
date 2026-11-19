@@ -1659,11 +1659,14 @@ mod tests {
 
     #[test]
     fn the_otlp_endpoint_flag_is_global_and_optional() {
-        let cli = Cli::try_parse_from(["subhost", "chain"]).unwrap();
+        // `chain` lives under `query`, not at the top level; pin that so this
+        // test never silently parses a different command than it claims to.
+        assert!(Cli::try_parse_from(["subhost", "chain"]).is_err());
+        let cli = Cli::try_parse_from(["subhost", "query", "chain"]).unwrap();
         assert_eq!(cli.otlp_endpoint, None);
         for args in [
-            vec!["subhost", "--otlp-endpoint", "http://127.0.0.1:4318/v1/traces", "chain"],
-            vec!["subhost", "chain", "--otlp-endpoint", "http://127.0.0.1:4318/v1/traces"],
+            vec!["subhost", "--otlp-endpoint", "http://127.0.0.1:4318/v1/traces", "query", "chain"],
+            vec!["subhost", "query", "chain", "--otlp-endpoint", "http://127.0.0.1:4318/v1/traces"],
         ] {
             let cli = Cli::try_parse_from(args).unwrap();
             assert_eq!(cli.otlp_endpoint.as_deref(), Some("http://127.0.0.1:4318/v1/traces"));
