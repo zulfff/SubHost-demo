@@ -271,6 +271,21 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **RPC method spans (S8.1, Q-033).** Every decoded JSON-RPC call on HTTP and
+  WebSocket emits one `info` span (`rpc_call`, target `subhost_rpc`) through
+  the existing RPC metrics middleware: `rpc.method` (registered static name or
+  `unknown`), `rpc.outcome`, `rpc.duration_ms`, and `rpc.error_code` on
+  failure. Params, payloads, tokens and caller-derived strings never enter a
+  span; tests assert the privacy boundary plus batch/notification/malformed/
+  guard-rejection bypass semantics. No new feature gate and no dependency
+  added: visibility belongs to the installed subscriber (no-op without one;
+  the default fmt layer logs no span events), and the opt-in OTLP export
+  remains a separate slice. Spans ride `with_metrics`, so a library consumer
+  without a metrics registry gets none — documented in
+  `docs/operations/observability.md`. Zero `methods.rs` edits per the Q-033
+  coordination; `tracing-subscriber` gains the additive `registry` feature for
+  the target-filtered test capture.
+
 - **Operations runbooks and sample alerts (S8.4/S8.5).** Added
   `docs/operations/` runbooks for start/stop, producer key handling and rotation,
   ledger diagnosis/recovery, conflicting-final-evidence incident investigation,

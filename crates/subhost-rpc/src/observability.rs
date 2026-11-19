@@ -1,4 +1,18 @@
-//! Metrics for completed decoded JSON-RPC calls on HTTP and WebSocket.
+//! Metrics and tracing spans for completed decoded JSON-RPC calls on HTTP and
+//! WebSocket.
+//!
+//! One `info` span per decoded call rides the same middleware as the metrics:
+//! the span is named `rpc_call` (tracing requires constant span names) and
+//! carries the registered static method name (or `unknown`) in `rpc.method`,
+//! recording only operational fields — outcome, duration and the JSON-RPC
+//! error code. Params, payloads, tokens and caller-derived strings never enter
+//! a span (Q-020). Spans are emitted through the existing `tracing` API: with
+//! no subscriber installed they are near-free no-ops, and the default `fmt`
+//! layer does not log span events, so default log output is unchanged.
+//! Visibility is controlled by the installed subscriber (env filter today, the
+//! opt-in OTLP provider later). Like the metrics, spans exist only when a
+//! metrics registry is supplied via `RpcServer::with_metrics`; the node always
+//! supplies one.
 
 use jsonrpsee::server::middleware::rpc::RpcServiceT;
 use jsonrpsee::server::MethodResponse;
@@ -10,6 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use subhost_metrics::Metrics;
 use tower::Layer;
+use tracing::Instrument;
 
 /// Instrument calls using only names from the server's method registry.
 #[derive(Clone)]
@@ -48,14 +63,36 @@ where
     fn call(&self, request: Request<'a>) -> Self::Future {
         // Copy the registered static name, never the caller's method string.
         let method = self.methods.get(request.method.as_ref()).copied().unwrap_or("unknown");
+        // The span name is a constant (tracing metadata requirement); the
+        // bounded method name travels in the rpc.method field. Only operational
+        // fields are recorded below; the request itself never enters a span.
+        let span = tracing::info_span!(
+            target: "subhost_rpc",
+            "rpc_call",
+            rpc.method = method,
+            rpc.outcome = tracing::field::Empty,
+            rpc.duration_ms = tracing::field::Empty,
+            rpc.error_code = tracing::field::Empty,
+        );
         let metrics = self.metrics.clone();
         let service = self.inner.clone();
         let started = Instant::now();
-        Box::pin(async move {
-            let response = service.call(request).await;
-            metrics.record_rpc_result(method, started.elapsed().as_secs_f64(), response.is_error());
-            response
-        })
+        Box::pin(
+            async move {
+                let response = service.call(request).await;
+                let elapsed = started.elapsed();
+                let failed = response.is_error();
+                let span = tracing::Span::current();
+                span.record("rpc.outcome", if failed { "error" } else { "ok" });
+                span.record("rpc.duration_ms", elapsed.as_millis() as u64);
+                if let Some(code) = response.as_error_code() {
+                    span.record("rpc.error_code", code);
+                }
+                metrics.record_rpc_result(method, elapsed.as_secs_f64(), failed);
+                response
+            }
+            .instrument(span),
+        )
     }
 }
 
@@ -303,5 +340,182 @@ mod tests {
         second_handle.stop().unwrap();
         first_handle.stopped().await;
         second_handle.stopped().await;
+    }
+
+    use std::cell::RefCell;
+    use std::sync::OnceLock;
+
+    /// One process-global capture subscriber, installed on first use. Span
+    /// tests cannot use thread-local subscribers: tracing's callsite interest
+    /// cache is global, and parallel tests without a subscriber race the
+    /// cache, dropping spans non-deterministically. `set_global_default`
+    /// rebuilds interest against the capture subscriber, and every later
+    /// callsite registration sees it on all threads.
+    static CAPTURE_INSTALLED: OnceLock<()> = OnceLock::new();
+
+    thread_local! {
+        /// Per-thread span-close output. Each test runs its server on its own
+        /// current-thread runtime, so a test's spans land only in its buffer.
+        static SPAN_OUTPUT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    struct ThreadLocalWriter;
+
+    impl std::io::Write for ThreadLocalWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            SPAN_OUTPUT.with(|output| output.borrow_mut().extend_from_slice(buf));
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalWriter {
+        type Writer = ThreadLocalWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            ThreadLocalWriter
+        }
+    }
+
+    /// Install the global capture subscriber once and clear this thread's
+    /// buffer. Filtered to the RPC span target; the server's own log events
+    /// (`subhost_rpc::methods`) are excluded so only spans reach assertions.
+    fn install_span_capture() {
+        CAPTURE_INSTALLED.get_or_init(|| {
+            use tracing_subscriber::layer::{Layer, SubscriberExt};
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(ThreadLocalWriter)
+                    .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                    .with_ansi(false)
+                    .with_filter(
+                        tracing_subscriber::filter::Targets::new()
+                            .with_target("subhost_rpc", tracing::Level::INFO)
+                            .with_target(
+                                "subhost_rpc::methods",
+                                tracing_subscriber::filter::LevelFilter::OFF,
+                            ),
+                    ),
+            );
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("the test binary installs one global capture subscriber");
+        });
+        SPAN_OUTPUT.with(|output| output.borrow_mut().clear());
+    }
+
+    fn rendered() -> String {
+        SPAN_OUTPUT.with(|output| String::from_utf8(output.borrow().clone()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn spans_carry_only_bounded_operational_fields() {
+        let metrics = Metrics::new().unwrap();
+        install_span_capture();
+        let (addr, handle) = start(&metrics, RpcSecurityConfig::default()).await;
+
+        let (_, ok) = http(addr, &call(1, "eth_chainId"), None).await;
+        assert_eq!(ok.unwrap()["result"], "0x1");
+        let (_, err) = http(addr, &call(2, "eth_getBalance"), None).await;
+        assert_eq!(err.unwrap()["error"]["code"], -32602);
+        let attacker = "caller-private-method-9f3k";
+        let (_, unknown) = http(addr, &call(3, attacker), None).await;
+        assert_eq!(unknown.unwrap()["error"]["code"], -32601);
+        handle.stop().unwrap();
+        handle.stopped().await;
+
+        let text = rendered();
+        assert_eq!(text.matches("rpc.outcome=").count(), 3, "one span per decoded call");
+        assert!(text.contains("rpc.method=\"eth_chainId\""), "span fields: {text}");
+        assert!(text.contains("rpc.method=\"eth_getBalance\""), "span fields: {text}");
+        assert!(text.contains("rpc.method=\"unknown\""), "span fields: {text}");
+        assert!(text.contains("rpc.outcome=\"ok\""), "span fields: {text}");
+        assert!(text.contains("rpc.outcome=\"error\""), "span fields: {text}");
+        assert!(text.contains("rpc.error_code=-32602"), "span fields: {text}");
+        assert!(text.contains("rpc.error_code=-32601"), "span fields: {text}");
+        assert!(text.contains("rpc.duration_ms="), "span fields: {text}");
+        assert!(!text.contains(attacker), "caller input reached a span: {text}");
+    }
+
+    #[tokio::test]
+    async fn batches_emit_one_span_per_call_and_bypass_paths_emit_none() {
+        let metrics = Metrics::new().unwrap();
+        install_span_capture();
+        let (addr, handle) = start(&metrics, RpcSecurityConfig::default()).await;
+
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "eth_chainId"},
+            {"jsonrpc": "2.0", "id": 2, "method": "batch-attacker-a"},
+            {"jsonrpc": "2.0", "id": 3, "method": "batch-attacker-b"}
+        ]);
+        let (_, response) = http(addr, &batch.to_string(), None).await;
+        assert_eq!(response.unwrap().as_array().unwrap().len(), 3);
+
+        // Notifications and malformed JSON bypass the decoded-call middleware.
+        let notification = json!({"jsonrpc": "2.0", "method": "eth_chainId"});
+        let (_, response) = http(addr, &notification.to_string(), None).await;
+        assert!(response.is_none());
+        let (_, malformed) = http(addr, "{\"jsonrpc\":", None).await;
+        assert!(malformed.unwrap().get("error").is_some());
+        handle.stop().unwrap();
+        handle.stopped().await;
+
+        let text = rendered();
+        assert_eq!(
+            text.matches("rpc.outcome=").count(),
+            3,
+            "one span per batch call, none for notifications or malformed JSON: {text}"
+        );
+        assert!(text.contains("rpc.method=\"unknown\""), "span fields: {text}");
+        assert!(!text.contains("batch-attacker-a"), "caller input reached a span: {text}");
+        assert!(!text.contains("batch-attacker-b"), "caller input reached a span: {text}");
+    }
+
+    #[tokio::test]
+    async fn guard_rejections_emit_no_spans() {
+        let metrics = Metrics::new().unwrap();
+        install_span_capture();
+        let token = "subhost test authorization token";
+        let (addr, handle) = start(
+            &metrics,
+            RpcSecurityConfig {
+                auth_token: Some(SecretToken::new(token).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let (status, _) = http(addr, &call(1, "eth_chainId"), None).await;
+        assert_eq!(status, 401);
+        handle.stop().unwrap();
+        handle.stopped().await;
+
+        let text = rendered();
+        assert!(!text.contains("rpc.outcome="), "a guard rejection emitted a span: {text}");
+    }
+
+    #[tokio::test]
+    async fn without_a_metrics_registry_no_spans_are_emitted() {
+        install_span_capture();
+        // The documented caveat: spans ride the metrics middleware, so a
+        // library consumer that never calls with_metrics gets no spans.
+        let (addr, handle) = RpcServer::new(RpcState::in_memory(1).unwrap())
+            .start(RpcServerConfig {
+                listen_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+                security: RpcSecurityConfig::default(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (_, ok) = http(addr, &call(1, "eth_chainId"), None).await;
+        assert_eq!(ok.unwrap()["result"], "0x1");
+        handle.stop().unwrap();
+        handle.stopped().await;
+
+        let text = rendered();
+        assert!(!text.contains("rpc.outcome="), "spans without metrics: {text}");
     }
 }
