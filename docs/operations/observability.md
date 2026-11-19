@@ -174,7 +174,10 @@ any committed chain — enable it only after the hooks ship.
 - Node/consensus/network call-sites for the runtime gauges and health
   predicates are Track A work (Q-020); this API publication changes no
   A-owned source.
-- OTLP tracing export (S8.1) is a later S8 slice; RPC method spans are
-  landed (see above) and become exportable when the OTLP provider lands.
+- OTLP tracing export provider (S8.1) is published behind the `subhost-telemetry`
+  `otlp` feature (Q-035): `otlp::init_with_otlp` installs the export layer and
+  returns a retained shutdown guard. RPC method spans are landed (#69) and
+  export through it once a binary installs the provider; binary wiring (CLI flag
+  / node) and the Track A block/consensus spans follow.
 - The exporter is unauthenticated: bind loopback or a private interface, or
   front it with an authenticating proxy. `/health/*` reveals readiness state.

@@ -289,6 +289,24 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Opt-in OTLP tracing export provider (S8.1, Q-020/Q-035).** `subhost-telemetry`
+  gains an `otlp` feature; default builds carry no OpenTelemetry dependency and
+  behave exactly as before. `otlp::init_with_otlp` installs a
+  `tracing-opentelemetry` layer on the global subscriber alongside the fmt
+  layer, backed by a batch span processor and an OTLP HTTP/protobuf exporter
+  with an explicit endpoint (default `http://localhost:4318/v1/traces`, env
+  overrides honoured) and per-export timeout, and returns a retained shutdown
+  guard that flushes on drop. Once installed, any ordinary `tracing` span —
+  Track A block/consensus spans and Track B RPC spans — exports with no
+  per-crate export API; per-layer `EnvFilter`s govern what is exported, and only
+  bounded operational fields enter spans (never secrets). Must be called within
+  a tokio runtime; exporter startup failure is reported, never fatal. New
+  dependencies `opentelemetry`/`opentelemetry_sdk` (`rt-tokio`)/`opentelemetry-otlp`
+  (`http-proto`, `hyper-client`) 0.33 and `tracing-opentelemetry` 0.34 (MSRV 1.75
+  ≤ workspace 1.89); `cargo deny` clean. Binary wiring (CLI flag / node) and the
+  Track A block/consensus spans follow per Q-035; the Track B RPC spans are
+  landed (#69) and export through this provider once a binary installs it.
+
 - **RPC method spans (S8.1, Q-033).** Every decoded JSON-RPC call on HTTP and
   WebSocket emits one `info` span (`rpc_call`, target `subhost_rpc`) through
   the existing RPC metrics middleware: `rpc.method` (registered static name or

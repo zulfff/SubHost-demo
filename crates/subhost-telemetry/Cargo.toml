@@ -11,7 +11,25 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Opt-in OTLP tracing export (S8.1 / Q-020 / Q-035). Default builds carry no
+# OpenTelemetry dependency and behave exactly as before.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }

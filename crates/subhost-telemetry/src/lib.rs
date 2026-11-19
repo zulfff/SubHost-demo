@@ -5,6 +5,9 @@
 
 use tracing_subscriber::EnvFilter;
 
+#[cfg(feature = "otlp")]
+pub mod otlp;
+
 /// Environment variable read for the log filter.
 pub const LOG_ENV: &str = "RUST_LOG";
 
@@ -111,6 +114,11 @@ pub fn init_or_warn(config: TelemetryConfig) {
 pub enum TelemetryError {
     #[error("a global tracing subscriber is already installed: {0}")]
     AlreadyInitialized(String),
+
+    /// OTLP exporter construction failed (only with the `otlp` feature).
+    #[cfg(feature = "otlp")]
+    #[error("OTLP exporter initialization failed: {0}")]
+    OtlpInit(String),
 }
 
 #[cfg(test)]
