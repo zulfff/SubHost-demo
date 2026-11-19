@@ -94,6 +94,31 @@ events.
 `expired` stays at 0: no TTL/expiry path exists in the pool or node yet. It
 wires when the S6.3 expiry lifecycle lands.
 
+## RPC method spans (S8.1)
+
+Every decoded JSON-RPC call on HTTP and WebSocket emits one `info` span
+through the existing `tracing` API, riding the same middleware as the RPC
+metrics (Q-033, contract Q-020):
+
+- Span name `rpc_call`, target `subhost_rpc` (tracing requires constant span
+  names; the method travels in a field).
+- Fields: `rpc.method` — the registered static method name or `unknown`,
+  never the caller's raw string; `rpc.outcome` — `ok`/`error`;
+  `rpc.duration_ms`; and `rpc.error_code` on failure.
+- **Privacy boundary:** params, payloads, tokens, passwords and keys never
+  enter a span. Tests assert caller-derived input appears in no span field.
+- Bypass semantics match the metrics: notifications, malformed JSON and HTTP
+  guard rejections (e.g. 401) emit no span; a batch emits one span per call.
+
+Visibility belongs to the installed subscriber, not a feature flag: with no
+subscriber the spans are near-free no-ops, and the default `fmt` layer does
+not log span events, so default log output is unchanged. An env-filtered or
+OTLP subscriber (the opt-in S8.1 export slice) makes them visible.
+
+Caveat: spans exist only when a metrics registry is supplied via
+`RpcServer::with_metrics` — they ride that middleware. The node always
+supplies one; a library consumer running without metrics gets no spans.
+
 ## Sample alert rules (S8.5)
 
 The canonical, expanded rule set — including a no-quorum finality-stall proxy
@@ -149,6 +174,7 @@ any committed chain — enable it only after the hooks ship.
 - Node/consensus/network call-sites for the runtime gauges and health
   predicates are Track A work (Q-020); this API publication changes no
   A-owned source.
-- OTLP tracing export (S8.1) and RPC method spans are later S8 slices.
+- OTLP tracing export (S8.1) is a later S8 slice; RPC method spans are
+  landed (see above) and become exportable when the OTLP provider lands.
 - The exporter is unauthenticated: bind loopback or a private interface, or
   front it with an authenticating proxy. `/health/*` reveals readiness state.

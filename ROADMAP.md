@@ -130,7 +130,7 @@ agent always sees the real state.
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | Merged: S5.1a auth/bind policy, S5.2 methods (#54), S5.3a middleware + S5.3b node wiring. TLS = documented reverse-proxy mode; rate limit per connection |
 | S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks contract in progress (dewi, Q-034), wiring after step 3 (raka); S6.2 steps 1–2 merged (#60/#65), step 3 in progress (bima); S6.3 counters merged (#51), TTL/eviction pending |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
-| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 health/gauges (#47), mempool events (#51), runbooks + alerts (#66) merged; node runtime hooks (sari, Q-032), RPC spans (yoga, Q-033), OTLP exporter (tania) in progress |
+| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 health/gauges (#47), mempool events (#51), runbooks + alerts (#66) merged; RPC spans landed (Q-033, #69); node runtime hooks (sari, Q-032), OTLP exporter (tania, Q-035) in progress |
 | S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap loader pending after S6.2 |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
@@ -556,7 +556,8 @@ looking traffic.
 | S8.2/S8.3 Platform API | Merged (PR #47, ADR-013, Q-020) |
 | S8.2/S8.3 node runtime hooks | Partial: block height + health wired; finalized height, QC latency, disk stats and peer count still pending Track A (see `docs/operations/alerts.md`) |
 | S8.2 mempool event wiring | Merged (#51, Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
-| S8.1 OTLP tracing, RPC spans | Pending, later S8 slices |
+| S8.1 RPC spans | Landed (Q-033, #69): per-call spans in the RPC metrics middleware, privacy-boundary tested |
+| S8.1 OTLP export | Pending (tania, Q-035): opt-in provider consuming the emitted spans |
 | S8.4 Runbooks | Complete: start/stop, key rotation, ledger repair, incident investigation + checklist (this PR); backup/restore, upgrade, certified-sync, mempool-persistence already present |
 | S8.5 Alerts | Canonical sample rules in `docs/operations/alerts.md` (height stall, no-quorum proxy, disk growth + live/gated metric table); `observability.md` keeps a summary |
 
