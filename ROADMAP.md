@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-19 · `main` = `982d3e6` · S0, S1 (through S1.4), S4 (through S4.5), S5.1a/S5.3a merged · S2 timeout/quorum + CLI policy (#46) and S3 certified-history relay (#45) merged · S8 slice 1 merged (#47) · S9 (#48), 002 wallet fix (#49), 003 storage slice (#50), S8.2 mempool events (#51) in review · `Q-001`–`Q-024` agreed
+Status: 2026-11-19 · `main` = `7e291b8` · S0, S1 (through S1.4), S4 (through S4.5), S5.1a/S5.3a merged · S2 timeout/quorum + CLI policy (#46) and S3 certified-history relay (#45) merged · S8 slice 1 (#47), S9 (#48), 002 wallet fix (#49) and S8.2 mempool events (#51) merged · S5.2 implemented on `s5/rpc-methods`, 003 storage slice (#50) in review · `Q-001`–`Q-024` agreed
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -17,7 +17,7 @@ editing the same files.
 | Networking | libp2p relays proposals, verified votes and QC-certified next blocks; demo block gossip remains. Bootstrap retries; no historical block sync, peer scoring, per-peer limits or tx gossip. |
 | Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
 | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
-| RPC | 11 methods. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. Completed decoded RPC calls and returned errors now reach the node metrics registry. |
+| RPC | 15 methods plus explicit unsupported log/subscription responses; block lookup by hash and bounded legacy fee history. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. Completed decoded RPC calls and returned errors now reach the node metrics registry. |
 | Mempool | In memory only; fixed gas price 1. |
 | IBC | State machine + single-key ed25519 light client. No validator-set rotation, no multisig QC, no non-membership proof. |
 | Release | `0.1.0`, no tag, no release workflow, no signed binaries or SBOM. |
@@ -415,11 +415,21 @@ reverse-proxy mode)*
   server-side TLS feature, so the supported public deployment is a TLS-terminating
   reverse proxy in front of a loopback bind.
 
-**S5.2 Methods**
-- Add `eth_getBlockByHash`, `eth_syncing`, `eth_feeHistory`, `eth_maxPriorityFeePerGas`.
-- Add `eth_getLogs` and `eth_subscribe` only after S10 produces logs; until then
-  return a documented "unsupported" error rather than an ad-hoc message.
-- Full JSON-RPC 2.0 error-code conformance test matrix.
+**S5.2 Methods** *(implemented; contract `ADR-012`)*
+- Added `eth_getBlockByHash`, `eth_syncing`, `eth_feeHistory` and
+  `eth_maxPriorityFeePerGas`; block-query flags and height quantities are strict.
+- History covers at most 1024 retained blocks and 100 gas-weighted reward
+  percentiles. Base fees are zero until S6 implements and records a fee market;
+  the priority recommendation equals the admission floor. Hash lookup scans
+  retained blocks; a persistent hash index is deferred.
+- Sync reports no active worker (`false`), without claiming network convergence;
+  real progress waits for S3. Logs/subscriptions return documented `-32004`
+  unsupported errors until S10 produces logs.
+- HTTP conformance covers parse/request/method/parameter/internal/server errors,
+  unsupported methods, ID preservation, batches and notification omission;
+  failure tests cover missing/pruned data, resource bounds and persistence errors.
+- Parameter and compatibility contracts are in `docs/rpc.md`. S5.3 metrics remain
+  outstanding, so the request-count exit criterion is not yet satisfied.
 
 **S5.3 Metrics**
 - S5.3a implements opt-in `RpcServer::with_metrics(Metrics) -> Self` and RPC

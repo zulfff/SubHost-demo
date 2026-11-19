@@ -126,6 +126,10 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   A repeated migration now validates the authoritative manifest, snapshot and
   retained segments before returning `AlreadySegmented`, including when a valid
   legacy file remains after an interrupted upgrade.
+- **Block-query parameters are validated consistently.** Noncanonical height
+  quantities and incorrectly typed hydration flags now return `-32602`, including
+  on an empty ledger, instead of being treated as missing blocks or ignored.
+
 - **`accept_block` accepted peer blocks over the block gas limit
   (SUBHOST-2026-001).** The producer capped a block at `BLOCK_GAS_LIMIT` while
   selecting transactions, but the peer path added the same gas figures without
@@ -357,6 +361,15 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   crash test now writes a new snapshot and checks state and receipts after retry.
   `docs/operations/backup-restore.md` explains coherent backups, offline
   validation, and recovery limits for committed corruption.
+- **RPC block hashes and legacy fee history (S5.2).** Added
+  `eth_getBlockByHash`, `eth_syncing`, `eth_feeHistory` and
+  `eth_maxPriorityFeePerGas`. History is bounded to 1024 retained blocks and 100
+  gas-weighted reward percentiles, with zero pre-EIP-1559 base fees. Sync reports
+  no active worker, not peer convergence. Logs/subscriptions now return explicit
+  `-32004` unsupported errors. HTTP tests cover pruning, fee weighting, malformed
+  parameters, standard error codes, persistence-detail suppression, batch IDs
+  and notifications. See `docs/rpc.md` and `ADR-012` for compatibility limits.
+
 - **Validator registry and producer key at bootstrap.** `Node::bootstrap` builds a
   `ValidatorRegistry` from `genesis.initial_validators` whenever the genesis has a
   validator set, and `RpcState::with_validators` enables peer-block verification
