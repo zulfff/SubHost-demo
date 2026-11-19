@@ -1,0 +1,67 @@
+[
+  {
+    "gate": "format",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 0.63
+  },
+  {
+    "gate": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--all-features",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 101.64
+  },
+  {
+    "gate": "tests",
+    "command": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--all-features",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "seconds": 332.34
+  },
+  {
+    "gate": "deny",
+    "command": [
+      "cargo",
+      "deny",
+      "--all-features",
+      "check"
+    ],
+    "exit_code": 0,
+    "seconds": 10.67
+  },
+  {
+    "gate": "build-cli",
+    "command": [
+      "cargo",
+      "build",
+      "-p",
+      "subhost-cli",
+      "-p",
+      "subhost-faucet",
+      "--locked"
+    ],
+    "exit_code": 0,
+    "seconds": 9.31
+  }
+]

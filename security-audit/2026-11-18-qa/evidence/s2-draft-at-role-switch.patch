@@ -1,0 +1,2025 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 3dff532..4d0a161 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -185,6 +185,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
+ 
+ ### Added
+ 
++- **Validator consensus wiring (S2.1–S2.2 and the S2.3 commit API).** RPC admission
++  stays pending when genesis defines validators. Nodes exchange signed proposals,
++  votes and certified commits; `commit_qc` checks the certificate before the
++  ledger write. Observers verify without signing. A failed write retains the
++  certificate for retry and never advances the visible or driver tip. Quorums
++  require `n - f` validators, preventing single-signer commits for sets of two or
++  three. Demo chains without validators retain synchronous single-writer blocks.
++  Timeout/view change, durable unfinished votes/QCs, historical sync and the
++  explicit CLI single-writer flag remain deferred; see `docs/consensus.md`.
++
+ - **Validator registry and producer key at bootstrap.** `Node::bootstrap` builds a
+   `ValidatorRegistry` from `genesis.initial_validators` whenever the genesis has a
+   validator set, and `RpcState::with_validators` enables peer-block verification
+diff --git a/README.md b/README.md
+index d58b8d8..a340535 100644
+--- a/README.md
++++ b/README.md
+@@ -24,11 +24,13 @@ blocks that carry several transactions at once. The ledger is crash-safe, and th
+ node replays it on load. Blocks commit to Merkle state and receipt roots, and
+ accounts can be proven against the state root. An optional libp2p transport
+ gossips blocks between nodes. The workspace also holds an IBC packet state machine
+-with a single-signer light client, and an in-process BFT agreement driver.
++with a single-signer light client, and a linear quorum driver wired into validator nodes.
+ 
+-This is not a production network. Block production belongs to whichever node
+-receives the transaction, and there is no fork choice, view change, or leader
+-rotation. Two producers that seal at the same height fork instead of converging.
++This is not a production network. Validator nodes commit only with a verified
++quorum certificate; RPC submissions remain pending until then. There is no timeout,
++view change, leader rotation, or historical sync. Concurrent proposals may stall,
++and unfinished votes are not durable across restarts. Demo chains without a
++validator set keep the single-writer path. See [consensus limits](docs/consensus.md).
+ The table below lists what each crate does today, and nothing in this repository
+ should be treated as production ready.
+ 
+@@ -42,12 +44,12 @@ should be treated as production ready.
+ | `subhost-state` | Complete. Balances, nonce ordering, replay rejection, checked arithmetic, Merkle state root bound to the chain ID, per-account inclusion proofs. |
+ | `subhost-mempool` | Complete. Per-sender nonce pool, replace-by-fee, capacity eviction, deterministic proposal order. |
+ | `subhost-storage` | Complete. Versioned (v2), checksummed, atomically written ledger with multi-transaction blocks; every block and receipt commitment is replayed on load. v1 files are refused. |
+-| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, one block per submission carrying every executable pending transaction, optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit, and opt-in bearer-token authentication, per-connection rate limiting and non-loopback bind policy (no in-process TLS; use a TLS-terminating reverse proxy). |
+-| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, optional peer gossip that publishes locally produced blocks and applies peer blocks in height order. |
++| `subhost-rpc` | Working subset. 11 JSON-RPC methods, mandatory signature verification, pending admission and QC-gated commit when validators are configured (one block per submission on demo chains), optional BLS signing of produced blocks, producer-signature verification when the genesis has a validator set, full re-validation of peer blocks, persist-before-commit, and opt-in bearer-token authentication, per-connection rate limiting and non-loopback bind policy (no in-process TLS; use a TLS-terminating reverse proxy). |
++| `subhost-node` | Complete. Genesis load, validator registry from genesis, producer key load with permission and scalar checks, ledger restore, RPC and metrics wiring, graceful shutdown, a genesis-backed consensus driver, optional gossip for proposals/votes/certified commits, and legacy demo block buffering. |
+ | `subhost-telemetry` | Complete. One `RUST_LOG`-aware subscriber, optional JSON output. |
+ | `subhost-metrics` | Complete. Prometheus registry and `/metrics` + `/health` exporter. |
+-| `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and a `2f + 1` view-by-view agreement driver. No networking, timeouts, view changes, or leader rotation. |
+-| `subhost-network` | Transport. libp2p gossip publish and receive, connection limits, and block-proposal delivery consumed by `subhost-node`. No Dandelion++ relay, no peer scoring, no block sync protocol. |
++| `subhost-consensus` | Primitives plus an in-process driver. DAG admission, quorum support, BLS-verified quorum certificates, staking and slashing, and an `n - f` linear agreement driver wired into the node. No timeouts, durable unfinished votes, view changes, or leader rotation. |
++| `subhost-network` | Transport. libp2p gossip publish and receive, connection limits, and proposal, vote and QC-certified block delivery consumed by `subhost-node`. No Dandelion++ relay, no peer scoring, no block sync protocol. |
+ | `subhost-ibc` | State machine plus a single-signer light client. Channel lifecycle, sequencing, timeouts, replay rejection, signed-header verification with monotonic height/time, and Merkle commitment proofs for packet delivery. No validator-set rotation or multisig quorum certificates. |
+ | `subhost-faucet` | Complete. Signs and submits real transfers from an encrypted wallet, per-address cooldown. |
+ | `subhost-cli` | Complete. Every command performs a real operation. |
+diff --git a/ROADMAP.md b/ROADMAP.md
+index c92cd96..01cfb7b 100644
+--- a/ROADMAP.md
++++ b/ROADMAP.md
+@@ -1,6 +1,6 @@
+ # Roadmap to a full release
+ 
+-Status: 2026-11-18 · baseline `main` = `1af182f` · S0.1–S0.3, S1.1–S1.4 and S4.1–S4.4 merged · S5.1a (RPC auth) in review · `Q-001`–`Q-006` agreed
++Status: 2026-11-18 · baseline `main` = `96f0cd2` · S0.1–S0.3, S1.1–S1.4 and S4.1–S4.4 merged · S5.1a (RPC auth) merged · S2.1–S2.2 and S2.3 QC API implemented on the S2 branch · `Q-001`–`Q-007` agreed
+ This document is the work plan for turning the current pre-production workspace into
+ a releasable network. It is written so two agents can work at the same time without
+ editing the same files.
+@@ -11,10 +11,10 @@ editing the same files.
+ 
+ | Area | Reality |
+ | --- | --- |
+-| Chain | Single-writer node. One submission seals one block with every executable pending transaction. |
++| Chain | Validator deployments admit to the pool and commit with a QC. Demo chains without validators seal synchronously on submission. |
+ | Block auth | A node with a configured authority signs each produced block with the validator's BLS key and verifies that signature on accept; a node without one still produces and accepts unsigned blocks. |
+-| Consensus | `subhost-consensus` has a tested in-process `2f+1` driver (`propose`, `receive_proposal`, `receive_vote`, commit). **No crate depends on it**; the node never calls it. |
+-| Networking | libp2p gossip publishes only locally sealed blocks. Messages for votes, DAG vertices and transactions are already defined but unused by the node. No block sync, peer scoring, per-peer limits, or tx gossip. |
++| Consensus | Node owns a linear `n - f` quorum driver restored at the ledger tip. Observers verify without voting. No timeout, view change, leader rotation or durable unfinished votes yet. |
++| Networking | libp2p relays proposals, verified votes and QC-certified next blocks; demo block gossip remains. No historical block sync, peer scoring, per-peer limits, or tx gossip. |
+ | Storage | `ledger/manifest.json` (v2, with `base_height`) + append-only `ledger/segments/NNNNNN.log` + periodic `ledger/snapshot-<height>.bin` (every 1024 blocks). `subhost db migrate` converts a v2 `node-state.bin`; `subhost db prune` drops the oldest segments. Loading reads every retained segment, the snapshot carries no receipt index, and pruning is offline only. |
+ | State | Balances + nonces + a Merkle root over sorted leaves. Transfers only; contract creation is refused. |
+ | RPC | 11 methods. Optional bearer token (`--rpc-auth-token-file`), per-connection rate limit, and a non-loopback bind policy (`--rpc-allow-public` requires a token); all off by default. No TLS — the documented public deployment is a reverse proxy. RPC counters in the metrics registry are still never incremented. |
+@@ -120,21 +120,21 @@ agent always sees the real state.
+ 
+ ## 4. Stage index
+ 
+-| Stage | Goal | Track | Depends on | Size |
+-| --- | --- | --- | --- | --- |
+-| S0 | Prepare `rpc` for parallel work | A | — | S |
+-| S1 | Signed blocks and validator identity | A | S0 | M |
+-| S2 | Wire the consensus driver into the node | A | S1 | L |
+-| S3 | Fork choice, reorg, and block sync | A | S2 | L |
+-| S4 | Segmented storage, snapshots, migration | B | — | L |
+-| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M |
+-| S6 | Durable mempool and fee market | B | S0 | M |
+-| S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M |
+-| S8 | Observability, health, runbooks | B | S0 | M |
+-| S9 | Release engineering | B | S5 | M |
+-| S10 | Execution layer (EVM or WASM) | C | S3 | XL |
+-| S11 | IBC production light client + relayer | C | — | L |
+-| S12 | External audit and public testnet soak | all | S1–S9 | XL |
++| Stage | Goal | Track | Depends on | Size | Status |
++| --- | --- | --- | --- | --- | --- |
++| S0 | Prepare `rpc` for parallel work | A | — | S | Merged |
++| S1 | Signed blocks and validator identity | A | S0 | M | Merged through S1.4 |
++| S2 | Wire the consensus driver into the node | A | S1 | L | Partial: S2.1–S2.2 and QC API; timeout/CLI pending |
++| S3 | Fork choice, reorg, and block sync | A | S2 | L | Planned |
++| S4 | Segmented storage, snapshots, migration | B | — | L | Merged through S4.4 |
++| S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | S5.1a merged |
++| S6 | Durable mempool and fee market | B | S0 | M | Planned |
++| S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
++| S8 | Observability, health, runbooks | B | S0 | M | Planned |
++| S9 | Release engineering | B | S5 | M | Planned |
++| S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
++| S11 | IBC production light client + relayer | C | — | L | Planned |
++| S12 | External audit and public testnet soak | all | S1–S9 | XL | Planned |
+ 
+ Size is relative effort, not calendar time. S10 alone is larger than S0–S9 combined.
+ 
+@@ -211,6 +211,13 @@ rejected by every other node; the ledger still replays.
+ 
+ ### S2 — Wire the consensus driver into the node (Track A)
+ 
++**Status:** S2.1–S2.2 and the S2.3 QC commit API implemented on
++`s2/consensus-driver-ownership`. The stage remains incomplete: S2.4 timeout/view
++change, durable unfinished vote recovery, the explicit S2.3 `--single-writer` CLI
++policy, and the S2.5 timeout assertions are deferred. QCs remain in memory and are
++not authenticated on ledger replay until S3.4 supplies the persisted format.
++Concurrent proposals can stall. See `docs/consensus.md`; this is not production BFT.
++
+ **S2.1 Driver ownership** (`subhost-node/src/lib.rs`)
+ - `Node` holds a `ConsensusDriver` built from the genesis set and its identity.
+ - Producer path: `seal_block` returns a proposal instead of committing; the node
+diff --git a/SECURITY.md b/SECURITY.md
+index 28ca1f3..29d37c8 100644
+--- a/SECURITY.md
++++ b/SECURITY.md
+@@ -45,11 +45,13 @@ because the peer address is not exposed to the middleware.
+ using a password taken from the request body. The explorer refuses to bind to a
+ non-loopback address for that reason. Do not expose it.
+ 
+-**No consensus in the node.** Block production still comes from whichever node
+-receives the transaction, even though `subhost-consensus` contains a tested
+-in-process `2f + 1` driver. There is no fork choice, no reorg handling, no block
+-sync, and no leader rotation. A produced block is signed by the configured producer
+-and is only accepted by a node that has the same genesis validator set.
++**Validator consensus is a prototype linear quorum driver.** With a genesis
++validator set, RPC submissions remain pending and only a verified `n - f` QC can
++commit a block. There is no timeout, view change, leader rotation, historical sync
++or reorg. Unfinished votes are not durable across restarts, and historical QCs are
++not stored/authenticated by ledger replay. Concurrent proposals can stall. This
++slice must not be treated as production BFT or a finality guarantee. Demo chains
++without validators still seal synchronously. See `docs/consensus.md`.
+ 
+ **The producer key is an unencrypted file.** `<data_dir>/producer.key` holds one
+ hex-encoded 32-byte BLS scalar with mode `0600`, and the node refuses to load it if
+@@ -58,11 +60,11 @@ so anyone who copies the file can produce blocks as that validator. That is
+ acceptable for a testnet and not for production; `ROADMAP.md` S9.6 replaces it with
+ an encrypted keystore. Back the file up as carefully as the identity it represents.
+ 
+-**Block gossip is best-effort and unauthenticated beyond libp2p.** With
+-`--p2p-listen`, a node publishes blocks it sealed and applies peer blocks that
+-extend its tip. There is no peer scoring, no rate limiting per peer, and no way to
+-request a missed block: a node that was offline cannot catch up. Two producers at
+-the same height fork permanently.
++**Gossip has no historical catch-up or peer scoring.** Validator nodes exchange
++producer-authenticated proposals, verified votes and QC-certified next blocks.
++Demo chains without validators accept unsigned blocks. There is no per-peer rate
++limit or request for a missed range, so an offline node cannot catch up across a
++history gap. Gossip retransmission is best effort.
+ 
+ **BLS hash-to-curve is non-standard.** `subhost-crypto` uses a domain-separated,
+ length-prefixed hash-and-multiply onto the prime-order G2 subgroup, not an RFC 9380
+@@ -134,7 +136,7 @@ A regression in any of these is a genuine vulnerability and worth reporting.
+ - Quorum certificates are accepted only when the required number of distinct,
+   registered validators each contribute a signature that verifies over a payload
+   binding both the view and the block hash.
+-- The consensus driver commits only on a `2f + 1` quorum for one proposal, counts
++- The consensus driver commits only on an `n - f` quorum for one proposal, counts
+   each validator once per view, and refuses a proposal that does not extend the
+   committed tip by exactly one height.
+ - Merkle leaves, internal nodes, and padding use separate domain tags, so a leaf
+diff --git a/crates/subhost-consensus/src/driver.rs b/crates/subhost-consensus/src/driver.rs
+index e9e4af1..5da89d7 100644
+--- a/crates/subhost-consensus/src/driver.rs
++++ b/crates/subhost-consensus/src/driver.rs
+@@ -1,7 +1,7 @@
+ //! A minimal linear consensus driver over the quorum primitives.
+ //!
+ //! Scope: one in-process state machine that advances a single view at a time,
+-//! collects BLS votes for one proposal, and commits the block once `2f + 1`
++//! collects BLS votes for one proposal, and commits the block once `n - f`
+ //! distinct validators sign the same `(view, block hash)`. Every proposal must
+ //! extend the committed tip by exactly one height, and a validator votes at most
+ //! once per view, so two conflicting blocks cannot both collect a quorum.
+@@ -16,10 +16,10 @@ use crate::{
+     ConsensusConfig, ConsensusError, HotStuff, QuorumCertificate, ValidatorRegistry,
+     BLS_SIGNATURE_BYTES,
+ };
+-use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
++use ark_serialize::CanonicalSerialize;
+ use std::collections::BTreeMap;
+ use subhost_core::{Address, Block, Hash};
+-use subhost_crypto::{BLSScheme, PrivateKey, Signature};
++use subhost_crypto::{BLSScheme, PrivateKey};
+ 
+ /// A block put forward for one view.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -78,6 +78,26 @@ impl ConsensusDriver {
+         config: ConsensusConfig,
+         registry: ValidatorRegistry,
+         identity: Option<(Address, PrivateKey)>,
++    ) -> Result<Self, ConsensusError> {
++        Self::with_tip(config, registry, identity, 0, Hash::ZERO)
++    }
++
++    /// Build a driver that resumes from a ledger restored at `height`.
++    ///
++    /// A fresh driver starts at height zero with the zero hash as its tip. A node
++    /// that reopened an existing ledger must pass the restored height and declared
++    /// tip instead, otherwise the next proposal is rejected for not extending
++    /// height zero.
++    ///
++    /// In this linear driver each committed height consumes exactly one view,
++    /// so the restored height also restores the committed view. Votes for an
++    /// unfinished round are not durable yet; crash-safe vote recovery is S2.4.
++    pub fn with_tip(
++        config: ConsensusConfig,
++        registry: ValidatorRegistry,
++        identity: Option<(Address, PrivateKey)>,
++        height: u64,
++        tip: Hash,
+     ) -> Result<Self, ConsensusError> {
+         if registry.len() != config.validator_count {
+             return Err(ConsensusError::InvalidConfig(format!(
+@@ -86,19 +106,42 @@ impl ConsensusDriver {
+                 config.validator_count
+             )));
+         }
+-        if let Some((address, _)) = &identity {
+-            if !registry.contains(address) {
+-                return Err(ConsensusError::UnknownValidator(*address));
++        if let Some((address, secret)) = &identity {
++            let public_key =
++                registry.public_key(address).ok_or(ConsensusError::UnknownValidator(*address))?;
++            if *public_key != BLSScheme::public_key(secret) {
++                return Err(ConsensusError::InvalidConfig(
++                    "validator identity key mismatch".into(),
++                ));
+             }
+         }
++        let expected = ConsensusConfig::new(config.validator_count)?;
++        if config.quorum_threshold != expected.quorum_threshold
++            || config.max_faulty != expected.max_faulty
++        {
++            return Err(ConsensusError::InvalidConfig("invalid quorum parameters".into()));
++        }
++        if height == 0 && tip != Hash::ZERO {
++            return Err(ConsensusError::InvalidConfig(
++                "height zero must pair with the zero tip hash".into(),
++            ));
++        }
++        if height > 0 && tip == Hash::ZERO {
++            return Err(ConsensusError::InvalidConfig(
++                "a non-zero height needs the committed tip hash".into(),
++            ));
++        }
++        let mut hotstuff = HotStuff::new(config, registry);
++        hotstuff.view = height;
++        hotstuff.locked_view = height;
+         Ok(Self {
+-            hotstuff: HotStuff::new(config, registry),
++            hotstuff,
+             identity,
+-            height: 0,
+-            tip: Hash::ZERO,
++            height,
++            tip,
+             proposal: None,
+             votes: BTreeMap::new(),
+-            last_committed_view: 0,
++            last_committed_view: height,
+             committed: Vec::new(),
+         })
+     }
+@@ -126,6 +169,11 @@ impl ConsensusDriver {
+     /// Leader path: open the next view with `block` and return the leader's own
+     /// vote along with the proposal to broadcast.
+     pub fn propose(&mut self, block: Block) -> Result<(BlockProposal, Vote), ConsensusError> {
++        if self.proposal.is_some() {
++            return Err(ConsensusError::InvalidProposal(
++                "a proposal is already awaiting quorum".into(),
++            ));
++        }
+         self.ensure_extends_tip(&block)?;
+         let view = self
+             .hotstuff
+@@ -143,39 +191,134 @@ impl ConsensusDriver {
+         Ok((proposal, vote))
+     }
+ 
+-    /// Follower path: validate the leader's proposal and return this replica's
+-    /// vote. Only the next view is accepted, so a leader cannot skip views or
+-    /// replay an old proposal.
++    /// Follower path: accept the next proposal and return this validator's vote.
+     pub fn receive_proposal(&mut self, proposal: BlockProposal) -> Result<Vote, ConsensusError> {
++        if self.identity.is_none() {
++            return Err(ConsensusError::NotAValidator);
++        }
++        // Keep the strict public API: repeated proposals do not open another view.
++        if proposal.view != self.view().saturating_add(1) {
++            return Err(ConsensusError::InvalidView {
++                proposed: proposal.view,
++                current: self.view(),
++            });
++        }
++        self.observe_proposal(proposal)?.ok_or(ConsensusError::NotAValidator)
++    }
++
++    /// Accept a proposal without requiring an observer to hold a signing key.
++    ///
++    /// An exact retransmission returns the already signed vote. A conflicting
++    /// proposal cannot replace a round awaiting quorum, even in a later view.
++    pub fn observe_proposal(
++        &mut self,
++        proposal: BlockProposal,
++    ) -> Result<Option<Vote>, ConsensusError> {
++        if let Some(open) = &self.proposal {
++            if *open == proposal {
++                return Ok(self.own_vote().cloned());
++            }
++            return Err(ConsensusError::InvalidProposal(
++                "a conflicting proposal is already open".into(),
++            ));
++        }
+         self.ensure_extends_tip(&proposal.block)?;
+-        let current = self.hotstuff.view();
++        let current = self.view();
+         if proposal.view != current.saturating_add(1) {
+             return Err(ConsensusError::InvalidView { proposed: proposal.view, current });
+         }
+         if !self.hotstuff.is_safe_proposal(proposal.view) {
+-            return Err(ConsensusError::InvalidProposal(format!(
+-                "view {} is below the locked view {}",
+-                proposal.view,
+-                self.hotstuff.locked_view()
+-            )));
++            return Err(ConsensusError::InvalidProposal(
++                "proposal is below the locked view".into(),
++            ));
+         }
+-        let vote = self.sign_vote(&proposal)?;
++        let vote = if self.identity.is_some() { Some(self.sign_vote(&proposal)?) } else { None };
+         self.hotstuff.enter_next_view()?;
+-        self.proposal = Some(proposal.clone());
++        self.proposal = Some(proposal);
+         self.votes.clear();
+-        self.votes.insert(vote.validator, vote.clone());
++        if let Some(vote) = &vote {
++            self.votes.insert(vote.validator, vote.clone());
++        }
+         Ok(vote)
+     }
+ 
++    /// Latest certificate held in memory (ledger QC persistence is S3.4).
++    pub fn committed_qc(&self) -> Option<&QuorumCertificate> {
++        self.hotstuff.high_qc()
++    }
++
++    /// Adopt a peer's certified next block, after checking the certificate.
++    pub fn receive_commit(
++        &mut self,
++        block: Block,
++        qc: QuorumCertificate,
++    ) -> Result<(), ConsensusError> {
++        self.ensure_extends_tip(&block)?;
++        if qc.block_hash != block.hash() || qc.view != block.header.height {
++            return Err(ConsensusError::InvalidProposal(
++                "certificate does not match the block".into(),
++            ));
++        }
++        self.hotstuff.update_high_qc(qc.clone())?;
++        self.height = block.header.height;
++        self.tip = block.hash();
++        self.last_committed_view = qc.view;
++        self.committed.push(block);
++        self.proposal = None;
++        self.votes.clear();
++        Ok(())
++    }
++
++    pub fn is_validator(&self) -> bool {
++        self.identity.is_some()
++    }
++
++    pub fn own_vote(&self) -> Option<&Vote> {
++        self.identity.as_ref().and_then(|(address, _)| self.votes.get(address))
++    }
++
++    /// Verified certificate ready to persist, without advancing the tip.
++    pub fn pending_qc(&self) -> Option<QuorumCertificate> {
++        let proposal = self.proposal.as_ref()?;
++        if self.votes.len() < self.hotstuff.config().quorum_threshold {
++            return None;
++        }
++        Some(QuorumCertificate {
++            view: proposal.view,
++            block_hash: proposal.block.hash(),
++            signatures: self
++                .votes
++                .values()
++                .map(|vote| (vote.validator, vote.signature.clone()))
++                .collect(),
++        })
++    }
++
+     /// Validate and tally a vote.
+     ///
+     /// A vote is accepted only for the open proposal, from a registered
+     /// validator, once per signer, with a valid BLS signature over the exact
+     /// `(view, block hash)` pair. A quorum commits the proposal immediately.
+     pub fn receive_vote(&mut self, vote: Vote) -> Result<VoteOutcome, ConsensusError> {
+-        let Some(proposal) = self.proposal.clone() else {
++        let fresh = self.record_vote(vote)?;
++        if self.pending_qc().is_some() {
++            return self.commit_open_proposal();
++        }
++        if !fresh {
++            return Ok(VoteOutcome::Ignored);
++        }
++        Ok(VoteOutcome::Pending {
++            votes: self.votes.len(),
++            needed: self.hotstuff.config().quorum_threshold,
++        })
++    }
++
++    /// Validate and retain a vote without committing, for persist-before-visibility.
++    /// Returns false for duplicates and already committed views.
++    pub fn record_vote(&mut self, vote: Vote) -> Result<bool, ConsensusError> {
++        let Some(proposal) = &self.proposal else {
+             if vote.view <= self.last_committed_view {
+-                return Ok(VoteOutcome::Ignored);
++                return Ok(false);
+             }
+             return Err(ConsensusError::NoProposal);
+         };
+@@ -185,26 +328,32 @@ impl ConsensusDriver {
+             ));
+         }
+         if self.votes.contains_key(&vote.validator) {
+-            return Ok(VoteOutcome::Ignored);
++            return Ok(false);
+         }
+-
+         let public_key = self
+             .hotstuff
+             .registry()
+             .public_key(&vote.validator)
+             .ok_or(ConsensusError::UnknownValidator(vote.validator))?;
+-        if vote.signature.len() != BLS_SIGNATURE_BYTES {
+-            return Err(ConsensusError::MalformedSignature(vote.validator));
+-        }
+-        let signature = Signature::deserialize_compressed(vote.signature.as_slice())
+-            .map_err(|_| ConsensusError::MalformedSignature(vote.validator))?;
++        let signature = subhost_crypto::BLSScheme::decode_signature(&vote.signature)
++            .ok_or(ConsensusError::MalformedSignature(vote.validator))?;
+         let payload = QuorumCertificate::payload_for(vote.view, &vote.block_hash);
+         if !BLSScheme::verify(public_key, &payload, &signature) {
+             return Err(ConsensusError::InvalidSignature(vote.validator));
+         }
+-
+         self.votes.insert(vote.validator, vote);
++        Ok(true)
++    }
+ 
++    /// Commit the open proposal when its tally has reached the quorum.
++    ///
++    /// The caller has already checked that every signature is valid and that
++    /// the signers are distinct, registered validators. `update_high_qc`
++    /// re-verifies the assembled certificate before the lock moves.
++    pub fn commit_open_proposal(&mut self) -> Result<VoteOutcome, ConsensusError> {
++        let Some(proposal) = self.proposal.clone() else {
++            return Ok(VoteOutcome::Ignored);
++        };
+         let needed = self.hotstuff.config().quorum_threshold;
+         if self.votes.len() < needed {
+             return Ok(VoteOutcome::Pending { votes: self.votes.len(), needed });
+@@ -219,7 +368,6 @@ impl ConsensusDriver {
+                 .map(|vote| (vote.validator, vote.signature.clone()))
+                 .collect(),
+         };
+-        // `update_high_qc` re-verifies the quorum and advances the lock.
+         self.hotstuff.update_high_qc(quorum)?;
+ 
+         let block = proposal.block;
+@@ -270,6 +418,7 @@ mod tests {
+     use super::*;
+     use ark_serialize::CanonicalSerialize;
+     use subhost_core::{BlockHeader, BLOCK_GAS_LIMIT};
++    use subhost_crypto::Signature;
+ 
+     fn address(n: u8) -> Address {
+         Address::new([n; 20])
+@@ -503,6 +652,102 @@ mod tests {
+         assert_eq!(leader.view(), 1);
+     }
+ 
++    #[test]
++    fn an_open_round_cannot_be_abandoned_for_a_conflicting_later_view() {
++        let (registry, keys) = registry(4);
++        let mut leader = driver(&registry, &keys, 0);
++        let (proposal, _) = leader.propose(block(1, Hash::ZERO, 1)).unwrap();
++        assert!(leader.propose(block(1, Hash::ZERO, 2)).is_err());
++        assert!(leader
++            .observe_proposal(BlockProposal { view: 2, block: block(1, Hash::ZERO, 2) })
++            .is_err());
++        assert_eq!(leader.open_proposal(), Some(&proposal));
++        assert_eq!(leader.view(), 1);
++    }
++
++    #[test]
++    fn unsafe_quorum_configuration_and_mismatched_identity_are_rejected() {
++        let (registry, keys) = registry(4);
++        let mut config = ConsensusConfig::new(4).unwrap();
++        config.quorum_threshold = 1;
++        assert!(ConsensusDriver::new(config, registry.clone(), Some(keys[0].clone())).is_err());
++        assert!(ConsensusDriver::new(
++            ConsensusConfig::new(4).unwrap(),
++            registry,
++            Some((keys[0].0, keys[1].1.clone()))
++        )
++        .is_err());
++    }
++
++    #[test]
++    fn a_single_validator_commits_its_own_proposal() {
++        let (registry, keys) = registry(1);
++        let mut driver =
++            ConsensusDriver::new(ConsensusConfig::new(1).unwrap(), registry, Some(keys[0].clone()))
++                .unwrap();
++
++        let (proposal, vote) = driver.propose(block(1, Hash::ZERO, 1)).unwrap();
++        assert_eq!(
++            driver.receive_vote(vote).unwrap(),
++            VoteOutcome::Committed { view: proposal.view, block_hash: proposal.block.hash() }
++        );
++        assert_eq!(driver.height(), 1);
++        assert_eq!(driver.tip(), proposal.block.hash());
++        assert!(driver.open_proposal().is_none());
++    }
++
++    #[test]
++    fn a_restored_driver_extends_the_restored_tip() {
++        let (registry, keys) = registry(4);
++        let restored_tip = Hash::from_data(b"restored tip");
++        let mut driver = ConsensusDriver::with_tip(
++            ConsensusConfig::new(4).unwrap(),
++            registry,
++            Some(keys[0].clone()),
++            7,
++            restored_tip,
++        )
++        .unwrap();
++
++        assert_eq!(driver.height(), 7);
++        assert_eq!(driver.tip(), restored_tip);
++
++        // A block that ignores the restored tip is refused.
++        assert!(matches!(
++            driver.propose(block(1, Hash::ZERO, 1)),
++            Err(ConsensusError::InvalidProposal(_))
++        ));
++
++        let (proposal, _) = driver.propose(block(8, restored_tip, 2)).unwrap();
++        assert_eq!(proposal.view, 8);
++        assert_eq!(driver.height(), 7);
++    }
++
++    #[test]
++    fn a_restored_driver_needs_a_consistent_height_and_tip() {
++        let (registry, _) = registry(4);
++        assert!(matches!(
++            ConsensusDriver::with_tip(
++                ConsensusConfig::new(4).unwrap(),
++                registry.clone(),
++                None,
++                9,
++                Hash::ZERO,
++            ),
++            Err(ConsensusError::InvalidConfig(_))
++        ));
++        assert!(matches!(
++            ConsensusDriver::with_tip(
++                ConsensusConfig::new(4).unwrap(),
++                registry,
++                None,
++                0,
++                Hash::from_data(b"not the genesis tip"),
++            ),
++            Err(ConsensusError::InvalidConfig(_))
++        ));
++    }
++
+     #[test]
+     fn an_observer_validates_but_cannot_vote() {
+         let (registry, keys) = registry(4);
+diff --git a/crates/subhost-consensus/src/lib.rs b/crates/subhost-consensus/src/lib.rs
+index d4a2de3..55ed5b8 100644
+--- a/crates/subhost-consensus/src/lib.rs
++++ b/crates/subhost-consensus/src/lib.rs
+@@ -4,7 +4,7 @@
+ //! Scope: these are the verifiable pieces of the protocol — vertex admission,
+ //! quorum support, QC signature validation, and stake accounting. The
+ //! [`driver`] module turns them into an in-process agreement loop: one view at a
+-//! time, a `2f + 1` BLS quorum commits a block, and every proposal must extend
++//! time, a `n - f` BLS quorum commits a block, and every proposal must extend
+ //! the committed tip. The driver has no networking, timeouts, view changes, or
+ //! leader rotation yet, so it is a tested state machine rather than a
+ //! decentralized testnet.
+@@ -27,7 +27,7 @@ pub const BLS_PUBLIC_KEY_BYTES: usize = 48;
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct ConsensusConfig {
+     pub validator_count: usize,
+-    /// Signatures required to form a quorum certificate: `2f + 1`.
++    /// Signatures required to form a quorum certificate: `n - f`.
+     pub quorum_threshold: usize,
+     /// Tolerated byzantine validators: `f = (n - 1) / 3`.
+     pub max_faulty: usize,
+@@ -47,7 +47,7 @@ impl ConsensusConfig {
+         let max_faulty = (validator_count - 1) / 3;
+         Ok(Self {
+             validator_count,
+-            quorum_threshold: 2 * max_faulty + 1,
++            quorum_threshold: validator_count - max_faulty,
+             max_faulty,
+             block_time_ms: subhost_core::DEFAULT_BLOCK_TIME_MS,
+             dag_round_timeout_ms: 500,
+@@ -711,8 +711,16 @@ mod tests {
+ 
+     #[test]
+     fn quorum_sizing_follows_the_bft_bound() {
+-        for (validators, faulty, quorum) in [(1, 0, 1), (3, 0, 1), (4, 1, 3), (7, 2, 5), (10, 3, 7)]
+-        {
++        for (validators, faulty, quorum) in [
++            (1, 0, 1),
++            (2, 0, 2),
++            (3, 0, 3),
++            (4, 1, 3),
++            (5, 1, 4),
++            (6, 1, 5),
++            (7, 2, 5),
++            (10, 3, 7),
++        ] {
+             let config = ConsensusConfig::new(validators).unwrap();
+             assert_eq!(config.max_faulty, faulty, "n={validators}");
+             assert_eq!(config.quorum_threshold, quorum, "n={validators}");
+diff --git a/crates/subhost-network/src/lib.rs b/crates/subhost-network/src/lib.rs
+index 3d7806a..ea3ed02 100644
+--- a/crates/subhost-network/src/lib.rs
++++ b/crates/subhost-network/src/lib.rs
+@@ -93,10 +93,19 @@ pub enum NetworkMessage {
+     TransactionFluff { tx_hash: [u8; 32], data: Vec<u8> },
+     /// A serialized DAG vertex.
+     DagVertex { data: Vec<u8> },
+-    /// A serialized block proposal.
+-    BlockProposal { data: Vec<u8> },
+-    /// A vote for a block hash.
+-    Vote { block_hash: [u8; 32], signature: Vec<u8> },
++    /// A block proposal for one consensus view.
++    ///
++    /// `data` is the canonical block encoding; `view` lets a driver reject a
++    /// proposal that is not the next view before it spends time decoding.
++    BlockProposal { view: u64, data: Vec<u8> },
++    /// One validator's vote for a block in a view.
++    ///
++    /// `validator` is the 20-byte address the signature belongs to. Without it a
++    /// receiver cannot tell which registered key to verify against, and `view`
++    /// binds the vote to one proposal.
++    Vote { view: u64, validator: [u8; 20], block_hash: [u8; 32], signature: Vec<u8> },
++    /// A committed block and its independently verifiable quorum certificate.
++    BlockCommit { view: u64, data: Vec<u8>, signatures: Vec<([u8; 20], Vec<u8>)> },
+ }
+ 
+ impl NetworkMessage {
+@@ -110,7 +119,22 @@ impl NetworkMessage {
+                 data.len()
+             }
+             Self::TransactionFluff { data, .. } => data.len(),
+-            Self::DagVertex { data } | Self::BlockProposal { data } => data.len(),
++            Self::DagVertex { data } | Self::BlockProposal { data, .. } => data.len(),
++            Self::BlockCommit { data, signatures, .. } => {
++                if data.is_empty() || signatures.is_empty() {
++                    return Err(NetworkError::InvalidMessage("empty block or certificate".into()));
++                }
++                signatures.iter().try_fold(data.len(), |size, (_, signature)| {
++                    if signature.len() != 96 {
++                        return Err(NetworkError::InvalidMessage(
++                            "malformed certificate signature".into(),
++                        ));
++                    }
++                    size.checked_add(20 + signature.len()).ok_or_else(|| {
++                        NetworkError::InvalidMessage("certificate size overflow".into())
++                    })
++                })?
++            }
+             Self::Vote { signature, .. } => signature.len(),
+         };
+         if payload_len == 0 {
+@@ -407,11 +431,23 @@ mod tests {
+         assert_eq!(bootstrap[0].to_string(), "/ip4/10.0.0.1/tcp/30333");
+     }
+ 
++    #[test]
++    fn certificate_messages_require_a_bounded_nonempty_signature_list() {
++        for (data, signatures) in [
++            (Vec::new(), vec![([1; 20], vec![2; 96])]),
++            (vec![1], Vec::new()),
++            (vec![1], vec![([1; 20], vec![2; 95])]),
++            (vec![1; MAX_TRANSMIT_BYTES], vec![([1; 20], vec![2; 96])]),
++        ] {
++            assert!(NetworkMessage::BlockCommit { view: 1, data, signatures }.validate().is_err());
++        }
++    }
++
+     #[test]
+     fn message_validation_rejects_empty_oversized_and_exhausted_payloads() {
+         assert!(NetworkMessage::DagVertex { data: vec![1] }.validate().is_ok());
+         assert!(NetworkMessage::DagVertex { data: Vec::new() }.validate().is_err());
+-        assert!(NetworkMessage::BlockProposal { data: vec![0; MAX_TRANSMIT_BYTES + 1] }
++        assert!(NetworkMessage::BlockProposal { view: 1, data: vec![0; MAX_TRANSMIT_BYTES + 1] }
+             .validate()
+             .is_err());
+ 
+@@ -424,9 +460,14 @@ mod tests {
+         assert!(NetworkMessage::TransactionFluff { tx_hash: [0; 32], data: vec![1] }
+             .validate()
+             .is_ok());
+-        assert!(NetworkMessage::Vote { block_hash: [0; 32], signature: Vec::new() }
+-            .validate()
+-            .is_err());
++        assert!(NetworkMessage::Vote {
++            view: 1,
++            validator: [2; 20],
++            block_hash: [0; 32],
++            signature: Vec::new()
++        }
++        .validate()
++        .is_err());
+     }
+ 
+     #[test]
+@@ -435,8 +476,18 @@ mod tests {
+             NetworkMessage::TransactionStem { data: vec![1, 2], ttl: 4 },
+             NetworkMessage::TransactionFluff { tx_hash: [7; 32], data: vec![3] },
+             NetworkMessage::DagVertex { data: vec![4] },
+-            NetworkMessage::BlockProposal { data: vec![5] },
+-            NetworkMessage::Vote { block_hash: [9; 32], signature: vec![6] },
++            NetworkMessage::BlockCommit {
++                view: 4,
++                data: vec![5],
++                signatures: vec![([8; 20], vec![6; 96])],
++            },
++            NetworkMessage::BlockProposal { view: 4, data: vec![5] },
++            NetworkMessage::Vote {
++                view: 4,
++                validator: [8; 20],
++                block_hash: [9; 32],
++                signature: vec![6],
++            },
+         ];
+         for message in messages {
+             let encoded = serde_json::to_vec(&message).unwrap();
+@@ -482,7 +533,7 @@ mod tests {
+             NetworkManager::new(NetworkConfig { enable_mdns: false, ..Default::default() })
+                 .unwrap();
+ 
+-        let message = NetworkMessage::BlockProposal { data: vec![1, 2, 3] };
++        let message = NetworkMessage::BlockProposal { view: 1, data: vec![1, 2, 3] };
+         manager.handle_gossip(&serde_json::to_vec(&message).unwrap());
+         assert_eq!(handle.inbound.recv().await, Some(message));
+ 
+diff --git a/crates/subhost-node/src/lib.rs b/crates/subhost-node/src/lib.rs
+index b3f9476..31c1325 100644
+--- a/crates/subhost-node/src/lib.rs
++++ b/crates/subhost-node/src/lib.rs
+@@ -15,8 +15,12 @@ use std::collections::BTreeMap;
+ use std::io::Write;
+ use std::net::SocketAddr;
+ use std::path::{Path, PathBuf};
+-use subhost_consensus::ValidatorRegistry;
+-use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, GenesisConfig};
++use std::sync::{Arc, Mutex};
++use subhost_consensus::{
++    driver::{BlockProposal as DriverProposal, ConsensusDriver, Vote, VoteOutcome},
++    ConsensusConfig, QuorumCertificate, ValidatorRegistry,
++};
++use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, GenesisConfig, Hash};
+ use subhost_crypto::{BLSScheme, PrivateKey};
+ use subhost_metrics::{Metrics, MetricsConfig};
+ use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessage};
+@@ -99,6 +103,8 @@ pub struct Node {
+     metrics: Metrics,
+     config: NodeConfig,
+     genesis: Option<GenesisConfig>,
++    /// A driver for every node with a validator set. Observers verify without voting.
++    consensus: Option<Arc<Mutex<ConsensusDriver>>>,
+ }
+ 
+ impl Node {
+@@ -135,15 +141,18 @@ impl Node {
+             _ => None,
+         };
+ 
++        let mut producer_identity = None;
+         let authority = match (config.producer_key_path(), validators.as_ref()) {
+             (None, _) => None,
+             (Some(path), Some(validators)) => {
+                 let (producer, secret) = load_producer(&path, genesis.as_ref())?;
+                 info!(path = %path.display(), %producer, "loaded the producer key");
++                producer_identity = Some((producer, secret.clone()));
+                 Some(BlockAuthority::new(validators.clone(), producer, secret)?)
+             }
+             (Some(path), None) => return Err(NodeError::NoValidatorSetForProducer(path)),
+         };
++        let driver_registry = validators.clone();
+ 
+         let store = LedgerStore::open(chain_id, &config.data_dir)?;
+         let fresh = !store.exists();
+@@ -176,11 +185,27 @@ impl Node {
+             );
+         }
+ 
++        let consensus = match (driver_registry, producer_identity) {
++            (Some(registry), identity) => {
++                let consensus_config = ConsensusConfig::new(registry.len())?;
++                let height = state.block_height();
++                let tip = state.tip_hash();
++                Some(Arc::new(Mutex::new(ConsensusDriver::with_tip(
++                    consensus_config,
++                    registry,
++                    identity,
++                    height,
++                    tip,
++                )?)))
++            }
++            _ => None,
++        };
++
+         let metrics = Metrics::new()?;
+         metrics.set_block_height(state.block_height());
+         metrics.set_pending_transactions(state.pending_count());
+ 
+-        Ok(Self { state, metrics, config, genesis })
++        Ok(Self { state, metrics, config, genesis, consensus })
+     }
+ 
+     pub fn state(&self) -> &RpcState {
+@@ -199,6 +224,11 @@ impl Node {
+         self.genesis.as_ref()
+     }
+ 
++    /// The consensus driver, when genesis declares a validator set.
++    pub fn consensus(&self) -> Option<&Arc<Mutex<ConsensusDriver>>> {
++        self.consensus.as_ref()
++    }
++
+     pub fn chain_id(&self) -> ChainId {
+         self.state.chain_id()
+     }
+@@ -238,14 +268,31 @@ impl Node {
+             })
+         };
+ 
+-        let network_task = self.config.network.clone().map(|config| {
+-            let state = self.state.clone();
+-            tokio::spawn(async move {
+-                if let Err(error) = run_network(state, config).await {
+-                    warn!(%error, "peer gossip stopped");
+-                }
+-            })
+-        });
++        let network_task = match (self.config.network.clone(), self.consensus.clone()) {
++            (Some(config), Some(driver)) => {
++                let state = self.state.clone();
++                Some(tokio::spawn(async move {
++                    if let Err(error) = run_network_with_driver(state, config, driver).await {
++                        warn!(%error, "peer gossip stopped");
++                    }
++                }))
++            }
++            (Some(config), None) => {
++                let state = self.state.clone();
++                Some(tokio::spawn(async move {
++                    if let Err(error) = run_network(state, config).await {
++                        warn!(%error, "peer gossip stopped");
++                    }
++                }))
++            }
++            // A validator without peers still has to produce, so the driver runs
++            // even when gossip is disabled.
++            (None, Some(driver)) => {
++                let state = self.state.clone();
++                Some(tokio::spawn(produce_blocks(state, Some(driver), None)))
++            }
++            (None, None) => None,
++        };
+ 
+         let rpc = RpcServer::new(self.state.clone());
+         let result = tokio::select! {
+@@ -341,6 +388,23 @@ fn decode_block(data: &[u8]) -> Result<Block, bincode::Error> {
+ /// The swarm and the application loop live in one task, so aborting the task
+ /// stops both. Nothing is spawned here that could outlive the node.
+ async fn run_network(state: RpcState, config: NetworkConfig) -> Result<(), NodeError> {
++    run_network_inner(state, config, None).await
++}
++
++/// Gossip plus block production for a node that holds a consensus driver.
++async fn run_network_with_driver(
++    state: RpcState,
++    config: NetworkConfig,
++    driver: Arc<Mutex<ConsensusDriver>>,
++) -> Result<(), NodeError> {
++    run_network_inner(state, config, Some(driver)).await
++}
++
++async fn run_network_inner(
++    state: RpcState,
++    config: NetworkConfig,
++    driver: Option<Arc<Mutex<ConsensusDriver>>>,
++) -> Result<(), NodeError> {
+     let (manager, handle) = NetworkManager::new(config)?;
+     let local_peer_id = handle.local_peer_id;
+     let NetworkHandle { outbound, mut inbound, .. } = handle;
+@@ -356,12 +420,182 @@ async fn run_network(state: RpcState, config: NetworkConfig) -> Result<(), NodeE
+             }
+             Ok(())
+         }
+-        () = pump_gossip(&state, &outbound, &mut inbound, &mut block_events, &mut buffer) => {
++        () = pump_gossip(&state, &outbound, &mut inbound, &mut block_events, &mut buffer, driver.as_ref()) => {
++            Ok(())
++        }
++        () = produce_blocks(state.clone(), driver.clone(), Some(outbound.clone())) => {
+             Ok(())
+         }
+     }
+ }
+ 
++/// One proposal ready to broadcast, possibly from an observer.
++struct ProducedRound {
++    proposal: DriverProposal,
++    vote: Option<Vote>,
++}
++
++/// Commit a certified candidate before advancing the live consensus driver.
++/// Valid votes stay in the live tally on I/O failure, so the ticker can retry.
++fn commit_ready(state: &RpcState, driver: &mut ConsensusDriver) -> Result<(), NodeError> {
++    let Some(qc) = driver.pending_qc() else { return Ok(()) };
++    let block = driver.open_proposal().expect("pending QC requires a proposal").block.clone();
++    let mut candidate = driver.clone();
++    if !matches!(candidate.commit_open_proposal()?, VoteOutcome::Committed { .. }) {
++        return Ok(());
++    }
++    state.commit_qc(block, &qc)?;
++    *driver = candidate;
++    Ok(())
++}
++
++/// Build a proposal or retry a pending certificate without committing alone.
++fn produce_once(
++    state: &RpcState,
++    driver: &mut ConsensusDriver,
++) -> Result<Option<ProducedRound>, NodeError> {
++    if driver.open_proposal().is_none() && driver.is_validator() {
++        if let Some(block) = state.build_block()? {
++            driver.propose(block)?;
++        }
++    }
++    let round = driver
++        .open_proposal()
++        .cloned()
++        .map(|proposal| ProducedRound { proposal, vote: driver.own_vote().cloned() });
++    commit_ready(state, driver)?;
++    Ok(round)
++}
++
++fn vote_message(vote: &Vote) -> NetworkMessage {
++    NetworkMessage::Vote {
++        view: vote.view,
++        validator: *vote.validator.as_bytes(),
++        block_hash: *vote.block_hash.as_bytes(),
++        signature: vote.signature.clone(),
++    }
++}
++
++fn relay(outbound: &tokio::sync::mpsc::Sender<NetworkMessage>, message: NetworkMessage) {
++    if outbound.try_send(message).is_err() {
++        debug!("outbound gossip queue is full; consensus message was not relayed");
++    }
++}
++
++/// Validate inbound consensus traffic before voting or publishing it.
++fn handle_consensus_message(
++    state: &RpcState,
++    driver: &mut ConsensusDriver,
++    message: NetworkMessage,
++) -> Result<Option<Vote>, NodeError> {
++    match message {
++        NetworkMessage::BlockProposal { view, data } => {
++            let block = decode_block(&data)
++                .map_err(|error| subhost_rpc::RpcError::BlockRejected(error.to_string()))?;
++            if block.header.height <= driver.height() {
++                return Ok(None);
++            }
++            state.validate_proposal(&block)?;
++            let vote = driver.observe_proposal(DriverProposal { view, block })?;
++            commit_ready(state, driver)?;
++            Ok(vote)
++        }
++        NetworkMessage::Vote { view, validator, block_hash, signature } => {
++            let vote = Vote {
++                view,
++                validator: Address::new(validator),
++                block_hash: Hash::new(block_hash),
++                signature,
++            };
++            let fresh = driver.record_vote(vote.clone())?;
++            commit_ready(state, driver)?;
++            Ok(fresh.then_some(vote))
++        }
++        NetworkMessage::BlockCommit { view, data, signatures } => {
++            let block = decode_block(&data)
++                .map_err(|error| subhost_rpc::RpcError::BlockRejected(error.to_string()))?;
++            if block.header.height <= driver.height() {
++                return Ok(None);
++            }
++            let qc = QuorumCertificate {
++                view,
++                block_hash: block.hash(),
++                signatures: signatures
++                    .into_iter()
++                    .map(|(address, signature)| (Address::new(address), signature))
++                    .collect(),
++            };
++            let mut candidate = driver.clone();
++            candidate.receive_commit(block.clone(), qc.clone())?;
++            state.commit_qc(block, &qc)?;
++            *driver = candidate;
++            Ok(None)
++        }
++        _ => Ok(None),
++    }
++}
++
++/// Retry proposal/vote/commit dissemination as peers join the mesh.
++async fn produce_blocks(
++    state: RpcState,
++    driver: Option<Arc<Mutex<ConsensusDriver>>>,
++    outbound: Option<tokio::sync::mpsc::Sender<NetworkMessage>>,
++) {
++    let Some(driver) = driver else {
++        std::future::pending::<()>().await;
++        return;
++    };
++    let block_time = std::time::Duration::from_millis(subhost_core::DEFAULT_BLOCK_TIME_MS.max(100));
++    let mut ticker = tokio::time::interval(block_time);
++    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
++    loop {
++        ticker.tick().await;
++        let result = {
++            let Ok(mut driver) = driver.lock() else {
++                warn!("consensus lock poisoned; stopping producer");
++                return;
++            };
++            produce_once(&state, &mut driver).map(|round| {
++                (round, driver.committed_qc().cloned().zip(state.block_at_height(driver.height())))
++            })
++        };
++        let (round, committed) = match result {
++            Ok(result) => result,
++            Err(error) => {
++                warn!(%error, "consensus round failed");
++                continue;
++            }
++        };
++        let Some(outbound) = &outbound else { continue };
++        if let Some(round) = round {
++            relay(
++                outbound,
++                NetworkMessage::BlockProposal {
++                    view: round.proposal.view,
++                    data: encode_block(&round.proposal.block),
++                },
++            );
++            if let Some(vote) = round.vote {
++                relay(outbound, vote_message(&vote));
++            }
++        }
++        if let Some((qc, block)) = committed {
++            relay(
++                outbound,
++                NetworkMessage::BlockCommit {
++                    view: qc.view,
++                    data: encode_block(&block),
++                    signatures: qc
++                        .signatures
++                        .into_iter()
++                        .map(|(address, signature)| (*address.as_bytes(), signature))
++                        .collect(),
++                },
++            );
++        }
++    }
++}
++
+ /// Apply inbound blocks and relay locally sealed ones.
+ async fn pump_gossip(
+     state: &RpcState,
+@@ -369,18 +603,32 @@ async fn pump_gossip(
+     inbound: &mut tokio::sync::mpsc::Receiver<NetworkMessage>,
+     block_events: &mut tokio::sync::broadcast::Receiver<BlockEvent>,
+     buffer: &mut BlockBuffer,
++    driver: Option<&Arc<Mutex<ConsensusDriver>>>,
+ ) {
+     loop {
+         tokio::select! {
+             message = inbound.recv() => match message {
+-                Some(NetworkMessage::BlockProposal { data }) => match decode_block(&data) {
+-                    Ok(block) => {
+-                        buffer.offer(block, state.block_height().saturating_add(1));
+-                        debug!(buffered = buffer.len(), "evaluating a peer block");
+-                        apply_buffered(state, buffer);
++                Some(message) if driver.is_some() => {
++                    let Some(driver) = driver else { continue };
++                    let result = match driver.lock() {
++                        Ok(mut driver) => handle_consensus_message(state, &mut driver, message),
++                        Err(_) => { warn!("consensus lock poisoned; stopping gossip application"); return; }
++                    };
++                    match result {
++                        Ok(Some(vote)) => relay(outbound, vote_message(&vote)),
++                        Ok(None) => {},
++                        Err(error) => debug!(%error, "discarding invalid consensus traffic"),
+                     }
+-                    Err(error) => debug!(%error, "discarding an undecodable peer block"),
+-                },
++                }
++                Some(NetworkMessage::BlockProposal { view: 0, data }) if !state.has_validator_set() => {
++                    match decode_block(&data) {
++                        Ok(block) => {
++                            buffer.offer(block, state.block_height().saturating_add(1));
++                            apply_buffered(state, buffer);
++                        }
++                        Err(error) => debug!(%error, "discarding an undecodable peer block"),
++                    }
++                }
+                 // Other flows exist on the wire but are not driven here.
+                 Some(_) => {}
+                 None => break,
+@@ -389,7 +637,10 @@ async fn pump_gossip(
+                 // Only relay blocks this node produced; a received block already
+                 // reached every peer through gossip.
+                 Ok(BlockEvent::Sealed(block)) => {
+-                    let message = NetworkMessage::BlockProposal { data: encode_block(&block) };
++                    // Legacy single-writer blocks have no consensus view; the
++                    // receiver only decodes the block payload.
++                    let message =
++                        NetworkMessage::BlockProposal { view: 0, data: encode_block(&block) };
+                     if outbound.try_send(message).is_err() {
+                         debug!("outbound gossip queue is full; a block was not relayed");
+                     }
+@@ -716,6 +967,16 @@ mod tests {
+         let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+         node.state().seed_accounts([(sender, 1_000_000)]).unwrap();
+         node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
++        assert_eq!(
++            node.state().block_height(),
++            0,
++            "under consensus the RPC submission only admits; the producer commits"
++        );
++
++        let driver = node.consensus().expect("a validator node must own a driver");
++        let mut driver = driver.lock().unwrap();
++        assert!(produce_once(node.state(), &mut driver).unwrap().is_some());
++        drop(driver);
+ 
+         let block = node.state().block_at_height(1).unwrap();
+         assert_eq!(
+@@ -725,6 +986,280 @@ mod tests {
+         assert_eq!(block.signatures.len(), 1);
+     }
+ 
++    fn validator_nodes(count: u8) -> (Vec<tempfile::TempDir>, Vec<Node>) {
++        let tx_key = signing_key(7);
++        let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
++        let keys: Vec<_> = (0..count).map(|_| BLSScheme::keygen().0).collect();
++        let mut genesis = genesis_with(1, Some((sender, 1_000_000)));
++        genesis.initial_validators = keys
++            .iter()
++            .enumerate()
++            .map(|(index, secret)| ValidatorInfo {
++                address: Address::new([index as u8 + 1; 20]),
++                public_key: BLSScheme::encode_public_key(&BLSScheme::public_key(secret)),
++                power: 100,
++                proof_of_possession: BLSScheme::encode_signature(&BLSScheme::proof_of_possession(
++                    secret,
++                )),
++            })
++            .collect();
++        let dirs: Vec<_> = keys
++            .iter()
++            .map(|secret| {
++                let dir = tempfile::tempdir().unwrap();
++                genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
++                write_test_producer_key(dir.path(), secret);
++                dir
++            })
++            .collect();
++        let nodes = dirs
++            .iter()
++            .map(|dir| {
++                Node::bootstrap(NodeConfig { validator: true, ..NodeConfig::new(dir.path()) })
++                    .unwrap()
++            })
++            .collect();
++        (dirs, nodes)
++    }
++
++    #[test]
++    fn four_validator_nodes_require_three_votes_before_a_ledger_write() {
++        for voting_nodes in [4, 3, 2] {
++            let (dirs, nodes) = validator_nodes(4);
++            let manifests: Vec<_> = dirs
++                .iter()
++                .map(|dir| {
++                    std::fs::read(
++                        dir.path()
++                            .join(subhost_storage::LEDGER_DIR_NAME)
++                            .join(subhost_storage::MANIFEST_FILE_NAME),
++                    )
++                    .unwrap()
++                })
++                .collect();
++            let tx = signed_transfer(&signing_key(7), 0, 10);
++            let hash = nodes[0].state().submit_transaction(tx).unwrap();
++            let round =
++                produce_once(nodes[0].state(), &mut nodes[0].consensus().unwrap().lock().unwrap())
++                    .unwrap()
++                    .unwrap();
++            let mut votes = vec![round.vote.unwrap()];
++            for node in &nodes[1..voting_nodes] {
++                let vote = handle_consensus_message(
++                    node.state(),
++                    &mut node.consensus().unwrap().lock().unwrap(),
++                    NetworkMessage::BlockProposal {
++                        view: round.proposal.view,
++                        data: encode_block(&round.proposal.block),
++                    },
++                )
++                .unwrap()
++                .unwrap();
++                votes.push(vote);
++            }
++            for (index, node) in nodes[..voting_nodes].iter().enumerate() {
++                for vote in &votes {
++                    handle_consensus_message(
++                        node.state(),
++                        &mut node.consensus().unwrap().lock().unwrap(),
++                        vote_message(vote),
++                    )
++                    .unwrap();
++                }
++                let driver = node.consensus().unwrap().lock().unwrap();
++                if voting_nodes >= 3 {
++                    assert_eq!(node.state().block_height(), 1);
++                    assert_eq!(driver.height(), 1);
++                    assert_eq!(driver.tip(), round.proposal.block.hash());
++                    assert!(node.state().receipt(&hash).is_some());
++                    assert_eq!(node.state().balance(&Address::new([2; 20])), 10);
++                } else {
++                    assert_eq!(node.state().block_height(), 0);
++                    assert_eq!(driver.height(), 0);
++                    assert!(node.state().receipt(&hash).is_none());
++                    assert_eq!(node.state().balance(&Address::new([2; 20])), 0);
++                    assert_eq!(
++                        std::fs::read(
++                            dirs[index]
++                                .path()
++                                .join(subhost_storage::LEDGER_DIR_NAME)
++                                .join(subhost_storage::MANIFEST_FILE_NAME)
++                        )
++                        .unwrap(),
++                        manifests[index]
++                    );
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn an_observer_can_commit_a_certified_block_without_a_signing_key() {
++        let (dirs, nodes) = validator_nodes(1);
++        let observer_dir = tempfile::tempdir().unwrap();
++        std::fs::copy(
++            dirs[0].path().join(GENESIS_FILE_NAME),
++            observer_dir.path().join(GENESIS_FILE_NAME),
++        )
++        .unwrap();
++        let observer = Node::bootstrap(NodeConfig::new(observer_dir.path())).unwrap();
++        assert!(!observer.consensus().unwrap().lock().unwrap().is_validator());
++        nodes[0].state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
++        produce_once(nodes[0].state(), &mut nodes[0].consensus().unwrap().lock().unwrap()).unwrap();
++        let qc = nodes[0].consensus().unwrap().lock().unwrap().committed_qc().unwrap().clone();
++        let block = nodes[0].state().block_at_height(1).unwrap();
++        let mut driver = observer.consensus().unwrap().lock().unwrap();
++        let vote = handle_consensus_message(
++            observer.state(),
++            &mut driver,
++            NetworkMessage::BlockProposal { view: 1, data: encode_block(&block) },
++        )
++        .unwrap();
++        assert!(vote.is_none());
++        assert_eq!(observer.state().block_height(), 0);
++        let message = NetworkMessage::BlockCommit {
++            view: qc.view,
++            data: encode_block(&block),
++            signatures: qc
++                .signatures
++                .into_iter()
++                .map(|(address, signature)| (*address.as_bytes(), signature))
++                .collect(),
++        };
++        assert!(handle_consensus_message(observer.state(), &mut driver, message.clone())
++            .unwrap()
++            .is_none());
++        assert_eq!(observer.state().block_height(), 1);
++        assert_eq!(observer.state().tip_hash(), block.hash());
++        handle_consensus_message(observer.state(), &mut driver, message).unwrap();
++        assert_eq!(observer.state().balance(&Address::new([2; 20])), 10);
++    }
++
++    #[test]
++    fn a_failed_quorum_write_keeps_the_tip_and_retries_the_certificate() {
++        let (dirs, nodes) = validator_nodes(1);
++        let node = &nodes[0];
++        let tx = signed_transfer(&signing_key(7), 0, 10);
++        let hash = node.state().submit_transaction(tx).unwrap();
++        let ledger = dirs[0].path().join(subhost_storage::LEDGER_DIR_NAME);
++        let saved = dirs[0].path().join("saved-ledger");
++        std::fs::rename(&ledger, &saved).unwrap();
++        std::fs::write(&ledger, b"block ledger directory creation").unwrap();
++        let mut driver = node.consensus().unwrap().lock().unwrap();
++        assert!(produce_once(node.state(), &mut driver).is_err());
++        assert_eq!(driver.height(), 0);
++        assert_eq!(node.state().block_height(), 0);
++        assert!(driver.pending_qc().is_some());
++        assert!(node.state().receipt(&hash).is_none());
++        assert_eq!(node.state().pending_count(), 1);
++        let block_hash = driver.open_proposal().unwrap().block.hash();
++        std::fs::remove_file(&ledger).unwrap();
++        std::fs::rename(&saved, &ledger).unwrap();
++        produce_once(node.state(), &mut driver).unwrap();
++        assert_eq!(driver.tip(), block_hash);
++        assert_eq!(node.state().tip_hash(), block_hash);
++        assert_eq!(node.state().pending_count(), 0);
++        assert!(node.state().receipt(&hash).is_some());
++    }
++
++    #[test]
++    fn restarting_a_validator_restores_the_committed_height_and_view() {
++        let (_dirs, nodes) = validator_nodes(1);
++        let node = &nodes[0];
++        node.state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
++        produce_once(node.state(), &mut node.consensus().unwrap().lock().unwrap()).unwrap();
++        let first_hash = node.state().tip_hash();
++        let restarted = Node::bootstrap(node.config().clone()).unwrap();
++        assert_eq!(restarted.consensus().unwrap().lock().unwrap().view(), 1);
++        restarted.state().submit_transaction(signed_transfer(&signing_key(7), 1, 20)).unwrap();
++        produce_once(restarted.state(), &mut restarted.consensus().unwrap().lock().unwrap())
++            .unwrap();
++        assert_eq!(restarted.state().block_height(), 2);
++        assert_eq!(restarted.state().block_at_height(2).unwrap().header.parent_hash, first_hash);
++    }
++
++    #[test]
++    fn invalid_or_unseen_consensus_traffic_cannot_trigger_a_vote() {
++        let (_dirs, nodes) = validator_nodes(2);
++        nodes[0].state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
++        let round =
++            produce_once(nodes[0].state(), &mut nodes[0].consensus().unwrap().lock().unwrap())
++                .unwrap()
++                .unwrap();
++        let follower = &nodes[1];
++        let mut driver = follower.consensus().unwrap().lock().unwrap();
++        assert!(handle_consensus_message(
++            follower.state(),
++            &mut driver,
++            vote_message(round.vote.as_ref().unwrap())
++        )
++        .is_err());
++        let mut tampered = round.proposal.block.clone();
++        tampered.transactions[0].value += 1;
++        assert!(handle_consensus_message(
++            follower.state(),
++            &mut driver,
++            NetworkMessage::BlockProposal { view: 1, data: encode_block(&tampered) }
++        )
++        .is_err());
++        assert_eq!(driver.view(), 0);
++        assert!(driver.open_proposal().is_none());
++        let mut malformed = round.vote.unwrap();
++        malformed.signature = vec![0xff; 96];
++        handle_consensus_message(
++            follower.state(),
++            &mut driver,
++            NetworkMessage::BlockProposal { view: 1, data: encode_block(&round.proposal.block) },
++        )
++        .unwrap();
++        assert!(handle_consensus_message(follower.state(), &mut driver, vote_message(&malformed))
++            .is_err());
++        assert_eq!(follower.state().block_height(), 0);
++        assert!(driver.pending_qc().is_none());
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn two_validators_commit_over_real_loopback_gossip() {
++        let (_dirs, nodes) = validator_nodes(2);
++        let (first_port, second_port) = two_free_loopback_ports();
++        let first_task = tokio::spawn(run_network_with_driver(
++            nodes[0].state().clone(),
++            NetworkConfig {
++                listen_addr: format!("/ip4/127.0.0.1/tcp/{first_port}"),
++                enable_mdns: false,
++                ..Default::default()
++            },
++            nodes[0].consensus().unwrap().clone(),
++        ));
++        wait_until_listening(first_port).await;
++        let second_task = tokio::spawn(run_network_with_driver(
++            nodes[1].state().clone(),
++            NetworkConfig {
++                listen_addr: format!("/ip4/127.0.0.1/tcp/{second_port}"),
++                enable_mdns: false,
++                bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/{first_port}")],
++                ..Default::default()
++            },
++            nodes[1].consensus().unwrap().clone(),
++        ));
++        let hash =
++            nodes[0].state().submit_transaction(signed_transfer(&signing_key(7), 0, 10)).unwrap();
++        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
++            while nodes.iter().any(|node| node.state().block_height() != 1) {
++                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
++            }
++        })
++        .await;
++        first_task.abort();
++        second_task.abort();
++        assert!(result.is_ok(), "both validators must commit after gossip quorum");
++        assert_eq!(nodes[0].state().tip_hash(), nodes[1].state().tip_hash());
++        assert_eq!(nodes[0].state().state_root(), nodes[1].state().state_root());
++        for node in &nodes {
++            assert!(node.state().receipt(&hash).is_some());
++        }
++    }
++
+     #[test]
+     fn validator_mode_without_a_producer_key_is_refused() {
+         let dir = tempfile::tempdir().unwrap();
+@@ -818,15 +1353,15 @@ mod tests {
+         let address = genesis.initial_validators[0].address;
+         let producer = RpcState::in_memory(1)
+             .unwrap()
+-            .with_authority(BlockAuthority::new(registry, address, secret).unwrap());
++            .with_authority(BlockAuthority::new(registry, address, secret.clone()).unwrap());
+ 
+         let tx_key = signing_key(7);
+         let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+         producer.seed_accounts([(sender, 1_000_000)]).unwrap();
+         producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
++        let block = producer.build_block().unwrap().unwrap();
+         node.state().seed_accounts([(sender, 1_000_000)]).unwrap();
+ 
+-        let block = producer.block_at_height(1).unwrap();
+         let mut unsigned = block.clone();
+         unsigned.signatures.clear();
+         assert!(matches!(
+@@ -835,7 +1370,18 @@ mod tests {
+         ));
+         assert_eq!(node.state().block_height(), 0);
+ 
+-        node.state().accept_block(block).unwrap();
++        let qc = QuorumCertificate {
++            view: 1,
++            block_hash: block.hash(),
++            signatures: vec![(
++                address,
++                BLSScheme::encode_signature(&BLSScheme::sign(
++                    &secret,
++                    &QuorumCertificate::payload_for(1, &block.hash()),
++                )),
++            )],
++        };
++        node.state().commit_qc(block, &qc).unwrap();
+         assert_eq!(node.state().block_height(), 1);
+         assert_eq!(node.state().balance(&Address::new([2; 20])), 10);
+     }
+@@ -1077,7 +1623,7 @@ mod tests {
+             // Newest first: the follower must buffer height 2 until height 1
+             // arrives, then apply both.
+             for block in [&second, &first] {
+-                let message = NetworkMessage::BlockProposal { data: encode_block(block) };
++                let message = NetworkMessage::BlockProposal { view: 0, data: encode_block(block) };
+                 if handle.outbound.send(message).await.is_err() {
+                     break;
+                 }
+diff --git a/crates/subhost-rpc/src/block.rs b/crates/subhost-rpc/src/block.rs
+index 7c5083f..223d8dc 100644
+--- a/crates/subhost-rpc/src/block.rs
++++ b/crates/subhost-rpc/src/block.rs
+@@ -3,7 +3,7 @@
+ use crate::state::{lock, read, write, BlockEvent, RpcError, RpcState};
+ use std::collections::{HashMap, HashSet};
+ use std::sync::atomic::Ordering;
+-use subhost_consensus::ValidatorRegistry;
++use subhost_consensus::{ConsensusConfig, HotStuff, QuorumCertificate, ValidatorRegistry};
+ use subhost_core::{
+     tx_root_of, Address, Block, BlockHeader, Gas, Hash, Receipt, ReceiptStatus, Transaction,
+     ValidatorSignature, BLOCK_GAS_LIMIT,
+@@ -52,6 +52,13 @@ impl BlockAuthority {
+     }
+ }
+ 
++/// A block built against a candidate state, before any commit.
++struct BuiltCandidate {
++    block: Block,
++    /// State after the block's transactions were applied.
++    state: State,
++}
++
+ impl RpcState {
+     /// Submit a transaction: admit it to a copy of the pool, then seal the next
+     /// block with every pending transaction that is currently executable.
+@@ -74,6 +81,23 @@ impl RpcState {
+         }
+         debug_assert_eq!(admission.hash, requested_hash);
+ 
++        // With a validator set configured, this node does not commit on the RPC
++        // thread: the producer proposes the block and it commits only after a
++        // quorum. Dry-run the build so an unexecutable transaction is still
++        // rejected here, then leave it for the producer.
++        if self.validators.is_some() {
++            let executable = self.build_candidate(&candidate_pool)?.is_some_and(|candidate| {
++                candidate.block.transactions.iter().any(|tx| tx.hash() == requested_hash)
++            });
++            if !executable {
++                return Err(RpcError::TransactionRejected(
++                    "transaction is not executable against the current state".into(),
++                ));
++            }
++            *write(&self.mempool) = candidate_pool;
++            return Ok(requested_hash);
++        }
++
+         let receipts = self.seal_block(&mut candidate_pool)?;
+         if !receipts.contains_key(&requested_hash) {
+             return Err(RpcError::TransactionRejected(
+@@ -89,6 +113,11 @@ impl RpcState {
+     /// block's executable transactions.
+     pub fn include_transaction(&self, tx_hash: &Hash) -> Result<Receipt, RpcError> {
+         let _commit_guard = lock(&self.commit_lock);
++        if self.validators.is_some() {
++            return Err(RpcError::TransactionRejected(
++                "direct inclusion is disabled while a validator set is configured; the producer will include the transaction".into(),
++            ));
++        }
+         let mut candidate_pool = read(&self.mempool).clone();
+         if !candidate_pool.contains(tx_hash) {
+             return Err(RpcError::InvalidTxHash);
+@@ -129,16 +158,30 @@ impl RpcState {
+         selected
+     }
+ 
+-    /// Seal every executable pending transaction into one block.
++    /// The next block this producer would seal, without committing it.
+     ///
+-    /// On success the pool has the mined transactions removed and every other
+-    /// in-memory view has been swapped; on error nothing is published. The caller
+-    /// installs the mutated pool only after this returns `Ok`.
+-    fn seal_block(&self, pool: &mut Mempool) -> Result<HashMap<Hash, Receipt>, RpcError> {
++    /// The block is built and signed against a snapshot of the current state,
++    /// but nothing is persisted, the mempool is untouched, and no event is
++    /// emitted. A consensus producer hands this block to the driver and commits
++    /// it through [`RpcState::commit_qc`] only after a quorum certifies it.
++    ///
++    /// Returns `None` when no pending transaction is executable.
++    pub fn build_block(&self) -> Result<Option<Block>, RpcError> {
++        let _commit_guard = lock(&self.commit_lock);
++        let pool = read(&self.mempool).clone();
++        Ok(self.build_candidate(&pool)?.map(|candidate| candidate.block))
++    }
++
++    /// Build the next block from `pool` and the state it would produce.
++    ///
++    /// The caller must hold the commit lock. `seal_block` uses the returned
++    /// state to persist the commit; `build_block` throws it away because a
++    /// proposal is not a commit.
++    fn build_candidate(&self, pool: &Mempool) -> Result<Option<BuiltCandidate>, RpcError> {
+         let mut candidate_state = read(&self.state).clone();
+         let transactions = self.select_transactions(pool, &mut candidate_state);
+         if transactions.is_empty() {
+-            return Ok(HashMap::new());
++            return Ok(None);
+         }
+ 
+         let previous_block = read(&self.blocks).last().cloned();
+@@ -197,7 +240,22 @@ impl RpcState {
+             block
+         };
+ 
++        Ok(Some(BuiltCandidate { block, state: candidate_state }))
++    }
++
++    /// Seal every executable pending transaction into one block.
++    ///
++    /// On success the pool has the mined transactions removed and every other
++    /// in-memory view has been swapped; on error nothing is published. The caller
++    /// installs the mutated pool only after this returns `Ok`.
++    fn seal_block(&self, pool: &mut Mempool) -> Result<HashMap<Hash, Receipt>, RpcError> {
++        let Some(BuiltCandidate { block, state: candidate_state }) = self.build_candidate(pool)?
++        else {
++            return Ok(HashMap::new());
++        };
++
+         let block_hash = block.hash();
++        let height = block.header.height;
+         let mut receipts = HashMap::with_capacity(block.transactions.len());
+         let mut cumulative_gas_used: Gas = 0;
+         for (index, tx) in block.transactions.iter().enumerate() {
+@@ -277,6 +335,47 @@ impl RpcState {
+     /// Receipts are derived locally and never taken from the wire.
+     pub fn accept_block(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
+         let _commit_guard = lock(&self.commit_lock);
++        self.verify_block_authority(&block)?;
++        if self.validators.is_some() {
++            return Err(RpcError::BlockRejected(
++                "validator blocks require a quorum certificate".into(),
++            ));
++        }
++        self.accept_validated(block)
++    }
++
++    /// Validate a proposal against the current tip without writing any state.
++    pub fn validate_proposal(&self, block: &Block) -> Result<(), RpcError> {
++        let _commit_guard = lock(&self.commit_lock);
++        self.validate_candidate(block).map(|_| ())
++    }
++
++    /// Persist a block only after its quorum certificate and state transition verify.
++    pub fn commit_qc(
++        &self,
++        block: Block,
++        qc: &QuorumCertificate,
++    ) -> Result<Vec<Receipt>, RpcError> {
++        let _commit_guard = lock(&self.commit_lock);
++        let validators = self.validators.as_ref().ok_or_else(|| {
++            RpcError::BlockRejected("a quorum commit requires a validator registry".into())
++        })?;
++        // With no view changes yet, the linear driver's view equals block height.
++        if qc.block_hash != block.hash() || qc.view != block.header.height {
++            return Err(RpcError::BlockRejected(
++                "certificate does not match the block and view".into(),
++            ));
++        }
++        let config = ConsensusConfig::new(validators.len())
++            .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
++        HotStuff::new(config, (**validators).clone())
++            .validate_qc(qc)
++            .map_err(|error| RpcError::BlockRejected(error.to_string()))?;
++        self.accept_validated(block)
++    }
++
++    /// Validate before persistence; caller holds the commit lock.
++    fn validate_candidate(&self, block: &Block) -> Result<State, RpcError> {
+         let previous = read(&self.blocks).last().cloned();
+         let expected_height = match previous.as_ref() {
+             Some(previous) => previous.header.height.checked_add(1).ok_or(RpcError::Internal)?,
+@@ -343,6 +442,12 @@ impl RpcState {
+             )));
+         }
+ 
++        Ok(candidate_state)
++    }
++
++    /// Apply a validated block under the caller's commit lock.
++    fn accept_validated(&self, block: Block) -> Result<Vec<Receipt>, RpcError> {
++        let candidate_state = self.validate_candidate(&block)?;
+         let block_hash = block.hash();
+         let mut receipts = Vec::with_capacity(block.transactions.len());
+         let mut cumulative_gas_used: Gas = 0;
+@@ -437,6 +542,22 @@ mod tests {
+         registry
+     }
+ 
++    fn certificate(block: &Block, signers: &[(Address, &PrivateKey)]) -> QuorumCertificate {
++        let view = block.header.height;
++        let block_hash = block.hash();
++        let payload = QuorumCertificate::payload_for(view, &block_hash);
++        QuorumCertificate {
++            view,
++            block_hash,
++            signatures: signers
++                .iter()
++                .map(|(address, secret)| {
++                    (*address, BLSScheme::encode_signature(&BLSScheme::sign(secret, &payload)))
++                })
++                .collect(),
++        }
++    }
++
+     #[test]
+     fn authority_signs_the_block_it_produces() {
+         let tx_key = signing_key(7);
+@@ -445,8 +566,7 @@ mod tests {
+         let state = funded_state(&tx_key, 1_000_000).with_authority(authority);
+ 
+         state.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+-
+-        let block = state.block_at_height(1).unwrap();
++        let block = state.build_block().unwrap().unwrap();
+         assert_eq!(block.header.validator, producer);
+         assert_eq!(block.signatures.len(), 1);
+         let signature = &block.signatures[0];
+@@ -499,7 +619,7 @@ mod tests {
+     }
+ 
+     /// A producer and a follower that both know the two-validator registry.
+-    fn signed_block_and_follower() -> (Block, RpcState) {
++    fn signed_block_and_follower() -> (Block, QuorumCertificate, RpcState) {
+         let tx_key = signing_key(7);
+         let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+         let (alice_secret, _) = BLSScheme::keygen();
+@@ -508,22 +628,68 @@ mod tests {
+         let bob = Address::new([10; 20]);
+         let registry = registry(&[(alice, &alice_secret), (bob, &bob_secret)]);
+ 
+-        let producer = funded_state(&tx_key, 1_000_000)
+-            .with_authority(BlockAuthority::new(registry.clone(), alice, alice_secret).unwrap());
++        let producer = funded_state(&tx_key, 1_000_000).with_authority(
++            BlockAuthority::new(registry.clone(), alice, alice_secret.clone()).unwrap(),
++        );
+         producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+-        let block = producer.block_at_height(1).unwrap();
++        let block = producer.build_block().unwrap().unwrap();
++        let qc = certificate(&block, &[(alice, &alice_secret), (bob, &bob_secret)]);
+ 
+         let follower = RpcState::in_memory(1)
+             .unwrap()
+             .with_authority(BlockAuthority::new(registry, bob, bob_secret).unwrap());
+         follower.seed_accounts([(sender, 1_000_000)]).unwrap();
+-        (block, follower)
++        (block, qc, follower)
++    }
++
++    #[test]
++    fn admission_and_proposal_do_not_publish_state_or_bypass_quorum() {
++        let tx_key = signing_key(7);
++        let (secret, _) = BLSScheme::keygen();
++        let (authority, _) = authority(&secret);
++        let state = funded_state(&tx_key, 1_000_000).with_authority(authority);
++        let root = state.state_root();
++        let mut events = state.subscribe_blocks();
++        let hash = state.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
++        let block = state.build_block().unwrap().unwrap();
++        assert_eq!(state.block_height(), 0);
++        assert_eq!(state.state_root(), root);
++        assert!(state.receipt(&hash).is_none());
++        assert_eq!(state.pending_count(), 1);
++        assert!(events.try_recv().is_err());
++        assert!(state.include_transaction(&hash).is_err());
++        assert!(state.accept_block(block).is_err());
++        assert_eq!(state.block_height(), 0);
++    }
++
++    #[test]
++    fn invalid_certificates_leave_balances_receipts_and_height_unchanged() {
++        let (block, qc, follower) = signed_block_and_follower();
++        let mut insufficient = qc.clone();
++        insufficient.signatures.pop();
++        let mut duplicate = qc.clone();
++        duplicate.signatures[1] = duplicate.signatures[0].clone();
++        let mut wrong_hash = qc.clone();
++        wrong_hash.block_hash = Hash::ZERO;
++        let mut wrong_view = qc.clone();
++        wrong_view.view += 1;
++        let mut malformed = qc.clone();
++        malformed.signatures[0].1 = vec![0xff; 96];
++        let root = follower.state_root();
++        for bad in [insufficient, duplicate, wrong_hash, wrong_view, malformed] {
++            assert!(follower.commit_qc(block.clone(), &bad).is_err());
++            assert_eq!(follower.block_height(), 0);
++            assert_eq!(follower.state_root(), root);
++            assert!(follower.receipt(&block.transactions[0].hash()).is_none());
++        }
++        follower.commit_qc(block, &qc).unwrap();
++        assert_eq!(follower.block_height(), 1);
+     }
+ 
+     #[test]
+     fn a_block_with_a_valid_producer_signature_is_accepted() {
+-        let (block, follower) = signed_block_and_follower();
+-        follower.accept_block(block).unwrap();
++        let (block, qc, follower) = signed_block_and_follower();
++        follower.commit_qc(block, &qc).unwrap();
+         assert_eq!(follower.block_height(), 1);
+         assert_eq!(follower.block_count(), 1);
+     }
+@@ -536,14 +702,16 @@ mod tests {
+         let alice = Address::new([9; 20]);
+         let registry = registry(&[(alice, &alice_secret)]);
+ 
+-        let producer = funded_state(&tx_key, 1_000_000)
+-            .with_authority(BlockAuthority::new(registry.clone(), alice, alice_secret).unwrap());
++        let producer = funded_state(&tx_key, 1_000_000).with_authority(
++            BlockAuthority::new(registry.clone(), alice, alice_secret.clone()).unwrap(),
++        );
+         producer.submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+-        let block = producer.block_at_height(1).unwrap();
++        let block = producer.build_block().unwrap().unwrap();
++        let qc = certificate(&block, &[(alice, &alice_secret)]);
+ 
+         let follower = RpcState::in_memory(1).unwrap().with_validators(registry.clone());
+         follower.seed_accounts([(sender, 1_000_000)]).unwrap();
+-        follower.accept_block(block.clone()).unwrap();
++        follower.commit_qc(block.clone(), &qc).unwrap();
+         assert_eq!(follower.block_height(), 1);
+         assert_eq!(follower.balance(&Address::new([2; 20])), 10);
+ 
+@@ -557,7 +725,7 @@ mod tests {
+ 
+     #[test]
+     fn a_block_without_a_valid_producer_signature_is_rejected() {
+-        let (block, follower) = signed_block_and_follower();
++        let (block, _, follower) = signed_block_and_follower();
+ 
+         let mut missing = block.clone();
+         missing.signatures.clear();
+diff --git a/crates/subhost-rpc/src/state.rs b/crates/subhost-rpc/src/state.rs
+index a3450d1..00ed842 100644
+--- a/crates/subhost-rpc/src/state.rs
++++ b/crates/subhost-rpc/src/state.rs
+@@ -201,6 +201,22 @@ impl RpcState {
+         self.block_height.load(Ordering::SeqCst)
+     }
+ 
++    /// Hash of the newest committed block, or [`Hash::ZERO`] at genesis.
++    ///
++    /// A consensus driver needs this to resume after a restart: the next
++    /// proposal must name this hash as its parent.
++    pub fn tip_hash(&self) -> Hash {
++        read(&self.blocks).last().map_or(Hash::ZERO, Block::hash)
++    }
++
++    /// Whether this node checks blocks against a genesis validator set.
++    ///
++    /// The consensus orchestrator uses this to distinguish validator chains
++    /// from development chains without registered block producers.
++    pub fn has_validator_set(&self) -> bool {
++        self.validators.is_some()
++    }
++
+     /// Whether a ledger file already exists on disk.
+     pub fn has_persisted_state(&self) -> bool {
+         self.store.exists()
+diff --git a/docs/architecture.md b/docs/architecture.md
+index 221a62e..74b7a2b 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -14,6 +14,7 @@ A node is one process assembled in `subhost-node`:
+ - `RpcServer` serves the JSON-RPC surface over HTTP and WebSocket, optionally
+   behind a bearer-token and per-connection rate-limit HTTP middleware. Both are
+   off unless the operator configures them.
++- A linear consensus driver for a genesis validator set, verifying `n - f` votes before commit. Observers hold no signing key.
+ - The optional metrics exporter, the optional libp2p gossip task, and a five-second
+   observer that copies block height and pending count into metrics.
+ - `subhost-cli` parses operator flags, writes genesis files, and calls
+@@ -56,8 +57,10 @@ Submission works on a clone of the mempool. `Mempool::admit` enforces, in order:
+   transaction when full and the highest nonce among equal prices, so the remaining
+   per-sender sequence stays contiguous from the bottom.
+ 
+-The live pool is replaced only after the block write succeeds, so a rejected or
+-failed submission leaves admission, replacement, and eviction undone.
++With validators configured, an executable admission replaces the pool and returns
++its hash before a block or receipt exists. The producer builds a proposal and
++waits for quorum. Without validators, the pool is replaced only after the
++synchronous block write succeeds. The mempool remains volatile in both modes.
+ 
+ ### 2.3 Select
+ 
+@@ -70,7 +73,9 @@ until the commit succeeds.
+ 
+ ### 2.4 Execute and seal
+ 
+-`seal_block` produces at most one block per submission:
++`build_block` builds and signs a proposal without writing the ledger, changing
++balances or removing pool entries. Validator nodes use this path; demo chains
++without validators use `seal_block` synchronously on submission. Both forms use:
+ 
+ - height is the tip height plus one, or 1 when the ledger is empty; there is no
+   genesis block;
+@@ -99,13 +104,19 @@ and only then swaps the new state, blocks, and receipts into place and stores th
+ new height. If persistence fails, none of the swaps happen and no block event is
+ emitted.
+ 
+-On success the node removes the mined transactions from the pool, emits
+-`BlockEvent::Sealed`, and the network task relays only locally sealed blocks. A block
+-received from a peer is never relayed again.
++On success the node removes the mined transactions from the pool. Demo sealing
++emits `BlockEvent::Sealed`; QC commits emit `BlockEvent::Accepted`. The validator
++network loop retries proposals, verified votes and the latest certified block.
++A failed QC write keeps the tally ready for retry while both committed tips stay
++unchanged. See [consensus wiring](consensus.md).
+ 
+ ### 2.6 Accept a peer block
+ 
+-`RpcState::accept_block` re-validates a block end to end before touching anything:
++`RpcState::commit_qc` requires a certificate binding the block hash and linear
++view (equal to height), from `n - f` distinct registered validators. Each BLS
++signature verifies over the QC domain. `accept_block` refuses validator blocks
++without a certificate and remains available for demo chains. Both commit paths
++re-validate end to end before touching anything:
+ 
+ 1. it must extend the local tip exactly: height `tip + 1`, parent equal to the tip
+    hash, configured chain ID, the fixed block gas limit, and at least one
+@@ -123,7 +134,7 @@ Any failure rejects the whole block and leaves the ledger unchanged.
+ 
+ ### 2.7 Ordering buffer
+ 
+-Peer blocks that arrive before their parent are buffered by height. A block at or
++On demo chains, peer blocks that arrive before their parent are buffered by height. A block at or
+ below the next expected height is discarded as stale, and anything more than 64
+ blocks ahead of the local tip is refused so a peer cannot force unbounded buffering.
+ The first block seen for a height wins; a duplicate cannot replace it. Whenever the
+@@ -136,7 +147,7 @@ cannot succeed.
+ Today: JSON-RPC is unauthenticated by default, so any client that can reach the
+ port can submit a transaction; with the optional bearer-token policy enabled, only
+ clients with the token can. Any node whose genesis carries a validator set rejects
+-blocks that do not come from one of those validators. On a genesis with no validators,
++blocks that do not come from one of those validators or lack a valid quorum certificate. On a genesis with no validators,
+ the single-node path is unchanged and unsigned blocks are accepted.
+ 
+ - Bootstrap builds a `ValidatorRegistry` from `genesis.initial_validators` on every
+@@ -153,7 +164,7 @@ the single-node path is unchanged and unsigned blocks are accepted.
+ - A node with a `BlockAuthority` sets `header.validator` to the resolved address and
+   attaches exactly one BLS signature over `Block::signing_payload()`. Construction
+   also checks that the secret belongs to the registered public key.
+-- `accept_block` on a node with a registry requires `header.validator` to be
++- Proposal validation and `commit_qc` on a node with a registry require `header.validator` to be
+   registered and exactly one signature from that validator over the payload, checked
+   before the state transition. A missing, extra, foreign, malformed, or stale
+   signature is rejected with `RpcError::UnauthorizedProducer`.
+@@ -276,8 +287,8 @@ What the ledger does not guarantee:
+ | `subhost-mempool` | Admission policy, per-sender ordering, replacement, eviction | Execution, persistence |
+ | `subhost-storage` | On-disk format, atomic write, load validation, receipt and block commitments | Deciding which block to write |
+ | `subhost-rpc` | Block selection, sealing, acceptance, the JSON-RPC surface, submission signature check | Consensus, peer identity, genesis policy |
+-| `subhost-consensus` | Validator registry, votes, quorum certificates, DAG, slashing | Nothing in the node path yet; it is not wired into `subhost-node` |
+-| `subhost-node` | Node assembly, genesis loading, gossip relay, ordering buffer, shutdown | Ledger rules, block validity |
++| `subhost-consensus` | Validator registry, linear quorum driver, votes, certificates, DAG, slashing | Ledger writes, execution, transport |
++| `subhost-node` | Node assembly, genesis loading, consensus/transport orchestration, demo ordering buffer, shutdown | Ledger format, block validity |
+ | `subhost-network` | libp2p transport, framing, message size limits | Message meaning |
+ | `subhost-cli` | Operator flags, genesis file authoring, wallet and transaction commands | Ledger logic |
+ | `subhost-metrics`, `subhost-telemetry` | Counters and gauges; one structured logging setup | State transitions, tracing spans |
+diff --git a/docs/manual-testing.md b/docs/manual-testing.md
+index 6267867..88922d2 100644
+--- a/docs/manual-testing.md
++++ b/docs/manual-testing.md
+@@ -419,4 +419,24 @@ That only removes the `/tmp` directories created above.
+ - `invalid chain ID`: `--chain-id` must match the node.
+ - `cannot reach the node at …`: the node is not running on that port.
+ - `a validator network requires at least one initial validator`: `node
+-  --validator` needs `init --validator`.
+\ No newline at end of file
++  --validator` needs `init --validator`.
++
++## Validator quorum checks (S2)
++
++On a genesis containing validators, a successful submission returns a hash before
++its receipt exists. Poll `eth_getTransactionReceipt` until a QC commits the block;
++`eth_blockNumber` and balances stay unchanged while quorum is absent. Submit to a
++node with its producer key: transaction gossip is not implemented.
++
++For a four-validator set, three distinct valid votes commit; two votes leave the
++ledger unchanged. Two- and three-validator sets require all their validators,
++rather than a single signer. Run the node's loopback regression to exercise real
++proposal → vote → commit delivery:
++
++```sh
++cargo test -p subhost-node two_validators_commit_over_real_loopback_gossip
++```
++
++See [consensus wiring and limitations](consensus.md) before running a devnet.
++Timeout/view change and durable unfinished vote recovery remain pending; this
++slice does not establish production finality or long-offline catch-up.
+diff --git a/docs/security/threat-model.md b/docs/security/threat-model.md
+index 6194586..169a9bc 100644
+--- a/docs/security/threat-model.md
++++ b/docs/security/threat-model.md
+@@ -16,12 +16,13 @@ Subhost protocol. It changes as the protocol matures and new threats appear.
+ > subset that requires a valid signature bound to the sender; Merkle state and
+ > receipt commitments with per-account inclusion proofs; multi-transaction block
+ > production and full re-validation of peer blocks; BLS-verified quorum
+-> certificates with an in-process `2f + 1` driver; stake-deducting slashing; a
++> certificates with an `n - f` linear driver wired into validator nodes; stake-deducting slashing; a
+ > libp2p gossip transport that the node uses for live block propagation; and an IBC
+ > light client that verifies a single ed25519 signer's headers and Merkle
+ > commitment proofs.
+ >
+-> **Not implemented:** consensus inside the node, fork choice, reorg handling,
++> **Not implemented:** durable unfinished votes/QCs, timeout/view change, leader
++> rotation, fork choice, reorg handling,
+ > block sync/backfill, peer scoring, an encrypted mempool, Dandelion++ routing,
+ > threshold encryption, on-chain governance, EVM or WASM execution, zk proofs, a
+ > Merkle Patricia Trie, non-membership proofs, validator-set rotation or multisig

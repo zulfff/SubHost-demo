@@ -1,0 +1,58 @@
+SUBHOST-2026-002 post-fix re-verification (tania seat, track-b)
+Date: 2026-11-19
+Binary worktree: /tmp/opencode/wt-qa-002, HEAD 3a41220566775621eee15b17acf66ddb0ec176f5
+  (PR #49 head, yoga/wallet-kdf-bounds; base origin/main 01a59df)
+Build: cargo build --release -p subhost-cli, exit 0
+  (CARGO_TARGET_DIR=/tmp/opencode/wt-qa-main-01a59df/target, log tania-002-build.log)
+Binary sha256: 486ea51f373597db04067a2ee4b52e7e4a277a9cabc507b463b77e49dd762bfc
+Provenance caveat: the reproducer's `commit:` line below reads the shared
+checkout (fd0fc7e), NOT the binary's worktree; the binary was built from
+3a41220 as recorded above.
+
+Result: FIXED.
+- case 1 (log_n=30, r=8, p=1; 1 TiB; ulimit -v 1 GiB): was abort exit 134
+  on main (evidence/main-01a59df-release.txt); now clean refusal
+  "Error: scrypt parameters are outside the accepted cost bounds", exit 1.
+- case 2 (log_n=14, r=1, p=1000000000): was abort exit 134 on main; now
+  the same clean refusal, exit 1, well under the 30 s timeout.
+- control 1 (wallet show): unchanged, exit 0, prints kdf scrypt(log_n=15, r=8, p=1).
+- control 2 (default-cost junk ciphertext): unchanged clean
+  "Error: decryption failed (wrong password or corrupt wallet)", exit 1.
+
+Full transcript follows.
+---
+binary:  /tmp/opencode/wt-qa-main-01a59df/target/release/subhost
+commit:  fd0fc7e11ccb5fe8ebbb2948a68fd20cee4edab4
+sha256:  486ea51f373597db04067a2ee4b52e7e4a277a9cabc507b463b77e49dd762bfc
+workdir: /tmp/subhost-kdf-repro.3DVR8S
+
+wallet sizes:
+ 337 /tmp/subhost-kdf-repro.3DVR8S/memory/wallets/evil.json
+ 346 /tmp/subhost-kdf-repro.3DVR8S/cpu/wallets/evil.json
+ 337 /tmp/subhost-kdf-repro.3DVR8S/control/wallets/evil.json
+1020 total
+
+=== case 1: log_n=30, r=8, p=1 (1 TiB) with a 1 GiB address-space limit ===
+$ bash -c ulimit -v 1048576; exec "$@" _ env SUBHOST_HOME=/tmp/subhost-kdf-repro.3DVR8S/memory /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet export 0x1111111111111111111111111111111111111111 --password password123
+Error: scrypt parameters are outside the accepted cost bounds
+[exit status: 1]
+
+=== case 2: log_n=14, r=1, p=1000000000 (bounded by timeout 30) ===
+$ timeout 30 env SUBHOST_HOME=/tmp/subhost-kdf-repro.3DVR8S/cpu /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet export 0x2222222222222222222222222222222222222222 --password password123
+Error: scrypt parameters are outside the accepted cost bounds
+[exit status: 1]
+
+=== control 1: wallet show reads the parameters without running the KDF ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.3DVR8S/control /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet show 0x3333333333333333333333333333333333333333
+address: 0x3333333333333333333333333333333333333333
+file:    /tmp/subhost-kdf-repro.3DVR8S/control/wallets/evil.json
+version: 1
+kdf:     scrypt(log_n=15, r=8, p=1)
+[exit status: 0]
+
+=== control 2: default parameters reject the same junk ciphertext cleanly ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.3DVR8S/control /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet export 0x3333333333333333333333333333333333333333 --password password123
+Error: decryption failed (wrong password or corrupt wallet)
+[exit status: 1]
+
+kept for inspection: /tmp/subhost-kdf-repro.3DVR8S

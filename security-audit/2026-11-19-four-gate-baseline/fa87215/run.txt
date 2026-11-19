@@ -1,0 +1,15 @@
+worktree=/home/zulfff/subhost-wt/qa-fa87215
+commit=fa87215e035eb8f88a944108eb29724c9a79b59b
+describe=fa87215 Merge pull request #50 from zulfff/security/ledger-append-suffix-validation
+start=2026-11-19T21:52:26+07:00
+cargo=cargo 1.93.0 (083ac5135 2025-12-15)
+cargo-deny=cargo-deny 0.21.0
+== fmt: cargo fmt --all -- --check
+fmt exit=0
+== clippy: cargo clippy --workspace --all-targets --all-features -- -D warnings
+clippy exit=0
+== test: cargo test --workspace --all-features
+test exit=0
+== deny: env RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/home/zulfff/.cargo CARGO=/usr/local/cargo/bin/cargo /home/zulfff/.local/bin/cargo-deny --all-features check
+deny exit=0
+end=2026-11-19T22:09:04+07:00

@@ -1,0 +1,44 @@
+SUBHOST-2026-002 re-verification on origin/main 01a59df (2026-11-19, Sena QA support)
+binary: worktree /tmp/opencode/wt-qa-main-01a59df target/release/subhost, built from HEAD below
+note: the "commit:" line in the transcript is the shared checkout HEAD (fd0fc7e), not the binary source; provenance is this worktree HEAD
+worktree HEAD: 01a59df696b116734f2265c7968144c82f2ae299
+
+binary:  /tmp/opencode/wt-qa-main-01a59df/target/release/subhost
+commit:  fd0fc7e11ccb5fe8ebbb2948a68fd20cee4edab4
+sha256:  955ccb4f5fdd051023ab45a1ed0c3f7cafb7ee05dee385a1e9b851c1b64d6c48
+workdir: /tmp/subhost-kdf-repro.p0qX67
+
+wallet sizes:
+ 337 /tmp/subhost-kdf-repro.p0qX67/memory/wallets/evil.json
+ 346 /tmp/subhost-kdf-repro.p0qX67/cpu/wallets/evil.json
+ 337 /tmp/subhost-kdf-repro.p0qX67/control/wallets/evil.json
+1020 total
+
+=== case 1: log_n=30, r=8, p=1 (1 TiB) with a 1 GiB address-space limit ===
+$ bash -c ulimit -v 1048576; exec "$@" _ env SUBHOST_HOME=/tmp/subhost-kdf-repro.p0qX67/memory /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet export 0x1111111111111111111111111111111111111111 --password password123
+memory allocation of 1099511627776 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+security-audit/2026-11-18-wallet-kdf-unbounded/poc/reproduce.sh: line 50: 2290726 Aborted                 "$@" 2>&1
+[exit status: 134]
+
+=== case 2: log_n=14, r=1, p=1000000000 (bounded by timeout 30) ===
+$ timeout 30 env SUBHOST_HOME=/tmp/subhost-kdf-repro.p0qX67/cpu /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet export 0x2222222222222222222222222222222222222222 --password password123
+memory allocation of 128000000000 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+security-audit/2026-11-18-wallet-kdf-unbounded/poc/reproduce.sh: line 50: 2290736 Aborted                 "$@" 2>&1
+[exit status: 134]
+
+=== control 1: wallet show reads the parameters without running the KDF ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.p0qX67/control /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet show 0x3333333333333333333333333333333333333333
+address: 0x3333333333333333333333333333333333333333
+file:    /tmp/subhost-kdf-repro.p0qX67/control/wallets/evil.json
+version: 1
+kdf:     scrypt(log_n=15, r=8, p=1)
+[exit status: 0]
+
+=== control 2: default parameters reject the same junk ciphertext cleanly ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.p0qX67/control /tmp/opencode/wt-qa-main-01a59df/target/release/subhost wallet export 0x3333333333333333333333333333333333333333 --password password123
+Error: decryption failed (wrong password or corrupt wallet)
+[exit status: 1]
+
+kept for inspection: /tmp/subhost-kdf-repro.p0qX67

@@ -1,0 +1,18 @@
+    Updating crates.io index
+warning: failed to write cache, path: /usr/local/cargo/registry/index/index.crates.io-1949cf8c6b5b557f/.cache/sm/al/smallvec, error: Permission denied (os error 13)
+    Finished `release` profile [optimized] target(s) in 4.26s
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.97s
+HTTP reproduction: 40 transfers, 130000 calldata bytes each, gas=0x1, gasPrice=0x1
+nonce=0 {"jsonrpc":"2.0","id":1,"result":"0xe99f343f9c4aa46531209a355acb1b701133d40508c442ca23cbd951489a0cd2"} seconds=0.256155
+nonce=5 {"jsonrpc":"2.0","id":1,"result":"0xdfafb12b7e858929161bb45fd00a0b4e67cfcd0c250af80afcc173dbd2d666ea"} seconds=0.606607
+nonce=10 {"jsonrpc":"2.0","id":1,"result":"0x41afd9246f65f8c3796e35736aca4a86bb4c52a60afabb91371282673f893f43"} seconds=0.905268
+nonce=15 {"jsonrpc":"2.0","id":1,"result":"0xc17e11598083a8c76b3381c1cf4e1dde1874bb9735e3b7021a381393445fdab8"} seconds=1.256176
+nonce=20 {"jsonrpc":"2.0","id":1,"result":"0xc56aefd8c46139ef5e8eb8310efd137f0a55e87ea286146d9cc98e1ca4b3156c"} seconds=1.628093
+nonce=25 {"jsonrpc":"2.0","id":1,"result":"0x79c8f1e7bb6cdb4082906a6071ab041abc9d8568c0a67c116b013d9bc0a499f4"} seconds=1.900236
+nonce=30 {"jsonrpc":"2.0","id":1,"result":"0x77331784088ddfbac6993feba9ccd362845a24da8b7f4e432eaa1d34a4604fd0"} seconds=2.282423
+nonce=35 {"jsonrpc":"2.0","id":1,"result":"0x42917ac5f4d03b546f1766d214d97f65bf80b4dcd58317609ac4744efa457348"} seconds=2.572878
+nonce=39 {"jsonrpc":"2.0","id":1,"result":"0xc4d3a94aae964d54b8a54927c2ce368ce4235fe2ac9138b3dd5520fda33472e5"} seconds=2.859132
+ledger_bytes=5223809
+byte_0xaa_in_ledger=5200042
+attacker_fee_total_wei=40
+done exit=0

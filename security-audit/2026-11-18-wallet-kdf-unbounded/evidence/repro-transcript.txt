@@ -1,0 +1,39 @@
+binary:  /home/zulfff/SubHost-demo/target/debug/subhost
+commit:  4be9457e18a37537270223cbdbf2e9ab94955fe8
+sha256:  41edb0502f5495297b2c024dd1bc77d14a714e6e5ee6fce094adcbaf64f4b93f
+workdir: /tmp/subhost-kdf-repro.5vKuSB
+
+wallet sizes:
+ 337 /tmp/subhost-kdf-repro.5vKuSB/memory/wallets/evil.json
+ 346 /tmp/subhost-kdf-repro.5vKuSB/cpu/wallets/evil.json
+ 337 /tmp/subhost-kdf-repro.5vKuSB/control/wallets/evil.json
+1020 total
+
+=== case 1: log_n=30, r=8, p=1 (1 TiB) with a 1 GiB address-space limit ===
+$ bash -c ulimit -v 1048576; exec "$@" _ env SUBHOST_HOME=/tmp/subhost-kdf-repro.5vKuSB/memory /home/zulfff/SubHost-demo/target/debug/subhost wallet export 0x1111111111111111111111111111111111111111 --password password123
+memory allocation of 1099511627776 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+./security-audit/2026-11-18-wallet-kdf-unbounded/poc/reproduce.sh: line 50: 951593 Aborted                 "$@" 2>&1
+[exit status: 134]
+
+=== case 2: log_n=14, r=1, p=1000000000 (bounded by timeout 30) ===
+$ timeout 30 env SUBHOST_HOME=/tmp/subhost-kdf-repro.5vKuSB/cpu /home/zulfff/SubHost-demo/target/debug/subhost wallet export 0x2222222222222222222222222222222222222222 --password password123
+memory allocation of 128000000000 bytes failed
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+./security-audit/2026-11-18-wallet-kdf-unbounded/poc/reproduce.sh: line 50: 951602 Aborted                 "$@" 2>&1
+[exit status: 134]
+
+=== control 1: wallet show reads the parameters without running the KDF ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.5vKuSB/control /home/zulfff/SubHost-demo/target/debug/subhost wallet show 0x3333333333333333333333333333333333333333
+address: 0x3333333333333333333333333333333333333333
+file:    /tmp/subhost-kdf-repro.5vKuSB/control/wallets/evil.json
+version: 1
+kdf:     scrypt(log_n=15, r=8, p=1)
+[exit status: 0]
+
+=== control 2: default parameters reject the same junk ciphertext cleanly ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.5vKuSB/control /home/zulfff/SubHost-demo/target/debug/subhost wallet export 0x3333333333333333333333333333333333333333 --password password123
+Error: decryption failed (wrong password or corrupt wallet)
+[exit status: 1]
+
+kept for inspection: /tmp/subhost-kdf-repro.5vKuSB

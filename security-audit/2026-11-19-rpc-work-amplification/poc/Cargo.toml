@@ -1,0 +1,19 @@
+[package]
+name = "poc-work-amplification"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace so this crate can live inside the repository tree without
+# being treated as a member of the root workspace.
+[workspace]
+
+[dependencies]
+subhost-core = { path = "../../../crates/subhost-core" }
+subhost-rpc = { path = "../../../crates/subhost-rpc" }
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+tempfile = "3"
+serde_json = "1"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3

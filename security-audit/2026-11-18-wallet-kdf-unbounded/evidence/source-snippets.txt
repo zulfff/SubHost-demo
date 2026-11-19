@@ -1,0 +1,110 @@
+== crates/subhost-wallet/src/lib.rs:64-78 ==
+    64	        Self { log_n: SCRYPT_LOG_N, r: SCRYPT_R, p: SCRYPT_P }
+    65	    }
+    66	}
+    67	
+    68	impl KdfParams {
+    69	    /// Reject parameters that would be unusable or trivially cheap to brute force.
+    70	    fn validate(&self) -> Result<scrypt::Params, WalletError> {
+    71	        if self.log_n < 14 {
+    72	            return Err(WalletError::WeakKdfParameters);
+    73	        }
+    74	        scrypt::Params::new(self.log_n, self.r, self.p, SECRET_KEY_BYTES)
+    75	            .map_err(|_| WalletError::KeyDerivationFailed)
+    76	    }
+    77	}
+    78	
+
+== crates/subhost-wallet/src/lib.rs:173-190 ==
+   173	    pub fn load(path: &Path, password: &str) -> Result<(Self, PrivateKey), WalletError> {
+   174	        validate_password(password)?;
+   175	        let wallet = Self::read(path)?;
+   176	        let private_key = decrypt_private_key(
+   177	            &EncryptedKey {
+   178	                ciphertext: wallet.encrypted_key.clone(),
+   179	                salt: wallet.salt.clone(),
+   180	                nonce: wallet.nonce.clone(),
+   181	                kdf: wallet.kdf,
+   182	            },
+   183	            password,
+   184	        )?;
+   185	        // The decrypted key must actually control the advertised address.
+   186	        if wallet.address != derive_address(&private_key.0).to_string() {
+   187	            return Err(WalletError::AddressMismatch);
+   188	        }
+   189	        Ok((wallet, private_key))
+   190	    }
+
+== crates/subhost-wallet/src/lib.rs:221-231 ==
+   221	fn derive_encryption_key(
+   222	    password: &str,
+   223	    salt: &[u8],
+   224	    kdf: KdfParams,
+   225	) -> Result<[u8; 32], WalletError> {
+   226	    let params = kdf.validate()?;
+   227	    let mut key = [0u8; 32];
+   228	    scrypt::scrypt(password.as_bytes(), salt, &params, &mut key)
+   229	        .map_err(|_| WalletError::KeyDerivationFailed)?;
+   230	    Ok(key)
+   231	}
+
+== crates/subhost-wallet/src/lib.rs:255-268 ==
+   255	fn decrypt_private_key(
+   256	    encrypted: &EncryptedKey,
+   257	    password: &str,
+   258	) -> Result<PrivateKey, WalletError> {
+   259	    // Validate the framing before spending ~100 ms on the KDF.
+   260	    if encrypted.salt.len() != SALT_BYTES || encrypted.nonce.len() != NONCE_BYTES {
+   261	        return Err(WalletError::DecryptionFailed);
+   262	    }
+   263	
+   264	    let mut key = derive_encryption_key(password, &encrypted.salt, encrypted.kdf)?;
+   265	    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| WalletError::DecryptionFailed)?;
+   266	    key.zeroize();
+   267	
+   268	    let mut plaintext = cipher
+
+== scrypt-0.11.0/src/params.rs:38-80 ==
+    38	    ///
+    39	    /// # Conditions
+    40	    /// - `log_n` must be less than `64`
+    41	    /// - `r` must be greater than `0` and less than or equal to `4294967295`
+    42	    /// - `p` must be greater than `0` and less than `4294967295`
+    43	    /// - `len` must be greater than `9` and less than or equal to `64`
+    44	    pub fn new(log_n: u8, r: u32, p: u32, len: usize) -> Result<Params, InvalidParams> {
+    45	        let cond1 = (log_n as usize) < usize::BITS as usize;
+    46	        let cond2 = size_of::<usize>() >= size_of::<u32>();
+    47	        let cond3 = r <= usize::MAX as u32 && p < usize::MAX as u32;
+    48	        let cond4 = (10..=64).contains(&len);
+    49	        if !(r > 0 && p > 0 && cond1 && (cond2 || cond3) && cond4) {
+    50	            return Err(InvalidParams);
+    51	        }
+    52	
+    53	        let r = r as usize;
+    54	        let p = p as usize;
+    55	
+    56	        let n: usize = 1 << log_n;
+    57	
+    58	        // check that r * 128 doesn't overflow
+    59	        let r128 = r.checked_mul(128).ok_or(InvalidParams)?;
+    60	
+    61	        // check that n * r * 128 doesn't overflow
+    62	        r128.checked_mul(n).ok_or(InvalidParams)?;
+    63	
+    64	        // check that p * r * 128 doesn't overflow
+    65	        r128.checked_mul(p).ok_or(InvalidParams)?;
+    66	
+    67	        // This check required by Scrypt:
+    68	        // check: n < 2^(128 * r / 8)
+    69	        // r * 16 won't overflow since r128 didn't
+    70	        if (log_n as usize) >= r * 16 {
+    71	            return Err(InvalidParams);
+    72	        }
+    73	
+    74	        // This check required by Scrypt:
+    75	        // check: p <= ((2^32-1) * 32) / (128 * r)
+    76	        // It takes a bit of re-arranging to get the check above into this form,
+    77	        // but it is indeed the same.
+    78	        if r * p >= 0x4000_0000 {
+    79	            return Err(InvalidParams);
+    80	        }

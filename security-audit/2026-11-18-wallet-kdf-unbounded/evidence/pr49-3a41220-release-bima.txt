@@ -1,0 +1,42 @@
+SUBHOST-2026-002 re-verification on PR #49 head 3a41220 (2026-11-19, bima track-a, independent cross-check)
+binary: /tmp/opencode/bima-002-target/release/subhost (release, built from worktree /tmp/opencode/bima-002-verify)
+worktree HEAD: 3a41220566775621eee15b17acf66ddb0ec176f5
+note: the "commit:" line in the transcript is the shared checkout HEAD, not the binary source; provenance is the worktree HEAD above
+note: tania's quality-seat transcript for the same source revision holds the sibling path pr49-3a41220-release.txt (different build, sha256 486ea51f...); this file is the independent track-a run
+
+binary:  /tmp/opencode/bima-002-target/release/subhost
+commit:  fd0fc7e11ccb5fe8ebbb2948a68fd20cee4edab4
+sha256:  d84940e51240410f2cfd185e6dfb31bcd8ea51b75cf7c10ae0fe81e030b658dd
+workdir: /tmp/subhost-kdf-repro.X9YLrn
+
+wallet sizes:
+ 337 /tmp/subhost-kdf-repro.X9YLrn/memory/wallets/evil.json
+ 346 /tmp/subhost-kdf-repro.X9YLrn/cpu/wallets/evil.json
+ 337 /tmp/subhost-kdf-repro.X9YLrn/control/wallets/evil.json
+1020 total
+
+=== case 1: log_n=30, r=8, p=1 (1 TiB) with a 1 GiB address-space limit ===
+$ bash -c ulimit -v 1048576; exec "$@" _ env SUBHOST_HOME=/tmp/subhost-kdf-repro.X9YLrn/memory /tmp/opencode/bima-002-target/release/subhost wallet export 0x1111111111111111111111111111111111111111 --password password123
+Error: scrypt parameters are outside the accepted cost bounds
+[exit status: 1]
+
+=== case 2: log_n=14, r=1, p=1000000000 (bounded by timeout 30) ===
+$ timeout 30 env SUBHOST_HOME=/tmp/subhost-kdf-repro.X9YLrn/cpu /tmp/opencode/bima-002-target/release/subhost wallet export 0x2222222222222222222222222222222222222222 --password password123
+Error: scrypt parameters are outside the accepted cost bounds
+[exit status: 1]
+
+=== control 1: wallet show reads the parameters without running the KDF ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.X9YLrn/control /tmp/opencode/bima-002-target/release/subhost wallet show 0x3333333333333333333333333333333333333333
+address: 0x3333333333333333333333333333333333333333
+file:    /tmp/subhost-kdf-repro.X9YLrn/control/wallets/evil.json
+version: 1
+kdf:     scrypt(log_n=15, r=8, p=1)
+[exit status: 0]
+
+=== control 2: default parameters reject the same junk ciphertext cleanly ===
+$ env SUBHOST_HOME=/tmp/subhost-kdf-repro.X9YLrn/control /tmp/opencode/bima-002-target/release/subhost wallet export 0x3333333333333333333333333333333333333333 --password password123
+Error: decryption failed (wrong password or corrupt wallet)
+[exit status: 1]
+
+kept for inspection: /tmp/subhost-kdf-repro.X9YLrn
+repro=0

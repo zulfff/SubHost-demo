@@ -1,0 +1,23 @@
+[package]
+name = "subhost-qa-probes"
+version = "0.0.0"
+edition = "2021"
+[dependencies]
+subhost-core = { path = "/tmp/opencode/wt-s2-1/crates/subhost-core" }
+subhost-consensus = { path = "/tmp/opencode/wt-s2-1/crates/subhost-consensus" }
+subhost-crypto = { path = "/tmp/opencode/wt-s2-1/crates/subhost-crypto" }
+subhost-rpc = { path = "/tmp/opencode/wt-s2-1/crates/subhost-rpc" }
+subhost-network = { path = "/tmp/opencode/wt-s2-1/crates/subhost-network" }
+subhost-wallet = { path = "/tmp/opencode/wt-s2-1/crates/subhost-wallet" }
+subhost-faucet = { path = "/tmp/opencode/wt-s2-1/crates/subhost-faucet" }
+ed25519-dalek = "3.0"
+serde_json = "1.0"
+hex = "0.4"
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+axum = "0.8"
+tempfile = "3.9"
+[profile.dev]
+debug = 0
+
+[workspace]
