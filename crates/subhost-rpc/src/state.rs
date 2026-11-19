@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use subhost_consensus::ValidatorRegistry;
 use subhost_core::{
-    Address, Amount, Block, ChainId, FeePolicy, Hash, Nonce, Receipt, TransactionType,
+    Address, Amount, Block, ChainId, FeePolicy, Gas, Hash, Nonce, Receipt, TransactionType,
     BLOCK_GAS_LIMIT, FEE_HEADER_VERSION,
 };
 use subhost_mempool::Mempool;
@@ -146,6 +146,10 @@ pub struct RpcState {
     /// version 2 headers with a derived base fee and end-of-block priority
     /// settlement.
     pub(crate) fee_policy: Option<FeePolicy>,
+    /// Block gas limit this chain produces and accepts, from the genesis
+    /// document. Defaults to [`BLOCK_GAS_LIMIT`]; a genesis that names a
+    /// different limit is honoured end to end (S6.2 step 3).
+    pub(crate) block_gas_limit: Gas,
 }
 
 /// Buffered block events per subscriber. A node only needs the newest few.
@@ -190,7 +194,38 @@ impl RpcState {
             validators: None,
             metrics: None,
             fee_policy: None,
+            block_gas_limit: BLOCK_GAS_LIMIT,
         })
+    }
+
+    /// Bind the block gas limit named by the genesis document.
+    ///
+    /// The block path used to hardcode [`BLOCK_GAS_LIMIT`] while
+    /// `GenesisConfig::validate` checked the fee policy against
+    /// `genesis.gas_limit`, so a genesis naming another limit produced headers
+    /// the policy could not extend. The limit is now honoured end to end. A
+    /// restored ledger must keep the limit its headers record; changing it
+    /// would make the committed tip unverifiable, so that is refused rather
+    /// than silently re-framing history.
+    pub fn with_block_gas_limit(mut self, limit: Gas) -> Result<Self, RpcError> {
+        if limit == 0 {
+            return Err(RpcError::BlockRejected("block gas limit must be > 0".into()));
+        }
+        if let Some(tip) = read(&self.blocks).last() {
+            if tip.header.gas_limit != limit {
+                return Err(RpcError::BlockRejected(format!(
+                    "genesis gas limit {limit} does not match the restored ledger's {}",
+                    tip.header.gas_limit
+                )));
+            }
+        }
+        self.block_gas_limit = limit;
+        Ok(self)
+    }
+
+    /// The block gas limit this chain produces and accepts.
+    pub fn block_gas_limit(&self) -> Gas {
+        self.block_gas_limit
     }
 
     /// Adopt the fee-market policy of a fee-enabled genesis (S6.2, Q-017).
@@ -202,11 +237,10 @@ impl RpcState {
     /// rewrites or discards existing data.
     pub fn with_fee_policy(mut self, policy: FeePolicy) -> Result<Self, RpcError> {
         policy
-            .validate(BLOCK_GAS_LIMIT)
+            .validate(self.block_gas_limit)
             .map_err(|error| RpcError::BlockRejected(format!("fee policy: {error}")))?;
-        let legacy_history = read(&self.blocks)
-            .iter()
-            .any(|block| block.header.version < FEE_HEADER_VERSION);
+        let legacy_history =
+            read(&self.blocks).iter().any(|block| block.header.version < FEE_HEADER_VERSION);
         if legacy_history {
             return Err(RpcError::BlockRejected(
                 "fee-enabled genesis cannot extend a legacy ledger; use a fresh data directory"
@@ -216,7 +250,7 @@ impl RpcState {
         // A restored fee-enabled tip must still be extendable under this policy:
         // same gas-limit frame and an in-bounds recorded base fee.
         if let Some(tip) = read(&self.blocks).last() {
-            policy.next_context(&tip.header, BLOCK_GAS_LIMIT).map_err(|error| {
+            policy.next_context(&tip.header, self.block_gas_limit).map_err(|error| {
                 RpcError::BlockRejected(format!(
                     "restored ledger is incompatible with this fee policy: {error}"
                 ))

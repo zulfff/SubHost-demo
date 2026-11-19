@@ -1,7 +1,10 @@
 use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use subhost_consensus::driver::VotePhase;
-use subhost_core::{Address, Transaction, TransactionSignature, TransactionType, ValidatorInfo};
+use subhost_core::{
+    Address, FeePolicy, Transaction, TransactionSignature, TransactionType, ValidatorInfo,
+    BLOCK_GAS_LIMIT, FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER, FEE_HEADER_VERSION,
+};
 
 fn test_config(directory: impl Into<PathBuf>) -> NodeConfig {
     let directory = directory.into();
@@ -1322,4 +1325,170 @@ async fn two_nodes_exchange_blocks_over_real_gossip() {
 
     follower_task.abort();
     producer_task.abort();
+}
+
+fn fee_policy() -> FeePolicy {
+    FeePolicy {
+        initial_base_fee_per_gas: 8,
+        min_base_fee_per_gas: 1,
+        max_base_fee_per_gas: u128::MAX / u128::from(BLOCK_GAS_LIMIT),
+        elasticity_multiplier: FEE_ELASTICITY_MULTIPLIER,
+        change_denominator: FEE_CHANGE_DENOMINATOR,
+    }
+}
+
+/// A transfer re-signed with an explicit bid, so it can meet the base fee.
+fn priced_transfer(key: &SigningKey, nonce: u64, value: u128, gas_price: u128) -> Transaction {
+    let mut tx = signed_transfer(key, nonce, value);
+    tx.gas_price = gas_price;
+    tx.signature = TransactionSignature::from_ed25519(&key.sign(&tx.signing_payload()).to_bytes());
+    tx
+}
+
+#[test]
+fn fee_enabled_genesis_without_allocations_persists_the_anchor_and_seals_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut genesis = genesis_with(1, None);
+    genesis.fee_policy = Some(fee_policy());
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(node.state().block_height(), 0);
+    assert!(node.state().fee_policy().is_some(), "the node binds the genesis policy");
+
+    // An idle fee-enabled chain still builds an empty v2 block at the initial
+    // fee, and accepting it lowers the fee for the next block.
+    let empty = node.state().build_block().unwrap().expect("a v2 chain seals empty blocks");
+    assert_eq!(empty.header.version, FEE_HEADER_VERSION);
+    assert_eq!(empty.header.base_fee_per_gas, 8);
+    assert!(empty.transactions.is_empty());
+    node.state().accept_block(empty).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+    assert_eq!(node.state().build_block().unwrap().unwrap().header.base_fee_per_gas, 7);
+
+    // Restart keeps the policy and derives the same next fee from the tip.
+    let restarted = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(restarted.state().block_height(), 1);
+    assert!(restarted.state().fee_policy().is_some());
+    assert_eq!(restarted.state().build_block().unwrap().unwrap().header.base_fee_per_gas, 7);
+}
+
+#[test]
+fn fee_enabled_demo_chain_seals_a_priced_transfer_and_burns_the_tip() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    let mut genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.fee_policy = Some(fee_policy());
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    // A bid below the initial base fee is refused at admission, before any seal.
+    assert!(node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).is_err());
+    assert_eq!(node.state().block_height(), 0);
+
+    node.state().submit_transaction(priced_transfer(&tx_key, 0, 10, 10)).unwrap();
+    assert_eq!(node.state().block_height(), 1, "demo chains seal synchronously");
+    assert_eq!(node.state().balance(&sender), 1_000_000 - 10 - 10 * 21_000);
+    assert_eq!(node.state().balance(&Address::ZERO), 0, "validatorless mode burns the tip");
+
+    // The durable ledger restores the same balances under the same policy.
+    let restarted = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(restarted.state().block_height(), 1);
+    assert_eq!(restarted.state().balance(&sender), 1_000_000 - 10 - 10 * 21_000);
+    assert_eq!(restarted.state().build_block().unwrap().unwrap().header.base_fee_per_gas, 7);
+}
+
+#[test]
+fn a_fee_policy_refuses_to_extend_a_legacy_data_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    let mut legacy = genesis_with(1, Some((sender, 1_000_000)));
+    legacy.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+    drop(node);
+
+    // The same directory with a fee-enabled genesis is refused, not rewritten.
+    legacy.fee_policy = Some(fee_policy());
+    legacy.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let error = match Node::bootstrap(test_config(dir.path())) {
+        Err(error) => error,
+        Ok(_) => panic!("bootstrap must refuse this genesis/ledger combination"),
+    };
+    assert!(
+        matches!(error, NodeError::Rpc(subhost_rpc::RpcError::BlockRejected(ref message))
+            if message.contains("legacy ledger")),
+        "the refusal must name the legacy ledger, got: {error}"
+    );
+}
+
+#[test]
+fn a_genesis_gas_limit_is_honoured_by_the_block_path_and_the_fee_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    let mut genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.gas_limit = 1_000_000;
+    genesis.fee_policy = Some(fee_policy());
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(node.state().block_gas_limit(), 1_000_000);
+    node.state().submit_transaction(priced_transfer(&tx_key, 0, 10, 10)).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+
+    // The next header carries the genesis limit and derives its fee from it:
+    // 21_000 of a 500_000 target is below target, so 8 falls to 7.
+    let next = node.state().build_block().unwrap().unwrap();
+    assert_eq!(next.header.gas_limit, 1_000_000);
+    assert_eq!(next.header.base_fee_per_gas, 7);
+
+    let restarted = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(restarted.state().block_gas_limit(), 1_000_000);
+    assert_eq!(restarted.state().block_height(), 1);
+}
+
+#[test]
+fn a_legacy_genesis_gas_limit_is_honoured_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    let mut genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.gas_limit = 2_000_000;
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+    let sealed = node.state().build_block().unwrap();
+    assert!(sealed.is_none(), "a legacy chain still skips empty selections");
+    assert_eq!(node.state().block_gas_limit(), 2_000_000);
+}
+
+#[test]
+fn a_restored_ledger_refuses_a_different_genesis_gas_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    let mut genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+    drop(node);
+
+    genesis.gas_limit = 2_000_000;
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let error = match Node::bootstrap(test_config(dir.path())) {
+        Err(error) => error,
+        Ok(_) => panic!("bootstrap must refuse this genesis/ledger combination"),
+    };
+    assert!(
+        matches!(error, NodeError::Rpc(subhost_rpc::RpcError::BlockRejected(ref message))
+            if message.contains("gas limit")),
+        "the refusal must name the gas limit, got: {error}"
+    );
 }

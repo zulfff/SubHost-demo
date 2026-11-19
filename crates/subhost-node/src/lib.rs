@@ -226,6 +226,12 @@ impl Node {
         let store = LedgerStore::open(chain_id, &config.data_dir)?;
         let fresh = !store.exists();
         let mut state = RpcState::with_store(store)?.with_consensus_context(protocol_context);
+        // Honour the genesis block gas limit end to end: the fee policy is
+        // validated against it and every produced/accepted header carries it.
+        // Absent a genesis document the default limit applies unchanged.
+        if let Some(genesis) = &genesis {
+            state = state.with_block_gas_limit(genesis.gas_limit)?;
+        }
         // A fee-enabled genesis owns the fee rules for this chain; the node
         // refuses to extend a legacy ledger with it. Absent policy keeps the
         // legacy fixed-price behaviour byte-for-byte.

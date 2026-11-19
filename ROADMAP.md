@@ -504,24 +504,26 @@ the metrics match a request-count test.
 - Ledger records the base fee per block; replay recomputes it.
 - Landing in three steps (ADR-010, Q-017/Q-030) so `main` never holds a
   fee-enabled chain its storage cannot verify: (1) `s6/fee-market-api` —
-  additive core/state API + version-2 header codec, nothing enables a policy;
-  (2) Track B storage, implemented on `s6/storage-fee-replay` — manifest
-  `fee_policy`, `LedgerStore::with_fee_policy`, fail-closed binding rules,
-  re-execution + settlement in both replay paths, ephemeral head anchoring;
+  additive core/state API + version-2 header codec, **merged** (#60);
+  (2) Track B storage, implemented on `s6/storage-fee-replay` (PR #65) —
+  manifest `fee_policy`, `LedgerStore::with_fee_policy`, fail-closed binding
+  rules, re-execution + settlement in both replay paths, ephemeral head
+  anchoring;
   (3) `s6/fee-market-v2` — genesis/node/RPC wiring, empty v2 blocks, admission
   policy, durable non-empty v2 tests.
-- Track A follow-ups recorded here, not widened into the fee contract: the
+- Track A follow-up recorded here, not widened into the fee contract: the
   demo seal-then-Err pool/commit inconsistency in `subhost-rpc/src/block.rs`
-  (the underpriced include case is refused up front in step 3), and the
-  pre-existing genesis `gas_limit` inconsistency — `GenesisConfig::validate`
-  checks the policy against `genesis.gas_limit` while the node never reads it
-  and the block path hardcodes `BLOCK_GAS_LIMIT`.
+  (the underpriced include case is refused up front in step 3).
 - Step 3 (`s6/fee-market-v2`) adds the genesis/node/RPC wiring: fee derived from
   the committed tip, version-2 headers, end-of-block settlement before the state
   root, empty certified blocks, below-base-fee admission refusal with parked
   entries, and refusal of a legacy data directory. It also makes the genesis
   seeding persist unconditional when a policy is configured, so a fee-enabled
-  ledger always has the height-0 anchor storage requires (Q-030).
+  ledger always has the height-0 anchor storage requires (Q-030), and it honours
+  the genesis `gas_limit` end to end — previously `GenesisConfig::validate`
+  checked the policy against `genesis.gas_limit` while the node never read it
+  and the block path hardcoded `BLOCK_GAS_LIMIT`. A restored ledger refuses a
+  genesis limit that differs from its recorded headers.
 - Remaining Track B after step 2: `eth_feeHistory` / `eth_gasPrice` /
   `eth_maxPriorityFeePerGas` and receipt `effectiveGasPrice` from recorded fees;
   CLI genesis generation for fee-enabled devnets.

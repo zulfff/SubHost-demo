@@ -11,7 +11,7 @@ use subhost_consensus::{ConsensusConfig, HotStuff, QuorumCertificate, ValidatorR
 use subhost_core::{
     encode_canonical, settle_block_fees, tx_root_of, Address, Amount, Block, BlockHeader,
     FeeContext, Gas, Hash, Receipt, ReceiptStatus, Transaction, ValidatorSignature,
-    BLOCK_GAS_LIMIT, FEE_HEADER_VERSION,
+    FEE_HEADER_VERSION,
 };
 use subhost_crypto::{BLSScheme, PrivateKey};
 use subhost_mempool::Mempool;
@@ -110,8 +110,8 @@ impl RpcState {
             return Ok(None);
         };
         let context = match parent {
-            None => policy.initial_context(BLOCK_GAS_LIMIT),
-            Some(parent) => policy.next_context(&parent.header, BLOCK_GAS_LIMIT),
+            None => policy.initial_context(self.block_gas_limit),
+            Some(parent) => policy.next_context(&parent.header, self.block_gas_limit),
         }
         .map_err(|error| format!("cannot derive the next base fee: {error}"))?;
         Ok(Some(context))
@@ -255,7 +255,7 @@ impl RpcState {
                     break;
                 }
                 let Some(next_gas) = gas_used.checked_add(tx.gas_limit) else { break };
-                if next_gas > BLOCK_GAS_LIMIT {
+                if next_gas > self.block_gas_limit {
                     break;
                 }
                 let Some(next_bytes) = selected_bytes.checked_add(encode_canonical(&tx).len())
@@ -364,7 +364,7 @@ impl RpcState {
                     // attest with, which keeps single-node behaviour unchanged.
                     validator,
                     gas_used,
-                    gas_limit: BLOCK_GAS_LIMIT,
+                    gas_limit: self.block_gas_limit,
                     extra_data: Vec::new(),
                     base_fee_per_gas,
                 },
@@ -596,7 +596,7 @@ impl RpcState {
             || block.header.parent_hash != expected_parent
             || block.header.chain_id != self.chain_id
             || block.header.version != self.header_version()
-            || block.header.gas_limit != BLOCK_GAS_LIMIT
+            || block.header.gas_limit != self.block_gas_limit
             || (self.fee_policy.is_none() && block.transactions.is_empty())
         {
             return Err(RpcError::BlockRejected(format!(
@@ -660,8 +660,8 @@ impl RpcState {
         if let Some(context) = &fee_context {
             // The recorded producer earns this block's tip; `Address::ZERO` is
             // the explicit validatorless mode that burns it.
-            let producer = (block.header.validator != Address::ZERO)
-                .then_some(block.header.validator);
+            let producer =
+                (block.header.validator != Address::ZERO).then_some(block.header.validator);
             settle_fees(context, &mut candidate_state, &block.transactions, debited, producer)
                 .map_err(RpcError::BlockRejected)?;
         }
@@ -753,7 +753,7 @@ mod tests {
     use crate::test_support::{funded_state, signed_transfer, signing_key};
     use ed25519_dalek::{Signer, SigningKey};
     use subhost_core::{
-        Amount, FeePolicy, Nonce, TransactionSignature, TransactionType,
+        Amount, FeePolicy, Nonce, TransactionSignature, TransactionType, BLOCK_GAS_LIMIT,
         FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER,
     };
 
@@ -1273,11 +1273,8 @@ mod tests {
         let (alice_secret, _) = BLSScheme::keygen();
         let alice = Address::new([9; 20]);
         let registry = registry(&[(alice, &alice_secret)]);
-        let producer = RpcState::in_memory(1)
-            .unwrap()
-            .with_fee_policy(fee_policy())
-            .unwrap()
-            .with_authority(
+        let producer =
+            RpcState::in_memory(1).unwrap().with_fee_policy(fee_policy()).unwrap().with_authority(
                 BlockAuthority::new(registry, alice, alice_secret.clone()).unwrap(),
             );
         producer.seed_accounts([(sender, 1_000_000)]).unwrap();
@@ -1369,7 +1366,10 @@ mod tests {
         assert_eq!(sealed.header.validator, Address::ZERO);
         assert_eq!(sealed.header.base_fee_per_gas, 8);
         assert_eq!(state.balance(&Address::ZERO), 0, "no reward at the zero address");
-        assert_eq!(state.balance(&sender), 1_000_000 - 10 - 10 * Amount::from(DEFAULT_TX_GAS_LIMIT));
+        assert_eq!(
+            state.balance(&sender),
+            1_000_000 - 10 - 10 * Amount::from(DEFAULT_TX_GAS_LIMIT)
+        );
 
         // An idle block keeps the zero address unrewarded too.
         let idle = state.build_block().unwrap().unwrap();
@@ -1383,11 +1383,8 @@ mod tests {
         let (alice_secret, _) = BLSScheme::keygen();
         let alice = Address::new([9; 20]);
         let registry = registry(&[(alice, &alice_secret)]);
-        let producer = RpcState::in_memory(1)
-            .unwrap()
-            .with_fee_policy(fee_policy())
-            .unwrap()
-            .with_authority(
+        let producer =
+            RpcState::in_memory(1).unwrap().with_fee_policy(fee_policy()).unwrap().with_authority(
                 BlockAuthority::new(registry.clone(), alice, alice_secret.clone()).unwrap(),
             );
         let empty = producer.build_block().unwrap().expect("an idle v2 chain still proposes");
@@ -1444,10 +1441,7 @@ mod tests {
             assert_eq!(state.block_height(), 1);
         }
         let reopened = RpcState::with_data_dir(1, legacy_dir.path()).unwrap();
-        assert!(matches!(
-            reopened.with_fee_policy(fee_policy()),
-            Err(RpcError::BlockRejected(_))
-        ));
+        assert!(matches!(reopened.with_fee_policy(fee_policy()), Err(RpcError::BlockRejected(_))));
 
         // A fee-enabled ledger restarts under the same policy.
         let fee_dir = tempfile::tempdir().unwrap();

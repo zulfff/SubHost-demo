@@ -114,12 +114,13 @@ must use a fresh data directory.
   version check. The node supplies the genesis policy before the first persist;
   storage never reads genesis files, so offline tools verify v2 ledgers from the
   recorded policy alone.
-- A genesis with a non-default `gas_limit` is already inconsistent before fees:
-  `GenesisConfig::validate` checks the policy against `genesis.gas_limit`, but
-  the node never reads that field and the block path hardcodes
-  `BLOCK_GAS_LIMIT`. Replay uses the policy-bound context limit and refuses a
-  mismatched header. Honouring the genesis limit end to end is a separate
-  Track A follow-up, not part of this contract.
+- The genesis `gas_limit` is honoured end to end from step 3: the node binds it
+  into `RpcState`, the fee policy is validated against it, and every produced
+  and accepted header carries it. Previously the block path hardcoded
+  `BLOCK_GAS_LIMIT` while `GenesisConfig::validate` checked the policy against
+  `genesis.gas_limit`, so a non-default genesis limit produced headers the
+  policy could not extend. A restored ledger refuses a genesis limit that
+  differs from its recorded headers; a default genesis is byte-identical.
 
 - Full-history replay verification is not in this slice; a restored fee-enabled
   ledger is checked for extendability, not re-executed. Track B's storage PR

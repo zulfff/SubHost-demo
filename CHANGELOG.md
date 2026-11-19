@@ -124,6 +124,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `four_validator_nodes_require_three_votes_before_a_ledger_write` now takes
   `NETWORK_TEST_LOCK` like the liveness and real-network suites, so the last
   in-process cluster no longer overlaps another live four-validator cluster.
+- **A genesis block gas limit is now honoured end to end (S6.2 step 3).**
+  `GenesisConfig::validate` checked the fee policy against `genesis.gas_limit`,
+  but the node never read that field and the block path hardcoded
+  `BLOCK_GAS_LIMIT` (30,000,000), so a genesis naming another limit produced
+  headers the policy could not extend. `RpcState::with_block_gas_limit` binds
+  the genesis limit, the fee context/selection/producer/verifier all use it,
+  and a restored ledger refuses a genesis limit that differs from its recorded
+  headers. A default genesis is byte-identical; a legacy genesis naming a
+  non-default limit now produces blocks at that limit instead of silently
+  ignoring the field.
 
 - **Wallet files could abort the process through their scrypt cost parameters.**
   `KdfParams::validate` now refuses file-supplied costs above 256 MiB of memory
@@ -377,6 +387,9 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   before a fee rise stay parked without skipping their sender's nonce.
   Validatorless demo mode burns the tip and creates no `Address::ZERO` reward.
   A fee-enabled node refuses a restored legacy ledger instead of rewriting it.
+  A fresh fee-enabled genesis persists its height-0 state anchor even with no
+  allocations, which storage requires before the first v2 append (Q-030), and
+  the genesis block gas limit is honoured end to end.
   Legacy chains keep byte-identical headers, bindings and burn rules.
 
 - **Release engineering and checked optimized tests (S9).** Added exact tag/version
