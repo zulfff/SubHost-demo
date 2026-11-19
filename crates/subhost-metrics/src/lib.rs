@@ -76,6 +76,27 @@ impl MempoolEvent {
     }
 }
 
+/// Bounded ledger-prune outcome labels (Q-036). Mirrors the storage
+/// `PruneOutcome` variants without depending on the storage crate; the mapping
+/// lives at the recording call site. `failed` is deliberately not a label: a
+/// prune error is an RPC/storage error, not a retention outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LedgerPruneOutcome {
+    Pruned,
+    NothingToPrune,
+    RefusedBySnapshot,
+}
+
+impl LedgerPruneOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Pruned => "pruned",
+            Self::NothingToPrune => "nothing_to_prune",
+            Self::RefusedBySnapshot => "refused_by_snapshot",
+        }
+    }
+}
+
 /// The node's metric set.
 ///
 /// Cloning shares the same underlying registry, so any component can record into
@@ -96,6 +117,8 @@ pub struct Metrics {
     ledger_snapshot_modified: Gauge,
     mempool_events: CounterVec,
     pending_cleanup_failures: Counter,
+    ledger_prune: CounterVec,
+    ledger_base_height: Gauge,
 }
 
 impl Metrics {
@@ -186,6 +209,30 @@ impl Metrics {
             "Failed best-effort pending-snapshot writes after a durable block commit; 0 until the S6.1b consumer wiring lands",
         )?;
 
+        // Q-036 retention outcomes: registered at zero with exactly the three
+        // bounded labels. A refusal is a normal no-op, not a fault; errors are
+        // not an outcome label. Unlike `reorg_total`, these do increment once
+        // retention runs.
+        let ledger_prune = CounterVec::new(
+            Opts::new(
+                "subhost_ledger_prune_total",
+                "Ledger prune attempts by bounded outcome (pruned, nothing_to_prune, refused_by_snapshot)",
+            ),
+            &["outcome"],
+        )?;
+        for outcome in [
+            LedgerPruneOutcome::Pruned,
+            LedgerPruneOutcome::NothingToPrune,
+            LedgerPruneOutcome::RefusedBySnapshot,
+        ] {
+            ledger_prune.with_label_values(&[outcome.label()]);
+        }
+        // 0 is a real value (full history retained), not "unavailable".
+        let ledger_base_height = Gauge::new(
+            "subhost_ledger_base_height",
+            "Height of the oldest retained block; 0 means the full history is retained",
+        )?;
+
         registry.register(Box::new(rpc_requests.clone()))?;
         registry.register(Box::new(rpc_errors.clone()))?;
         registry.register(Box::new(rpc_latency.clone()))?;
@@ -199,6 +246,8 @@ impl Metrics {
         registry.register(Box::new(reorgs.clone()))?;
         registry.register(Box::new(mempool_events.clone()))?;
         registry.register(Box::new(pending_cleanup_failures.clone()))?;
+        registry.register(Box::new(ledger_prune.clone()))?;
+        registry.register(Box::new(ledger_base_height.clone()))?;
 
         Ok(Self {
             registry: Arc::new(registry),
@@ -215,6 +264,8 @@ impl Metrics {
             ledger_snapshot_modified,
             mempool_events,
             pending_cleanup_failures,
+            ledger_prune,
+            ledger_base_height,
         })
     }
 
@@ -316,6 +367,19 @@ impl Metrics {
     /// Count one bounded mempool lifecycle event.
     pub fn record_mempool_event(&self, event: MempoolEvent) {
         self.mempool_events.with_label_values(&[event.label()]).inc();
+    }
+
+    /// Count one ledger prune attempt by its bounded outcome (Q-036). A
+    /// `RefusedBySnapshot` no-op counts here too — it is a normal retention
+    /// outcome, not a fault. Prune errors are not counted as an outcome.
+    pub fn record_ledger_prune(&self, outcome: LedgerPruneOutcome) {
+        self.ledger_prune.with_label_values(&[outcome.label()]).inc();
+    }
+
+    /// Publish the oldest retained block height (Q-036). 0 is a real value
+    /// meaning the full history is retained, not "unavailable".
+    pub fn set_ledger_base_height(&self, height: u64) {
+        self.ledger_base_height.set(height as f64);
     }
 
     /// Render the registry in the Prometheus text exposition format.
@@ -435,9 +499,40 @@ mod tests {
             "subhost_reorg_total",
             "subhost_mempool_transactions_total",
             "subhost_mempool_pending_cleanup_failures_total",
+            "subhost_ledger_prune_total",
+            "subhost_ledger_base_height",
         ] {
             assert!(rendered.contains(name), "{name} is missing from the exposition");
         }
+    }
+
+    #[test]
+    fn ledger_prune_outcomes_register_at_zero_with_exactly_three_bounded_labels() {
+        let metrics = Metrics::new().unwrap();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        for label in ["pruned", "nothing_to_prune", "refused_by_snapshot"] {
+            assert!(
+                rendered.contains(&format!("subhost_ledger_prune_total{{outcome=\"{label}\"}} 0")),
+                "{label} must be registered at zero"
+            );
+        }
+        // No height or other unbounded label may appear on the counter.
+        assert!(!rendered.contains("subhost_ledger_prune_total{outcome=\"failed\""));
+        assert!(rendered.contains("subhost_ledger_base_height 0"));
+    }
+
+    #[test]
+    fn recording_a_prune_outcome_increments_only_its_own_label() {
+        let metrics = Metrics::new().unwrap();
+        metrics.record_ledger_prune(LedgerPruneOutcome::RefusedBySnapshot);
+        metrics.record_ledger_prune(LedgerPruneOutcome::RefusedBySnapshot);
+        metrics.record_ledger_prune(LedgerPruneOutcome::Pruned);
+        metrics.set_ledger_base_height(1024);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"refused_by_snapshot\"} 2"));
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"pruned\"} 1"));
+        assert!(rendered.contains("subhost_ledger_prune_total{outcome=\"nothing_to_prune\"} 0"));
+        assert!(rendered.contains("subhost_ledger_base_height 1024"));
     }
 
     #[test]

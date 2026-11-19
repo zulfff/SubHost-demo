@@ -312,6 +312,22 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   below 4096 with the degraded sync-serving role, validator/observer-only
   safety scope), and `start-stop.md` cross-references it. Parse tests cover
   unset/positive/lean values and refusal of 0, negatives and non-numbers.
+- **Ledger retention metrics (Q-036 Q4).** `subhost_ledger_prune_total{outcome}`
+  counter with exactly the three bounded labels `pruned`, `nothing_to_prune`,
+  `refused_by_snapshot` (from a typed `LedgerPruneOutcome` in `subhost-metrics`;
+  no height labels, errors are not an outcome), and `subhost_ledger_base_height`
+  gauge — both registered at 0. Recording is wired into `RpcState::retain_from`:
+  every outcome counts, only a real `Pruned` moves the base gauge, and attaching
+  the registry seeds the gauge from the restored base so an already-trimmed
+  ledger publishes its real base before the first prune. 0 on the gauge is a
+  real value (full history retained), not unavailable. A snapshot refusal is a
+  normal no-op, not a fault — no refusal alert; `subhost_ledger_active_bytes`
+  stays the operator growth signal. Without a registry the recording is a silent
+  no-op and a prune never fails because of metrics. Tests cover zero
+  registration, label boundedness, per-label increments, the refusal and error
+  paths, gauge seeding and gauge movement only on `Pruned`. Documented in
+  `docs/operations/observability.md` and the `alerts.md` live-vs-gated table.
+  Stacked on the Q-036 retention mechanism (PR #87).
 
 - **Public genesis prep script (Q-012/Q-037).** Added
   `scripts/testnet/prepare-public-genesis.sh`: generates the four distinct
