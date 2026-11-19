@@ -249,6 +249,7 @@ impl RpcState {
         // reserve. Transaction bodies are measured using the actual codec.
         let transaction_budget = self.proposal_bytes_limit.map(|limit| limit.saturating_sub(512));
         let mut selected_bytes = 0usize;
+        let mut selected_calldata = 0usize;
         for sender in senders {
             for tx in pool.ready_for(&sender, state.nonce(&sender)) {
                 if fee.is_some_and(|fee| tx.gas_price < fee.base_fee_per_gas) {
@@ -265,11 +266,20 @@ impl RpcState {
                 if transaction_budget.is_some_and(|budget| next_bytes > budget) {
                     break;
                 }
+                // Per-block calldata budget (Q-037 L0): cheap bytes must not
+                // fill a block even when gas and total bytes still fit.
+                let Some(next_calldata) = selected_calldata.checked_add(tx.data.len()) else {
+                    break;
+                };
+                if self.proposal_calldata_bytes_limit.is_some_and(|budget| next_calldata > budget) {
+                    break;
+                }
                 if state.apply_transaction(&tx).is_err() {
                     break;
                 }
                 gas_used = next_gas;
                 selected_bytes = next_bytes;
+                selected_calldata = next_calldata;
                 selected.push(tx);
             }
         }

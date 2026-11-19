@@ -113,6 +113,10 @@ pub struct RpcState {
     pub(crate) finalized_height: Arc<AtomicU64>,
     /// Optional canonical proposal bound configured before serving.
     pub(crate) proposal_bytes_limit: Option<usize>,
+    /// Per-block calldata byte budget (Q-037 L0): the sum of `tx.data.len()`
+    /// over selected transactions. Independent of the total-byte budget; at
+    /// the floor rate it binds before the block gas limit does.
+    pub(crate) proposal_calldata_bytes_limit: Option<usize>,
     /// Height of the newest committed block, backing `eth_blockNumber`.
     pub(crate) block_height: Arc<AtomicU64>,
     /// Pending transaction pool.
@@ -192,6 +196,7 @@ impl RpcState {
             verified_view: Arc::new(AtomicBool::new(height == 0)),
             finalized_height: Arc::new(AtomicU64::new(0)),
             proposal_bytes_limit: None,
+            proposal_calldata_bytes_limit: Some(256 * 1024),
             block_height: Arc::new(AtomicU64::new(height)),
             mempool: Arc::new(RwLock::new(Mempool::default())),
             state: Arc::new(RwLock::new(restored.state)),
@@ -492,6 +497,20 @@ impl RpcState {
     pub fn with_proposal_bytes_limit(mut self, max_bytes: usize) -> Self {
         self.proposal_bytes_limit = Some(max_bytes);
         self
+    }
+
+    /// Override the per-block calldata byte budget (Q-037 L0). The default is
+    /// 256 KiB; operators may tighten it. Keep it at or above the mempool's
+    /// `max_tx_data_bytes`, or a transaction that passes admission could never
+    /// be selected.
+    pub fn with_proposal_calldata_bytes_limit(mut self, max_bytes: usize) -> Self {
+        self.proposal_calldata_bytes_limit = Some(max_bytes);
+        self
+    }
+
+    /// The per-block calldata byte budget, if set.
+    pub fn proposal_calldata_bytes_limit(&self) -> Option<usize> {
+        self.proposal_calldata_bytes_limit
     }
 
     /// Attach the metrics registry used for committed mempool lifecycle events
@@ -1116,5 +1135,35 @@ mod tests {
         let metrics = state.metrics.as_ref().unwrap();
         let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
         assert!(rendered.contains("subhost_ledger_base_height 1024"));
+    }
+
+    #[test]
+    fn restore_pending_drops_entries_over_the_tighter_calldata_cap() {
+        // nara's L0 ask, end to end: a pending file written under the old
+        // 128 KiB cap restores under the new 16 KiB default with the oversized
+        // entry cap-dropped and the rest intact (Q-034 filter semantics).
+        let dir = tempdir().unwrap();
+        let store = pending_store(dir.path());
+        let key = signing_key(46);
+        let state = RpcState::in_memory(1).unwrap().with_pending_store(store.clone());
+        let mut big = signed_transfer(&key, 0, 1);
+        big.data = vec![0; 32 * 1024];
+        let signature = key.sign(&big.signing_payload()).to_bytes();
+        big.signature = subhost_core::TransactionSignature::from_ed25519(&signature);
+        let small = signed_transfer(&key, 1, 1);
+
+        let mut old = Mempool::new(subhost_mempool::MempoolConfig {
+            max_tx_data_bytes: 128 * 1024,
+            ..Default::default()
+        });
+        old.add(big.clone()).unwrap();
+        old.add(small.clone()).unwrap();
+        store.persist(&old).unwrap();
+
+        state.restore_pending().unwrap();
+        let pool = read(&state.mempool);
+        assert_eq!(pool.len(), 1);
+        assert!(pool.contains(&small.hash()));
+        assert!(!pool.contains(&big.hash()));
     }
 }

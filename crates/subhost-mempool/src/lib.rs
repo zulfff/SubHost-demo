@@ -24,7 +24,10 @@ pub struct MempoolConfig {
     pub max_per_sender: usize,
     /// Transactions below this gas price are rejected outright.
     pub min_gas_price: u128,
-    /// Maximum calldata size accepted for one pending transaction.
+    /// Maximum calldata size accepted for one pending transaction. The
+    /// default is deliberately below the 128 KiB protocol upper bound: at the
+    /// Q-037 floor rate (16 gas/byte) a max-size transaction must cost real
+    /// gas, and one transaction cannot dominate a block's calldata (L0).
     pub max_tx_data_bytes: usize,
     /// Aggregate encoded-byte budget for the live pool, enforced with
     /// persistence on or off. Count and per-sender caps alone do not bound
@@ -38,7 +41,7 @@ impl Default for MempoolConfig {
             max_pending: 10_000,
             max_per_sender: 64,
             min_gas_price: 1,
-            max_tx_data_bytes: 128 * 1024,
+            max_tx_data_bytes: 16 * 1024,
             // Half the snapshot file cap, so a pool that fits the runtime budget
             // still fits `mempool.bin` with its framing overhead.
             max_pending_bytes: 32 * 1024 * 1024,
@@ -77,6 +80,25 @@ fn encoded_bytes(tx: &Transaction) -> usize {
         .unwrap_or(usize::MAX)
 }
 
+/// Compare fee density — gas price per encoded byte — by cross-multiplication
+/// so no division precision is lost. Products are checked u128: an overflowing
+/// side is the denser one, and if both overflow the raw gas prices decide.
+/// Deterministic for any pair of transactions (L0, Q-037 interim C).
+fn fee_density_cmp(
+    left: &Transaction,
+    left_bytes: u128,
+    right: &Transaction,
+    right_bytes: u128,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (left.gas_price.checked_mul(right_bytes), right.gas_price.checked_mul(left_bytes)) {
+        (Some(l), Some(r)) => l.cmp(&r),
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (None, None) => left.gas_price.cmp(&right.gas_price),
+    }
+}
+
 /// The outcome of accepting a transaction into the pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Admission {
@@ -94,9 +116,9 @@ pub struct Admission {
 ///
 /// Rules enforced:
 /// - One transaction per `(sender, nonce)`; a resubmission for the same nonce
-///   only wins with a strictly higher gas price.
+///   only wins with a strictly higher fee density (gas price per encoded byte).
 /// - A per-sender nonce budget and a global capacity cap, evicting the
-///   lowest-gas-price transaction when full.
+///   lowest-fee-density transaction when full.
 /// - Deterministic proposal ordering: highest gas price first, then sender, then
 ///   nonce.
 #[derive(Debug, Clone)]
@@ -225,9 +247,13 @@ impl Mempool {
         // (1) Replace-by-fee for an occupied (sender, nonce) slot.
         let existing = self.by_sender.get(&sender).and_then(|nonces| nonces.get(&nonce)).copied();
         if let Some(existing_hash) = existing {
-            let existing_price =
-                self.txs.get(&existing_hash).map_or(0, |existing| existing.gas_price);
-            if tx.gas_price <= existing_price {
+            // Replace-by-fee ranks by fee density, not raw price: a higher
+            // price attached to far more bytes is not a better offer (L0).
+            let wins = self.txs.get(&existing_hash).is_none_or(|existing| {
+                fee_density_cmp(&tx, tx_bytes as u128, existing, encoded_bytes(existing) as u128)
+                    == std::cmp::Ordering::Greater
+            });
+            if !wins {
                 return Ok(Admission { hash: existing_hash, accepted: false, displaced: None });
             }
             displaced = self.txs.remove(&existing_hash);
@@ -415,18 +441,20 @@ impl Mempool {
     }
 
     fn evict_lowest_priority(&mut self) -> Result<Option<Transaction>, MempoolError> {
-        // Cheapest first; among equals drop the highest nonce so the remaining
-        // per-sender sequence stays contiguous from the bottom.
+        // Lowest fee density first; among equals drop the highest nonce so the
+        // remaining per-sender sequence stays contiguous from the bottom, then
+        // the hash for determinism. Sizes are measured once per candidate, the
+        // same way the byte budget measures them (L0, Q-037 interim C).
         let victim = self
             .txs
             .iter()
-            .min_by(|(left_hash, left), (right_hash, right)| {
-                left.gas_price
-                    .cmp(&right.gas_price)
+            .map(|(hash, tx)| (hash, tx, encoded_bytes(tx) as u128))
+            .min_by(|(left_hash, left, left_bytes), (right_hash, right, right_bytes)| {
+                fee_density_cmp(left, *left_bytes, right, *right_bytes)
                     .then_with(|| right.nonce.cmp(&left.nonce))
                     .then_with(|| left_hash.cmp(right_hash))
             })
-            .map(|(hash, _)| *hash);
+            .map(|(hash, _, _)| *hash);
 
         match victim {
             Some(hash) => {
@@ -821,9 +849,10 @@ mod tests {
         pool.add(tx(2, 0, 10)).unwrap();
         assert_eq!(pool.pending_bytes(), measured(&pool));
 
-        let mut replacement = tx(1, 0, 20);
+        // Price high enough that fee density still wins with the extra bytes.
+        let mut replacement = tx(1, 0, 200);
         replacement.data = vec![0; 1024];
-        pool.admit(replacement).unwrap();
+        assert!(pool.admit(replacement).unwrap().accepted);
         assert_eq!(pool.pending_bytes(), measured(&pool));
 
         assert_eq!(pool.prune_below_nonce(&Address::new([1; 20]), 1), 1);
@@ -839,7 +868,11 @@ mod tests {
     #[test]
     fn the_byte_budget_binds_with_no_persistence_configured() {
         // No store, no snapshot: the runtime budget is the only memory bound.
-        let mut pool = Mempool::new(MempoolConfig { max_per_sender: 1_000, ..Default::default() });
+        let mut pool = Mempool::new(MempoolConfig {
+            max_per_sender: 1_000,
+            max_tx_data_bytes: 128 * 1024,
+            ..Default::default()
+        });
         let mut template = tx(1, 0, 10);
         template.data = vec![0; 128 * 1024];
         for nonce in 0..400 {
@@ -858,5 +891,118 @@ mod tests {
             Mempool::try_new(MempoolConfig { max_pending_bytes: 0, ..Default::default() }),
             Err(MempoolError::InvalidConfig(_))
         ));
+    }
+    // --- Q-037 L0: tighter cap and fee-density ranking ---
+
+    fn sized(sender: u8, nonce: u64, gas_price: u128, data_bytes: usize) -> Transaction {
+        let mut transaction = tx(sender, nonce, gas_price);
+        transaction.data = vec![0; data_bytes];
+        transaction
+    }
+
+    #[test]
+    fn the_default_calldata_cap_is_sixteen_kibibytes() {
+        assert_eq!(MempoolConfig::default().max_tx_data_bytes, 16 * 1024);
+        let mut pool = Mempool::default();
+        assert!(matches!(
+            pool.admit(sized(1, 0, 10, 16 * 1024 + 1)),
+            Err(MempoolError::DataTooLarge { provided, max }) if provided == 16 * 1024 + 1 && max == 16 * 1024
+        ));
+        pool.admit(sized(1, 0, 10, 16 * 1024)).unwrap();
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn replacement_ranks_by_fee_density_not_raw_price() {
+        let mut pool = Mempool::default();
+        let original = tx(1, 0, 100);
+        pool.add(original.clone()).unwrap();
+
+        // A higher raw price spread over far more bytes is a worse offer.
+        let bloated = sized(1, 0, 150, 8192);
+        let rejected = pool.admit(bloated).unwrap();
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.hash, original.hash());
+
+        // A much higher price with modest bytes wins.
+        let better = sized(1, 0, 10_000, 1024);
+        let accepted = pool.admit(better.clone()).unwrap();
+        assert!(accepted.accepted);
+        assert_eq!(accepted.displaced.unwrap().hash(), original.hash());
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn capacity_eviction_drops_the_lowest_fee_density_first() {
+        let mut pool = Mempool::new(MempoolConfig { max_pending: 2, ..Default::default() });
+        let dense = tx(1, 0, 10);
+        let bloated = sized(2, 0, 20, 8192);
+        pool.add(dense.clone()).unwrap();
+        pool.add(bloated.clone()).unwrap();
+
+        // The newcomer has the lowest raw price, but the bloated entry has the
+        // lowest fee density, so it is the victim.
+        let admission = pool.admit(tx(3, 0, 5)).unwrap();
+        assert_eq!(admission.displaced.unwrap().hash(), bloated.hash());
+        assert!(pool.contains(&dense.hash()));
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn byte_budget_eviction_drops_the_lowest_fee_density_first() {
+        // Composition with the S6.1b runtime byte budget (nara's L0 ask): the
+        // budget loop reuses evict_lowest_priority, so it inherits fee density.
+        let dense = tx(1, 0, 10);
+        let bloated = sized(2, 0, 20, 8192);
+        let one = usize::try_from(bincode::serialized_size(&dense).unwrap()).unwrap();
+        let bloat = usize::try_from(bincode::serialized_size(&bloated).unwrap()).unwrap();
+        let mut pool = Mempool::new(MempoolConfig {
+            max_pending_bytes: one + bloat + one / 2,
+            ..Default::default()
+        });
+        pool.add(dense.clone()).unwrap();
+        pool.add(bloated.clone()).unwrap();
+
+        let admission = pool.admit(tx(3, 0, 5)).unwrap();
+        assert_eq!(admission.displaced.unwrap().hash(), bloated.hash());
+        assert!(pool.contains(&dense.hash()));
+        assert!(pool.pending_bytes() <= pool.config().max_pending_bytes);
+    }
+
+    #[test]
+    fn an_overflowing_fee_density_ranks_highest() {
+        let mut pool = Mempool::new(MempoolConfig { max_pending: 2, ..Default::default() });
+        // A price whose density product overflows u128 while total_cost still
+        // fits (gas_limit 1), so admission accepts it but ranking must not
+        // panic or wrap: the overflowing side is the denser one.
+        let mut saturating = tx(1, 0, u128::MAX - 1_000);
+        saturating.gas_limit = 1;
+        let normal = tx(2, 0, 10);
+        pool.add(saturating.clone()).unwrap();
+        pool.add(normal.clone()).unwrap();
+
+        let admission = pool.admit(tx(3, 0, 5)).unwrap();
+        assert_eq!(admission.displaced.unwrap().hash(), normal.hash());
+        assert!(pool.contains(&saturating.hash()));
+
+        // Both products overflow: the raw gas prices decide, deterministically.
+        let mut lower = tx(1, 0, u128::MAX - 2_000);
+        lower.gas_limit = 1;
+        let rejected = pool.admit(lower).unwrap();
+        assert!(!rejected.accepted);
+        assert_eq!(rejected.hash, saturating.hash());
+    }
+
+    #[test]
+    fn restore_admission_drops_entries_over_the_tighter_cap() {
+        // nara's L0 ask: the Q-034 restore filter is just a cap, so entries
+        // persisted under the old 128 KiB default are cap-dropped on restore.
+        let mut pool = Mempool::default();
+        assert!(matches!(
+            pool.admit_restored(sized(1, 0, 10, 32 * 1024)),
+            Err(MempoolError::DataTooLarge { .. })
+        ));
+        pool.admit_restored(sized(1, 0, 10, 16 * 1024)).unwrap();
+        assert_eq!(pool.len(), 1);
     }
 }
