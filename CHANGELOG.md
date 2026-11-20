@@ -329,6 +329,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **The node sweeps expired pending transactions on a timer (S6.3, Q-039
+  follow-up).** `RpcState::expire_pending` (Q-044) drops entries past
+  `MempoolConfig.tx_ttl` and publishes their `expired` events under one pool
+  lock, but until now only an admission triggered a sweep, so an idle node kept
+  expired entries and a frozen `expired` counter. `run_until` now runs one
+  30 second interval task that calls it, immediate first tick included, so a
+  pool restored from `mempool.bin` is also swept at startup. The sweep is
+  best-effort and returns a count, never an error, so it cannot fail or delay a
+  commit, and the cadence is deliberately not configurable in this slice.
+
 - **`subhost_connected_peers` is live (S8, Q-032 follow-up).** `NetworkHandle`
   exposes the connected-peer count and a watch receiver, updated when a
   connection is established and when a peer's last connection closes; several
