@@ -939,7 +939,6 @@ dependencies = [
  "fiat-crypto 0.2.9",
  "rustc_version",
  "subtle",
- "zeroize",
 ]
 
 [[package]]
@@ -2401,7 +2400,7 @@ dependencies = [
  "static_assertions",
  "thiserror 2.0.21",
  "tracing",
- "x25519-dalek 3.0.0",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -4047,7 +4046,7 @@ dependencies = [
  "sha2 0.10.9",
  "sha3",
  "thiserror 2.0.21",
- "x25519-dalek 2.0.1",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -5210,18 +5209,6 @@ name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
-
-[[package]]
-name = "x25519-dalek"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
-dependencies = [
- "curve25519-dalek 4.1.3",
- "rand_core 0.6.4",
- "serde",
- "zeroize",
-]
 
 [[package]]
 name = "x25519-dalek"
