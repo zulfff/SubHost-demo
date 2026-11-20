@@ -45,8 +45,8 @@ subhost node --validator \
   fail-closed, no plaintext fallback. See
   [producer-keystore.md](producer-keystore.md).
 - `--retention-blocks <N>` configures automatic ledger retention (unset = off).
-  Accepted now, inert until the Q-036 trigger slice lands; semantics and the
-  snapshot floor are in [ledger-repair.md](ledger-repair.md).
+  The node prunes after a successful commit when the retained span exceeds N;
+  semantics and the snapshot floor are in [ledger-repair.md](ledger-repair.md).
 - `--mempool-persist` opts into a durable pending pool
   (`<data-dir>/mempool.bin`, restored on start-up; a corrupt or foreign
   snapshot refuses boot). Default off keeps the pool volatile. See

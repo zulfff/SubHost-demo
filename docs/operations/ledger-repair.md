@@ -63,21 +63,24 @@ prune to "fix" a load failure, and never prune below the snapshot anchor.
 ### Automatic retention (`--retention-blocks`, Q-036)
 
 `subhost node --retention-blocks <N>` configures automatic height-based
-retention: once the trigger slice lands, the node prunes after a successful
-commit when `tip - base_height > N`, without an operator command. Unset = off
-(the default; today's offline-only behaviour). The flag is **accepted now but
-inert** until the node-side trigger lands: `subhost db prune` remains the only
-prune path until then.
+retention: the node prunes after a successful commit when
+`tip - base_height > N`, without an operator command. Unset = off (the
+default); `subhost db prune` then remains the only prune path.
 
-Semantics once active (agreed in Q-036):
+Semantics (agreed in Q-036):
 
 - **The newest snapshot is the hard floor.** Automatic retention never prunes
   below the newest snapshot anchor, so the real bound is *snapshot cadence + N*,
-  not exactly `N`. A prune refused by the floor is a logged no-op, never an
-  error that halts the node.
+  not exactly `N`. A prune refused by the floor is a normal no-op, logged and
+  counted as `refused_by_snapshot`, never an error that halts the node.
 - **Failure never halts.** A failed prune is logged and counted, never
   propagated, and never fails the block commit. `subhost_ledger_active_bytes`
-  is the operator signal that retention is not keeping up.
+  is the growth signal that retention is not keeping up; refusals themselves
+  are not an alert condition.
+- **No-progress attempts back off.** Only a `Pruned` outcome is progress; a
+  snapshot refusal or a storage error waits `max(1, N / 8)` blocks before the
+  next attempt, so a persistent floor does not turn every commit into a prune
+  attempt. The backoff only delays an attempt; it never raises the bound.
 - **Any `N >= 1` is allowed; below 4096 the node warns at boot.** Aggressive
   values make the node a degraded sync source: heights it no longer retains
   are unavailable to peers (never an error, see
@@ -86,8 +89,8 @@ Semantics once active (agreed in Q-036):
   run lean; a public serving node should keep at least the certified-archive
   window.
 - Retention applies to validator/observer chains where committed = final.
-  Explicit `--single-writer` demo mode has committed ≠ final; automatic
-  retention there is a demo-only operation.
+  Explicit `--single-writer` demo mode has committed ≠ final, so automatic
+  retention is NOT installed there; the node warns at boot that it is off.
 
 `subhost db prune --keep-segments` stays the offline tool (segment-count unit,
 process stopped); `--retention-blocks` is the online height policy. They share
