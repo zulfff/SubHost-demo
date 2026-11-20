@@ -23,7 +23,7 @@ gated rules only after their call-sites land, or they fire on a healthy chain.
 | QC commit latency | `subhost_qc_commit_latency_seconds` | **live** (samples only for proposals this node authenticated; catch-up commits add none) |
 | Ledger disk footprint | `subhost_ledger_active_bytes` | **live** (`disk_stats` under the commit lock; a failed measurement keeps the last value) |
 | Snapshot age | `subhost_ledger_snapshot_modified_seconds` | **live** (same measurement; 0 means unavailable, not an epoch) |
-| Connected peers | `subhost_connected_peers` | **gated**: stays 0 until a network handle accessor is wired |
+| Connected peers | `subhost_connected_peers` | **live**: transport connections, updated on each change; a connected peer may not have announced the topic yet |
 | Reorg count | `subhost_reorg_total` | registered at 0, **no increment API**: reorgs unsupported; never alert on it |
 | Pending-file cleanup failures | `subhost_mempool_pending_cleanup_failures_total` | **gated**: registered at 0 and *will* increment once the S6.1b node wiring lands (unlike reorgs, whose 0 is permanent). Enable `SubhostPendingCleanupFailing` with that wiring |
 | Ledger prune outcomes | `subhost_ledger_prune_total{outcome}` | **gated**: registered at 0 (three bounded labels); recording is wired into `RpcState::retain_from` and increments once a retention caller drives it. Refusals are normal no-ops, not faults: no refusal alert |

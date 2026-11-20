@@ -271,6 +271,7 @@ pub struct NetworkHandle {
     pub inbound: mpsc::Receiver<NetworkMessage>,
     pub local_peer_id: PeerId,
     subscribed_peers: watch::Receiver<usize>,
+    connected_peers: watch::Receiver<usize>,
 }
 
 impl NetworkHandle {
@@ -282,6 +283,23 @@ impl NetworkHandle {
     pub fn subscribed_peer_count(&self) -> usize {
         *self.subscribed_peers.borrow()
     }
+
+    /// Peers this node currently holds a transport connection to.
+    ///
+    /// Plain transport reachability, not topic participation: a peer can be
+    /// connected and still not have announced the application topic.
+    pub fn connected_peer_count(&self) -> usize {
+        *self.connected_peers.borrow()
+    }
+
+    /// Watch the connected-peer count instead of polling it.
+    ///
+    /// The value changes when a connection is established or its last
+    /// connection closes, so a consumer that publishes a gauge can wake on
+    /// each change rather than sampling a timer.
+    pub fn watch_connected_peers(&self) -> watch::Receiver<usize> {
+        self.connected_peers.clone()
+    }
 }
 
 /// Owns the libp2p swarm and pumps messages in both directions.
@@ -289,6 +307,7 @@ pub struct NetworkManager {
     swarm: Swarm<SubhostBehavior>,
     config: NetworkConfig,
     connected_peers: HashSet<PeerId>,
+    connected_peer_count: watch::Sender<usize>,
     subscribed_peers: HashSet<PeerId>,
     subscribed_peer_count: watch::Sender<usize>,
     topic: IdentTopic,
@@ -368,12 +387,14 @@ impl NetworkManager {
         let (outbound_tx, outbound_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (inbound_tx, inbound_rx) = mpsc::channel(CHANNEL_CAPACITY);
         let (subscribed_peer_count, subscribed_peers) = watch::channel(0);
+        let (connected_peer_count, connected_peers) = watch::channel(0);
 
         Ok((
             Self {
                 swarm,
                 config,
                 connected_peers: HashSet::new(),
+                connected_peer_count,
                 subscribed_peers: HashSet::new(),
                 subscribed_peer_count,
                 topic,
@@ -387,6 +408,7 @@ impl NetworkManager {
                 inbound: inbound_rx,
                 local_peer_id,
                 subscribed_peers,
+                connected_peers,
             },
         ))
     }
@@ -447,11 +469,23 @@ impl NetworkManager {
         }
     }
 
+    /// Record a transport connection and publish the count when it is new.
+    ///
+    /// libp2p can report several connections for the same peer, so the set,
+    /// not the event, is the source of truth for the gauge.
+    fn note_connected(&mut self, peer_id: PeerId) {
+        if self.connected_peers.insert(peer_id) {
+            self.connected_peer_count.send_replace(self.connected_peers.len());
+        }
+    }
+
     fn note_connection_closed(&mut self, peer_id: PeerId, remaining: u32) {
         if remaining != 0 {
             return;
         }
-        self.connected_peers.remove(&peer_id);
+        if self.connected_peers.remove(&peer_id) {
+            self.connected_peer_count.send_replace(self.connected_peers.len());
+        }
         if self.subscribed_peers.remove(&peer_id) {
             self.subscribed_peer_count.send_replace(self.subscribed_peers.len());
         }
@@ -503,7 +537,7 @@ impl NetworkManager {
                 info!(%address, "listening");
             }
             SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } => {
-                self.connected_peers.insert(peer_id);
+                self.note_connected(peer_id);
                 for peer in &mut self.bootstrap {
                     if peer.attempt == Some(connection_id) {
                         peer.attempt = None;
@@ -627,7 +661,7 @@ mod tests {
             NetworkManager::new(NetworkConfig { enable_mdns: false, ..Default::default() })
                 .unwrap();
         manager.bootstrap = vec![retry];
-        manager.connected_peers.insert(peer_id);
+        manager.note_connected(peer_id);
         manager.note_connection_closed(peer_id, 1);
         assert_eq!(manager.connected_peer_count(), 1);
         assert_eq!(manager.bootstrap[0].connected, Some(peer_id));
@@ -843,6 +877,45 @@ mod tests {
             &serde_json::to_vec(&NetworkMessage::DagVertex { data: Vec::new() }).unwrap(),
         );
         assert!(handle.inbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn handle_publishes_the_connected_peer_count() {
+        let (mut manager, handle) =
+            NetworkManager::new(NetworkConfig { enable_mdns: false, ..Default::default() })
+                .unwrap();
+        assert_eq!(handle.connected_peer_count(), 0);
+
+        let peer_id = PeerId::random();
+        // Several connections for one peer are still one connected peer.
+        manager.note_connected(peer_id);
+        manager.note_connected(peer_id);
+        assert_eq!(handle.connected_peer_count(), 1);
+
+        // One connection closing leaves the peer connected while another lives.
+        manager.note_connection_closed(peer_id, 1);
+        assert_eq!(handle.connected_peer_count(), 1);
+
+        manager.note_connection_closed(peer_id, 0);
+        assert_eq!(handle.connected_peer_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn connected_peer_watch_wakes_on_every_change() {
+        let (mut manager, handle) =
+            NetworkManager::new(NetworkConfig { enable_mdns: false, ..Default::default() })
+                .unwrap();
+        let mut count = handle.watch_connected_peers();
+        assert_eq!(*count.borrow(), 0);
+
+        let peer_id = PeerId::random();
+        manager.note_connected(peer_id);
+        count.changed().await.unwrap();
+        assert_eq!(*count.borrow(), 1);
+
+        manager.note_connection_closed(peer_id, 0);
+        count.changed().await.unwrap();
+        assert_eq!(*count.borrow(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

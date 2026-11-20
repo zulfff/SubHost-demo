@@ -954,7 +954,14 @@ async fn run_network_inner(
 ) -> Result<(), NodeError> {
     let (manager, handle) = NetworkManager::new(config)?;
     let local_peer_id = handle.local_peer_id;
+    // S8 `subhost_connected_peers`: the network reports every connection change
+    // on a watch channel, so the gauge follows the real transport state instead
+    // of sampling a timer. The task ends when the manager drops the sender.
+    let connected_peers = handle.watch_connected_peers();
     let NetworkHandle { outbound, mut inbound, .. } = handle;
+    if let Some(metrics) = services.metrics.clone() {
+        tokio::spawn(publish_connected_peers(metrics, connected_peers));
+    }
     info!(%local_peer_id, "starting peer gossip");
 
     let mut block_events = state.subscribe_blocks();
@@ -1753,6 +1760,18 @@ impl RuntimeHealth {
 /// the incident; a pipeline that exited is not alive either.
 fn publish_health(metrics: &Metrics, runtime: &RuntimeHealth, halted: bool) {
     runtime.publish(metrics, halted);
+}
+
+/// Publish `subhost_connected_peers` from the network's watch channel.
+///
+/// Event-driven on purpose: a connection change is visible immediately, and the
+/// task ends as soon as the network drops its sender, so nothing polls or
+/// outlives the swarm.
+async fn publish_connected_peers(metrics: Metrics, mut count: tokio::sync::watch::Receiver<usize>) {
+    metrics.set_connected_peers(*count.borrow_and_update());
+    while count.changed().await.is_ok() {
+        metrics.set_connected_peers(*count.borrow_and_update());
+    }
 }
 
 /// Publish the ledger footprint gauges, keeping the last value on failure.

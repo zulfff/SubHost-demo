@@ -317,6 +317,16 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **`subhost_connected_peers` is live (S8, Q-032 follow-up).** `NetworkHandle`
+  exposes the connected-peer count and a watch receiver, updated when a
+  connection is established and when a peer's last connection closes; several
+  connections for one peer still count once. The node publishes the gauge from
+  that watch instead of sampling the 5 second metrics tick, so a connection
+  change is visible immediately, and the task ends with the swarm. The gauge is
+  transport reachability, not topic participation: a peer can be connected
+  before it announces the application topic. A node without networking
+  publishes 0.
+
 - **Automatic ledger retention in the node (Q-036 Q6, S12.3).**
   `NodeConfig.retention_blocks = Some(n)` now prunes instead of being inert. The
   trigger runs once per successful commit, on the produced path and on certified
