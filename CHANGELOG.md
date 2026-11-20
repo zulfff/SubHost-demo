@@ -457,6 +457,41 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   round-trip, oversized refusal, mixed-version refusal, ephemeral floor,
   both prune round-trips, manifest byte-identity) plus 3 rpc binding tests.
   Replay-only: block production and admission wiring remain L4.
+- **Calldata floor activation wiring and first version-3 production (Q-037 L4,
+  ADR-015, SUBHOST-2026-003).** The block path now activates the genesis-bound
+  calldata schedule end to end, the last code rung of the Q-037 ladder. The
+  header-version switch produces and accepts version 3 whenever a schedule is
+  bound, with or without a fee policy (a priced genesis never produces or
+  accepts version 2); fee-only chains stay version 2 and policy-less chains
+  stay version 1. The same pure `CalldataPolicy::check_floor` is enforced at
+  four block-path sites: admission (`submit_transaction`) refuses
+  under-intrinsic gas and the protocol calldata cap before the pool is touched,
+  independent of the local mempool cap; selection (`select_transactions`)
+  breaks the sender's nonce-ordered lane at the first floor-failing entry (no
+  resurrection, other lanes unaffected); acceptance (`validate_candidate`)
+  refuses a floor-invalid transaction before the state transition and before
+  any persist, on the single funnel every accept path shares; and restore
+  (`restore_pending`) drops floor-invalid entries before admission so they
+  never park. The restore filter order is mined nonce, floor, budget, then
+  admission, first match one reason, with a dedicated `floor_dropped` counter
+  and an observation-only `cap_dropped` split (the drop set is identical to
+  L0). The node binds the schedule into both the store and the RPC state from
+  one genesis document and persists the height-0 anchor for a priced genesis
+  even with no allocations. Acceptance and replay run the same check under the
+  same bound schedule, so an accepted block can never fail the persist floor
+  afterwards (Q-024). Empty blocks stay fee-keyed: a calldata-only chain skips
+  empty selections and carries base fee 0. Acceptance enforces the protocol cap
+  (128 KiB) plus the intrinsic floor, both consensus validity, while the 16 KiB
+  cap stays mempool-local, so a peer block with a 128 KiB validly-priced
+  transaction is accepted by a node whose local cap is 16 KiB. Tests: 15 rpc
+  tests (header matrix, admission refusals, selection lane isolation,
+  acceptance floor before state transition, exactly-at-cap acceptance,
+  accept/persist round-trip, restore counter split, gas-mismatch bind refusal)
+  plus 5 node bootstrap tests (v3 seal and restart, priced empty-allocation
+  anchor, joint fee and calldata empty v3, legacy and fee-only v2 directory
+  refusals). This is the activation wiring: with a priced genesis it closes the
+  SUBHOST-2026-003 cheap-calldata residual at admission and acceptance, pending
+  the activation re-probe.
 - **OTLP export wiring in the `subhost` CLI (S8.1, Q-035).** The CLI now enables
   the `subhost-telemetry` `otlp` feature and wires the merged provider (#74):
   a global `--otlp-endpoint <URL>` flag (env `SUBHOST_OTLP_ENDPOINT`) opts in to
