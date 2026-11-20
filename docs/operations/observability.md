@@ -95,8 +95,12 @@ tracked as A follow-up). Idempotent resubmissions
 and lower-price rejections buffer nothing; mined removals are not lifecycle
 events.
 
-`expired` stays at 0: no TTL/expiry path exists in the pool or node yet. It
-wires when the S6.3 expiry lifecycle lands.
+`expired` moves from two paths: the lazy sweep on every admission (#103) and a
+30 second node timer that calls `RpcState::expire_pending`, so an idle node does
+not keep entries past their TTL. Both drop the entry and publish its `expired`
+event under one pool lock, so the counter and the sender-depth gauges stay
+current without waiting for the next admission. A restart gives restored entries
+a fresh TTL window; see [mempool-persistence.md](mempool-persistence.md).
 
 ## RPC method spans (S8.1)
 

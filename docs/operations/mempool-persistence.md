@@ -61,9 +61,12 @@ Pending entries expire after `MempoolConfig::tx_ttl` (default 30 minutes; a
 zero value is refused at configuration time). Expiry is lazy: each admission
 first drops entries admitted at or before `now - tx_ttl`, before capacity or
 byte-budget eviction runs, so an expired entry never displaces a live one.
-The node has no background sweep yet; expiry runs on admission only until the
-optional node timer lands (`Mempool::expire_before(now)` is public and takes
-the clock as an argument, so a timer can drive the same sweep). Because the
+Expiry also runs on a 30 second timer in the node, so an idle node does not keep
+expired entries and the `expired` counter stays current. The timer calls
+`RpcState::expire_pending`, which drops the entries and publishes their events
+under one pool lock. The cadence is fixed in this slice;
+`Mempool::expire_before(now)` remains the public sweep that takes the clock as
+an argument. Because the
 snapshot stores transactions, not admission timestamps, restoring
 `mempool.bin` gives every entry a fresh TTL window; the operator-facing
 consequence is documented in the restart section of

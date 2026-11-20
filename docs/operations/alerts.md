@@ -18,7 +18,7 @@ gated rules only after their call-sites land, or they fire on a healthy chain.
 | Pending pool depth | `subhost_pending_transactions` | **live** |
 | Readiness/liveness | `/health/ready`, `/health/live` | **live** (`ledger_loaded && !syncing && consensus_alive`) |
 | RPC requests/errors/latency | `subhost_rpc_*` | **live** |
-| Mempool lifecycle | `subhost_mempool_transactions_total{event}` | **live** (pool-committed; `expired` is 0 until S6.3) |
+| Mempool lifecycle | `subhost_mempool_transactions_total{event}` | **live** (pool-committed; `expired` moves on admission sweeps and on the 30 s node timer) |
 | Finalized height | `subhost_finalized_height` | **live** (verified final Commit path; a single-writer demo chain publishes 0 by design) |
 | QC commit latency | `subhost_qc_commit_latency_seconds` | **live** (samples only for proposals this node authenticated; catch-up commits add none) |
 | Ledger disk footprint | `subhost_ledger_active_bytes` | **live** (`disk_stats` under the commit lock; a failed measurement keeps the last value) |

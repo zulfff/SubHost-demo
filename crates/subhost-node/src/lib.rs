@@ -74,6 +74,14 @@ pub const GENESIS_FILE_NAME: &str = "genesis.json";
 /// wallet keystore and is not encrypted; `ROADMAP.md` S9.6 replaces it.
 pub const PRODUCER_KEY_FILE_NAME: &str = "producer.key";
 
+/// How often the node drops pending transactions past their TTL (S6.3).
+///
+/// The mempool also sweeps lazily on every admission, so this timer only bounds
+/// how long an expired entry survives on a node that receives no traffic. It is
+/// deliberately not configurable: expiry is maintenance, and a tighter bound
+/// costs a write lock per tick for no correctness gain.
+const MEMPOOL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Everything needed to start a node.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -676,6 +684,16 @@ impl Node {
             services.spawn(async move {
                 metrics.serve(MetricsConfig { listen_addr: addr }).await?;
                 Err(NodeError::ServiceStopped("metrics exporter"))
+            });
+        }
+        {
+            // S6.3: expire pending transactions on a timer so an idle node still
+            // publishes the `expired` counter and the sender-depth gauges. The
+            // sweep is best-effort and cannot fail the pipeline.
+            let state = state.clone();
+            services.spawn(async move {
+                sweep_expired_transactions(state, MEMPOOL_SWEEP_INTERVAL).await;
+                Ok(())
             });
         }
         {
@@ -1752,6 +1770,27 @@ impl RuntimeHealth {
     fn take_qc_latency(&self, view: u64) -> Option<f64> {
         let mut seen = self.proposal_seen.lock().ok()?;
         seen.remove(&view).map(|at| at.elapsed().as_secs_f64())
+    }
+}
+
+/// Drop pending transactions past their TTL on a fixed cadence (S6.3).
+///
+/// `RpcState::expire_pending` removes the entries and publishes their `expired`
+/// lifecycle events under one pool lock, so the counter and the sender-depth
+/// gauges move even on a node that receives no admissions. A sweep returns a
+/// count and never an error: expiry is maintenance, not correctness, and a
+/// failure here must not disturb the block pipeline.
+async fn sweep_expired_transactions(state: RpcState, interval: std::time::Duration) {
+    // The first tick completes immediately, so a pool restored from
+    // `mempool.bin` is swept at startup instead of after one full interval.
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        let dropped = state.expire_pending(std::time::Instant::now());
+        if dropped > 0 {
+            debug!(dropped, "dropped expired pending transactions");
+        }
     }
 }
 

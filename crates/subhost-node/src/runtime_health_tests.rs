@@ -225,3 +225,64 @@ async fn connected_peer_gauge_follows_the_network_watch() {
     drop(sender);
     task.await.unwrap();
 }
+
+#[tokio::test]
+async fn the_sweep_timer_expires_past_ttl_entries_and_publishes_their_events() {
+    // S6.3: the timer has to move the observable values on an idle node, not
+    // merely run. Nothing else flushes here, so the expired counter starts at 0
+    // and only the timer can raise it.
+    let metrics = Metrics::new().unwrap();
+    let rpc = RpcServer::new(RpcState::in_memory(1).unwrap()).with_metrics(metrics.clone());
+    let state = rpc.state().clone();
+    let key = signing_key(21);
+
+    let short_ttl = subhost_mempool::MempoolConfig {
+        tx_ttl: std::time::Duration::from_millis(30),
+        ..Default::default()
+    };
+    let mut pool = subhost_mempool::Mempool::new(short_ttl);
+    pool.add(signed_transfer(&key, 0, 10)).unwrap();
+    state.publish_pool(pool).unwrap();
+    assert_eq!(state.pending_count(), 1);
+
+    let timer = tokio::spawn(sweep_expired_transactions(
+        state.clone(),
+        std::time::Duration::from_millis(5),
+    ));
+
+    // Bounded wait instead of a fixed sleep: the entry expires once its TTL
+    // passes and the next tick drops it. A slow machine fails loudly here rather
+    // than silently passing.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while state.pending_count() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sweep timer never dropped an entry past its TTL"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    timer.abort();
+    let _ = timer.await;
+
+    // The `expired` event is published in the same call as the drop, so the
+    // counter moves without any further admission.
+    let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+    assert!(
+        rendered.contains("subhost_mempool_transactions_total{event=\"expired\"} 1"),
+        "expected exactly one expired event, got:\n{rendered}"
+    );
+
+    // A fresh entry is not collateral damage: under the default TTL it survives
+    // several sweep ticks.
+    let mut fresh = subhost_mempool::Mempool::new(subhost_mempool::MempoolConfig::default());
+    fresh.add(signed_transfer(&key, 0, 10)).unwrap();
+    state.publish_pool(fresh).unwrap();
+    let timer = tokio::spawn(sweep_expired_transactions(
+        state.clone(),
+        std::time::Duration::from_millis(5),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    timer.abort();
+    let _ = timer.await;
+    assert_eq!(state.pending_count(), 1, "a sweep must not drop an entry inside its TTL");
+}
