@@ -25,7 +25,9 @@ A node is one process assembled in `subhost-node`:
 `Node::bootstrap` loads `genesis.json` when present, opens the ledger, and applies
 genesis allocations only when no ledger exists yet. A restarted node
 restores the ledger and logs the restored height instead of re-applying allocations.
-The mempool is not persisted, so a restart loses pool entries. Transactions in
+The mempool is volatile by default, so a restart loses pool entries;
+`subhost node --mempool-persist` opts into durable pending-pool snapshots
+(see `docs/operations/mempool-persistence.md`). Transactions in
 a journalled open proposal survive with their voting obligation. Bootstrap
 reconciles certified commit intents with the ledger and refuses missing, corrupt
 or incompatible validator voting state. The journal does not authenticate
@@ -55,14 +57,23 @@ boundary. Signature enforcement therefore lives at the RPC edge, while
 
 Submission works on a clone of the mempool. `Mempool::admit` enforces, in order:
 
-- calldata at most 128 KiB, gas limit above zero, gas price at or above the minimum;
+- calldata at most the pool's `max_tx_data_bytes` (default 16 KiB since Q-037
+  L0; the protocol upper bound stays 128 KiB, `MAX_TX_DATA_BYTES`, and operators
+  may tighten the cap or explicitly restore the old default), gas limit above
+  zero, gas price at or above the minimum;
 - no overflow in `gas_price * gas_limit + value`;
-- replace-by-fee inside one `(sender, nonce)` slot, with equal or lower price
-  refused;
+- replace-by-fee inside one `(sender, nonce)` slot, ranked by fee density (gas
+  price per encoded byte), with equal or lower density refused;
 - at most 64 pending transactions per sender;
-- at most 10,000 pending transactions overall, evicting the lowest gas-price
-  transaction when full and the highest nonce among equal prices, so the remaining
-  per-sender sequence stays contiguous from the bottom.
+- at most 10,000 pending transactions overall, evicting the lowest-fee-density
+  transaction when full, then the highest nonce among equal densities and then
+  the hash, so the remaining per-sender sequence stays contiguous from the bottom.
+
+Fee density ranks replacement and eviction only (Q-037 L0): the pool's proposal
+ordering (`Mempool::pending`) stays highest gas price first, ties broken by
+`(sender, nonce)`. The submit dry-run inherits the selection budgets: a
+transaction that fits the pool cap but not the next block beside earlier pending
+entries is refused at submit, with the pool untouched.
 
 With validators configured, an executable admission replaces the pool and returns
 its hash before a block or receipt exists. The producer builds a proposal and
@@ -73,8 +84,12 @@ synchronous block write succeeds. The mempool remains volatile in both modes.
 
 The producer sorts pending senders by address, then walks each sender's
 nonce-contiguous prefix starting at that sender's current state nonce. It stops at
-the first transaction that does not fit in the remaining 30,000,000 block gas or is
-rejected by the state transition, so a block never skips a nonce for a sender.
+the first transaction that does not fit in the remaining 30,000,000 block gas,
+would push the block's calldata total over the per-block calldata budget (default
+256 KiB of `tx.data.len()`, settable via
+`RpcState::with_proposal_calldata_bytes_limit`, independent of gas and total
+bytes), or is rejected by the state transition, so a block never skips a nonce
+for a sender.
 Selection runs against a clone of the account state; the live state is untouched
 until the commit succeeds.
 
