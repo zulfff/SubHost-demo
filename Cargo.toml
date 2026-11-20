@@ -93,7 +93,7 @@ aes-gcm = "0.11"
 libp2p = { version = "0.57", features = ["tcp", "dns", "tokio", "noise", "yamux", "ping", "kad", "gossipsub", "mdns", "macros"] }
 jsonrpsee = { version = "0.24", features = ["server", "macros"] }
 http = "1"
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 axum = "0.8"
 tower-http = { version = "0.7", features = ["cors", "limit"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
