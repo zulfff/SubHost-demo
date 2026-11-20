@@ -5,6 +5,7 @@ use jsonrpsee::types::error::ErrorObject;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use subhost_consensus::ValidatorRegistry;
 use subhost_core::{
     encode_canonical, Address, Amount, Block, CalldataPolicy, ChainId, FeePolicy, Gas, Hash, Nonce,
@@ -580,11 +581,33 @@ impl RpcState {
     /// unconditionally; without a registry the events are discarded, so they
     /// neither accumulate nor publish when a registry is attached later.
     pub(crate) fn flush_mempool_events(&self) {
-        let mut pool = write(&self.mempool);
+        self.publish_pool_events(&mut write(&self.mempool));
+    }
+
+    /// Publish (or, without a registry, discard) the pool's buffered lifecycle
+    /// events. Shared by the submit flush and the expiry sweep so both use the
+    /// same drain policy under the caller's pool lock.
+    fn publish_pool_events(&self, pool: &mut Mempool) {
         match &self.metrics {
             Some(metrics) => pool.flush_events(metrics),
             None => pool.drain_events(),
         }
+    }
+
+    /// Drop pending transactions past their TTL and publish their events in the
+    /// same call, under one pool write lock (Q-044). Returns the dropped count.
+    ///
+    /// An expiry is a committed pool removal, so it buffers an `expired`
+    /// lifecycle event and republishes the sender-depth gauge here, exactly like
+    /// an admission flush. Without an attached registry the events are drained.
+    /// `now` is a clock argument so a node timer (or a test) controls the sweep;
+    /// this never errors and never persists: removals become durable at the next
+    /// pending persist, consistent with restore-resets-clock.
+    pub fn expire_pending(&self, now: Instant) -> usize {
+        let mut pool = write(&self.mempool);
+        let dropped = pool.expire_before(now);
+        self.publish_pool_events(&mut pool);
+        dropped
     }
 
     pub fn consensus_context(&self) -> Hash {
@@ -1324,5 +1347,98 @@ mod tests {
             .err()
             .expect("rate 17 does not fit the custom limit");
         assert!(error.to_string().contains("calldata policy"), "{error}");
+    }
+
+    // --- Q-044 node sweep accessor: expire_pending ---
+
+    use std::time::Duration;
+
+    fn expiry_state(ttl: Duration, txs: Vec<Transaction>) -> RpcState {
+        let state = RpcState::in_memory(1).unwrap();
+        let mut pool =
+            Mempool::new(subhost_mempool::MempoolConfig { tx_ttl: ttl, ..Default::default() });
+        for tx in txs {
+            pool.add(tx).unwrap();
+        }
+        state.publish_pool(pool).unwrap();
+        state
+    }
+
+    fn rendered(metrics: &Metrics) -> String {
+        String::from_utf8(metrics.encode().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn expire_pending_drops_past_ttl_and_publishes_the_expiry() {
+        let metrics = Metrics::new().unwrap();
+        let ttl = Duration::from_secs(30 * 60);
+        let a = signed_transfer(&signing_key(21), 0, 1);
+        let b = signed_transfer(&signing_key(22), 0, 1);
+        let mut state = expiry_state(ttl, vec![a.clone(), b.clone()]);
+        state.set_metrics(metrics.clone());
+
+        // A clock one TTL plus a second ahead of admission expires both.
+        let dropped = state.expire_pending(Instant::now() + ttl + Duration::from_secs(1));
+        assert_eq!(dropped, 2);
+        assert_eq!(state.pending_count(), 0);
+        assert!(!state.mempool.read().unwrap().contains(&a.hash()));
+        let out = rendered(&metrics);
+        assert!(out.contains("subhost_mempool_transactions_total{event=\"expired\"} 2"), "{out}");
+        assert!(out.contains("subhost_mempool_sender_depth{bucket=\"1\"} 0"), "{out}");
+    }
+
+    #[test]
+    fn expire_pending_keeps_entries_within_the_ttl() {
+        let metrics = Metrics::new().unwrap();
+        let ttl = Duration::from_secs(30 * 60);
+        let tx = signed_transfer(&signing_key(23), 0, 1);
+        let mut state = expiry_state(ttl, vec![tx.clone()]);
+        state.set_metrics(metrics.clone());
+
+        // The current clock is not yet a full TTL past admission: nothing drops.
+        assert_eq!(state.expire_pending(Instant::now()), 0);
+        assert!(state.mempool.read().unwrap().contains(&tx.hash()));
+        let out = rendered(&metrics);
+        assert!(out.contains("subhost_mempool_transactions_total{event=\"expired\"} 0"), "{out}");
+        assert!(out.contains("subhost_mempool_sender_depth{bucket=\"1\"} 1"), "{out}");
+    }
+
+    #[test]
+    fn expire_pending_without_a_registry_drains_and_still_counts() {
+        let ttl = Duration::from_secs(30 * 60);
+        let tx = signed_transfer(&signing_key(24), 0, 1);
+        let mut state = expiry_state(ttl, vec![tx]);
+        // No registry attached: the sweep drains the buffered events.
+        assert_eq!(state.expire_pending(Instant::now() + ttl + Duration::from_secs(1)), 1);
+        assert_eq!(state.pending_count(), 0);
+
+        // A registry attached later publishes nothing from before it.
+        let metrics = Metrics::new().unwrap();
+        state.set_metrics(metrics.clone());
+        state.flush_mempool_events();
+        let out = rendered(&metrics);
+        assert!(out.contains("subhost_mempool_transactions_total{event=\"expired\"} 0"), "{out}");
+    }
+
+    #[test]
+    fn expire_pending_on_an_empty_pool_is_a_no_op() {
+        let metrics = Metrics::new().unwrap();
+        let mut state = expiry_state(Duration::from_secs(60), vec![]);
+        state.set_metrics(metrics.clone());
+        assert_eq!(state.expire_pending(Instant::now() + Duration::from_secs(3600)), 0);
+        let out = rendered(&metrics);
+        assert!(out.contains("subhost_mempool_transactions_total{event=\"expired\"} 0"), "{out}");
+        assert!(out.contains("subhost_mempool_sender_depth{bucket=\"1\"} 0"), "{out}");
+    }
+
+    #[test]
+    fn expire_pending_is_idempotent() {
+        let ttl = Duration::from_secs(30 * 60);
+        let tx = signed_transfer(&signing_key(25), 0, 1);
+        let state = expiry_state(ttl, vec![tx]);
+        let future = Instant::now() + ttl + Duration::from_secs(1);
+        assert_eq!(state.expire_pending(future), 1);
+        assert_eq!(state.expire_pending(future), 0);
+        assert_eq!(state.pending_count(), 0);
     }
 }

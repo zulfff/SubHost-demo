@@ -339,6 +339,19 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   before it announces the application topic. A node without networking
   publishes 0.
 
+- **Node expiry sweep accessor `RpcState::expire_pending(now)` (Q-044).**
+  Adds the single call a node sweep timer needs: it drops pending
+  transactions past their TTL and publishes the buffered lifecycle events
+  (the `expired` counter and the sender-depth gauge) in the same call, under
+  one pool write lock, returning the dropped count. Without an attached
+  registry the events are drained, exactly like the admission flush. The
+  flush body is shared with `flush_mempool_events` via a private helper, so
+  the drain policy stays in one place and expire-plus-publish is atomic.
+  `now` is a clock argument; the accessor never errors and never persists
+  (removals become durable at the next pending persist, consistent with
+  restore-resets-clock). Additive: admission and commit paths are unchanged.
+  The node interval timer itself remains raka's wiring (Q-044).
+
 - **Automatic ledger retention in the node (Q-036 Q6, S12.3).**
   `NodeConfig.retention_blocks = Some(n)` now prunes instead of being inert. The
   trigger runs once per successful commit, on the produced path and on certified
