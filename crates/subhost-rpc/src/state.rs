@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use subhost_consensus::ValidatorRegistry;
 use subhost_core::{
-    encode_canonical, Address, Amount, Block, ChainId, FeePolicy, Gas, Hash, Nonce, Receipt,
-    Transaction, TransactionType, BLOCK_GAS_LIMIT, FEE_HEADER_VERSION,
+    encode_canonical, Address, Amount, Block, CalldataPolicy, ChainId, FeePolicy, Gas, Hash, Nonce,
+    Receipt, Transaction, TransactionType, BLOCK_GAS_LIMIT, CALLDATA_HEADER_VERSION,
+    FEE_HEADER_VERSION,
 };
 use subhost_mempool::{Mempool, MempoolStore};
 use subhost_metrics::{LedgerPruneOutcome, Metrics};
@@ -156,6 +157,13 @@ pub struct RpcState {
     /// version 2 headers with a derived base fee and end-of-block priority
     /// settlement.
     pub(crate) fee_policy: Option<FeePolicy>,
+    /// Calldata schedule inherited from a calldata-priced genesis (Q-037 L3).
+    ///
+    /// `None` keeps calldata unpriced. A schedule makes the node enforce the
+    /// intrinsic gas floor on version 3 blocks, and the store replays that
+    /// floor from the recorded schedule on every load. Independent of the fee
+    /// policy: a calldata-only chain binds this with no fee policy at all.
+    pub(crate) calldata_policy: Option<CalldataPolicy>,
     /// Block gas limit this chain produces and accepts, from the genesis
     /// document. Defaults to [`BLOCK_GAS_LIMIT`]; a genesis that names a
     /// different limit is honoured end to end (S6.2 step 3).
@@ -210,6 +218,7 @@ impl RpcState {
             validators: None,
             metrics: None,
             fee_policy: None,
+            calldata_policy: None,
             block_gas_limit: BLOCK_GAS_LIMIT,
             pending_store: None,
         })
@@ -285,6 +294,47 @@ impl RpcState {
     /// The fee policy in force, when this chain is fee-enabled.
     pub fn fee_policy(&self) -> Option<&FeePolicy> {
         self.fee_policy.as_ref()
+    }
+
+    /// Adopt the calldata schedule of a calldata-priced genesis (Q-037 L3).
+    ///
+    /// Mirrors [`Self::with_fee_policy`]: refuses a schedule that cannot frame
+    /// this chain's gas limit, and refuses to price a restored pre-version-3
+    /// ledger, whose calldata was committed unpriced; continuing it under a
+    /// floor would reinterpret history, so the caller must use a fresh data
+    /// directory. A restored tip must also sit in the same gas-limit frame.
+    /// Nothing here rewrites or discards existing data.
+    pub fn with_calldata_policy(mut self, policy: CalldataPolicy) -> Result<Self, RpcError> {
+        policy
+            .validate(self.block_gas_limit)
+            .map_err(|error| RpcError::BlockRejected(format!("calldata policy: {error}")))?;
+        let pre_v3_history =
+            read(&self.blocks).iter().any(|block| block.header.version < CALLDATA_HEADER_VERSION);
+        if pre_v3_history {
+            return Err(RpcError::BlockRejected(
+                "calldata-priced genesis cannot extend a pre-version-3 ledger; use a fresh data directory"
+                    .into(),
+            ));
+        }
+        if let Some(tip) = read(&self.blocks).last() {
+            if tip.header.gas_limit != self.block_gas_limit {
+                return Err(RpcError::BlockRejected(format!(
+                    "genesis gas limit {} does not match the restored ledger's {}",
+                    self.block_gas_limit, tip.header.gas_limit
+                )));
+            }
+        }
+        self.calldata_policy = Some(policy);
+        // The store replays the floor on every load and persist, so it needs
+        // the same schedule. Clones share the verified-head cache, so replacing
+        // the handle is safe, exactly as for the fee policy.
+        self.store = self.store.clone().with_calldata_policy(policy)?;
+        Ok(self)
+    }
+
+    /// The calldata schedule in force, when this chain is calldata-priced.
+    pub fn calldata_policy(&self) -> Option<&CalldataPolicy> {
+        self.calldata_policy.as_ref()
     }
 
     /// Prune storage to `height` and trim the in-memory views to match (Q-036).
@@ -1165,5 +1215,114 @@ mod tests {
         assert_eq!(pool.len(), 1);
         assert!(pool.contains(&small.hash()));
         assert!(!pool.contains(&big.hash()));
+    }
+
+    // --- Q-037 L3 calldata policy binding ---
+
+    use subhost_core::{
+        CALLDATA_POLICY_VERSION, FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER,
+    };
+
+    fn calldata_schedule() -> CalldataPolicy {
+        CalldataPolicy { version: CALLDATA_POLICY_VERSION, gas_per_byte: 16 }
+    }
+
+    fn fee_policy() -> FeePolicy {
+        FeePolicy {
+            initial_base_fee_per_gas: 8,
+            min_base_fee_per_gas: 1,
+            max_base_fee_per_gas: Amount::MAX / u128::from(BLOCK_GAS_LIMIT),
+            elasticity_multiplier: FEE_ELASTICITY_MULTIPLIER,
+            change_denominator: FEE_CHANGE_DENOMINATOR,
+        }
+    }
+
+    #[test]
+    fn calldata_policy_binding_validates_the_schedule_and_reports_it() {
+        let state = RpcState::in_memory(1).unwrap();
+        assert!(state.calldata_policy().is_none());
+        for bad in [
+            CalldataPolicy { gas_per_byte: 0, ..calldata_schedule() },
+            CalldataPolicy { version: 2, ..calldata_schedule() },
+            // 256 * 128 KiB exceeds the default 30M block limit.
+            CalldataPolicy { gas_per_byte: 256, ..calldata_schedule() },
+        ] {
+            let error = RpcState::in_memory(1)
+                .unwrap()
+                .with_calldata_policy(bad)
+                .err()
+                .expect("an invalid schedule must be refused");
+            assert!(matches!(error, RpcError::BlockRejected(_)), "{error:?}");
+            assert!(error.to_string().contains("calldata policy"), "{error}");
+        }
+
+        let state =
+            RpcState::in_memory(1).unwrap().with_calldata_policy(calldata_schedule()).unwrap();
+        assert_eq!(state.calldata_policy(), Some(&calldata_schedule()));
+        // The store handle carries the same schedule for replay.
+        assert_eq!(state.store.calldata_policy(), Some(&calldata_schedule()));
+        // Independent of the fee policy: a calldata-only chain binds no fee.
+        assert!(state.fee_policy().is_none());
+
+        let both = RpcState::in_memory(1)
+            .unwrap()
+            .with_fee_policy(fee_policy())
+            .unwrap()
+            .with_calldata_policy(calldata_schedule())
+            .unwrap();
+        assert!(both.fee_policy().is_some());
+        assert!(both.calldata_policy().is_some());
+    }
+
+    #[test]
+    fn calldata_policy_refuses_a_pre_v3_ledger() {
+        // A legacy v1 ledger must not be repriced under a calldata schedule.
+        let legacy_dir = tempdir().unwrap();
+        {
+            let key = signing_key(50);
+            let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+            let state = RpcState::with_data_dir(1, legacy_dir.path()).unwrap();
+            state.seed_accounts([(sender, 1_000_000)]).unwrap();
+            state.submit_transaction(signed_transfer(&key, 0, 10)).unwrap();
+            assert_eq!(state.block_height(), 1);
+        }
+        let reopened = RpcState::with_data_dir(1, legacy_dir.path()).unwrap();
+        let error = reopened
+            .with_calldata_policy(calldata_schedule())
+            .err()
+            .expect("a legacy ledger must not be repriced");
+        assert!(error.to_string().contains("cannot extend a pre-version-3 ledger"), "{error}");
+
+        // A fee-only v2 ledger is pre-v3 as well: its calldata was unpriced.
+        let fee_dir = tempdir().unwrap();
+        {
+            let state = RpcState::with_data_dir(1, fee_dir.path())
+                .unwrap()
+                .with_fee_policy(fee_policy())
+                .unwrap();
+            state.seed_accounts([]).unwrap();
+            let block = state.build_block().unwrap().unwrap();
+            state.accept_block(block).unwrap();
+        }
+        let reopened = RpcState::with_data_dir(1, fee_dir.path()).unwrap();
+        let error = reopened
+            .with_calldata_policy(calldata_schedule())
+            .err()
+            .expect("a fee-only v2 ledger must not be repriced");
+        assert!(error.to_string().contains("cannot extend a pre-version-3 ledger"), "{error}");
+    }
+
+    #[test]
+    fn calldata_policy_respects_a_custom_block_gas_limit() {
+        // The schedule is validated against the genesis limit, not the default:
+        // rate 16 fits exactly in a 2_097_152-gas block, rate 17 does not.
+        let ok = RpcState::in_memory(1).unwrap().with_block_gas_limit(2_097_152).unwrap();
+        assert!(ok.with_calldata_policy(calldata_schedule()).is_ok());
+        let tight = RpcState::in_memory(1).unwrap().with_block_gas_limit(2_097_152).unwrap();
+        let error = tight
+            .with_calldata_policy(CalldataPolicy { gas_per_byte: 17, ..calldata_schedule() })
+            .err()
+            .expect("rate 17 does not fit the custom limit");
+        assert!(error.to_string().contains("calldata policy"), "{error}");
     }
 }

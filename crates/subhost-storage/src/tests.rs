@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use subhost_core::{
     Address, BlockHeader, Transaction, TransactionSignature, TransactionType, BLOCK_GAS_LIMIT,
-    FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER,
+    CALLDATA_POLICY_VERSION, FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER, MAX_TX_DATA_BYTES,
 };
 use subhost_state::State;
 
@@ -1784,6 +1784,128 @@ fn ephemeral_with_policy(policy: FeePolicy) -> LedgerStore {
     LedgerStore::ephemeral(1).unwrap().with_fee_policy(policy).unwrap()
 }
 
+fn calldata_policy() -> CalldataPolicy {
+    CalldataPolicy { version: CALLDATA_POLICY_VERSION, gas_per_byte: 16 }
+}
+
+fn other_calldata_policy() -> CalldataPolicy {
+    CalldataPolicy { gas_per_byte: 32, ..calldata_policy() }
+}
+
+/// A signed transfer carrying `data_len` calldata bytes under an explicit gas
+/// limit, so a test can sit exactly on the floor or deliberately below it.
+/// The bid is 10 so the same fixture also settles on a fee-enabled v3 chain.
+fn calldata_transfer(nonce: u64, data_len: usize, gas_limit: u64) -> Transaction {
+    let mut tx = transfer(nonce);
+    tx.data = vec![0xAB; data_len];
+    tx.gas_limit = gas_limit;
+    tx.gas_price = 10;
+    let signature = key().sign(&tx.signing_payload()).to_bytes();
+    tx.signature = TransactionSignature::from_ed25519(&signature);
+    tx
+}
+
+/// Cumulative calldata-priced snapshots, one per offered block, sealed exactly
+/// as the block path seals: execute every transaction, then settle when a fee
+/// policy is present. `fee: None` is a calldata-only chain (Q-037 ruling 1):
+/// base fee 0, no settlement, no producer credit.
+fn v3_history(
+    block_transactions: Vec<Vec<Transaction>>,
+    fee: Option<&FeePolicy>,
+    validator: Address,
+) -> Vec<LedgerSnapshot> {
+    let mut state = genesis_state();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut receipts: Vec<Receipt> = Vec::new();
+    let mut snapshots = Vec::new();
+    for (index, transactions) in block_transactions.into_iter().enumerate() {
+        let height = u64::try_from(index).unwrap() + 1;
+        let context = fee.map(|policy| match blocks.last() {
+            Some(parent) => policy.next_context(&parent.header, BLOCK_GAS_LIMIT).unwrap(),
+            None => policy.initial_context(BLOCK_GAS_LIMIT).unwrap(),
+        });
+        let mut hashes = Vec::new();
+        let mut commitments = Vec::new();
+        let mut gas_used = 0u64;
+        for (tx_index, tx) in transactions.iter().enumerate() {
+            state.apply_transaction(tx).unwrap();
+            gas_used += tx.gas_limit;
+            hashes.push(tx.hash());
+            commitments.push(receipt_commitment(
+                tx.hash(),
+                height,
+                u32::try_from(tx_index).unwrap(),
+                tx.gas_limit,
+                gas_used,
+            ));
+        }
+        if let Some(context) = &context {
+            let settlement =
+                settle_block_fees(context, transactions.iter().map(|tx| (tx, tx.gas_limit)))
+                    .unwrap();
+            state
+                .credit_block_priority(
+                    (validator != Address::ZERO).then_some(validator),
+                    settlement.priority,
+                )
+                .unwrap();
+        }
+        let header = BlockHeader {
+            version: CALLDATA_HEADER_VERSION,
+            chain_id: 1,
+            height,
+            timestamp: 1_700_000_000 + height,
+            parent_hash: blocks.last().map_or(Hash::ZERO, Block::hash),
+            state_root: state.root(),
+            tx_root: tx_root_of(&hashes),
+            receipt_root: receipts_root(&commitments),
+            validator,
+            gas_used,
+            gas_limit: BLOCK_GAS_LIMIT,
+            extra_data: Vec::new(),
+            base_fee_per_gas: context.map_or(0, |context| context.base_fee_per_gas),
+        };
+        let block = Block { header, transactions, signatures: Vec::new() };
+        let mut cumulative_gas_used = 0u64;
+        for (tx_index, tx) in block.transactions.iter().enumerate() {
+            cumulative_gas_used += tx.gas_limit;
+            receipts.push(Receipt {
+                tx_hash: tx.hash(),
+                block_hash: block.hash(),
+                block_height: height,
+                transaction_index: u32::try_from(tx_index).unwrap(),
+                gas_used: tx.gas_limit,
+                cumulative_gas_used,
+                status: ReceiptStatus::Success,
+                logs: Vec::new(),
+                contract_address: None,
+            });
+        }
+        blocks.push(block);
+        snapshots.push(LedgerSnapshot {
+            chain_id: 1,
+            state: state.snapshot(),
+            blocks: blocks.clone(),
+            receipts: receipts.clone(),
+        });
+    }
+    snapshots
+}
+
+/// `count` calldata-only blocks, each one transfer whose gas limit sits exactly
+/// on the rate-16 floor of its 2_000-byte payload (32_000 gas).
+fn calldata_only_history(count: u64) -> Vec<LedgerSnapshot> {
+    v3_history(
+        (0..count).map(|nonce| vec![calldata_transfer(nonce, 2_000, 32_000)]).collect(),
+        None,
+        Address::ZERO,
+    )
+}
+
+fn open_with_calldata(dir: &Path, schedule: CalldataPolicy) -> LedgerStore {
+    LedgerStore::open(1, dir).unwrap().with_calldata_policy(schedule).unwrap()
+}
+
 /// Persist the height-0 genesis state: the anchor every v2 replay starts from.
 fn seed(store: &LedgerStore) {
     store
@@ -2042,6 +2164,319 @@ fn a_policy_less_manifest_stays_byte_identical() {
     store.persist(&ledger(2).0).unwrap();
     let value = manifest_value(dir.path());
     assert!(value.get("fee_policy").is_none(), "{value}");
+    assert!(value.get("calldata_policy").is_none(), "{value}");
+    assert_eq!(value["version"], 2);
+}
+
+// --- Q-037 L3 calldata replay dispatch ---
+
+#[test]
+fn a_calldata_only_history_persists_loads_and_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let history = calldata_only_history(3);
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+    store.persist(&history[2]).unwrap();
+
+    let reopened = open_with_calldata(dir.path(), calldata_policy());
+    let restored = reopened.load().unwrap();
+    assert_eq!(restored.height(), 3);
+    assert_eq!(restored.state.root(), history[2].blocks.last().unwrap().header.state_root);
+    // Calldata-only: the schedule is recorded, no fee policy is, and every
+    // header settles at base fee 0 (ruling 1).
+    let value = manifest_value(dir.path());
+    assert!(value.get("fee_policy").is_none(), "{value}");
+    assert_eq!(value["calldata_policy"]["gas_per_byte"], 16);
+    assert!(restored.blocks.iter().all(|block| block.header.base_fee_per_gas == 0));
+}
+
+#[test]
+fn a_fee_enabled_v3_history_settles_and_replays() {
+    let policy = fee_policy();
+    let history = v3_history(
+        (0..3).map(|nonce| vec![calldata_transfer(nonce, 2_000, 32_000)]).collect(),
+        Some(&policy),
+        producer(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy.clone())
+        .with_calldata_policy(calldata_policy())
+        .unwrap();
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+    store.persist(&history[2]).unwrap();
+
+    let reopened =
+        open_with_policy(dir.path(), policy).with_calldata_policy(calldata_policy()).unwrap();
+    let restored = reopened.load().unwrap();
+    assert_eq!(restored.height(), 3);
+    assert_eq!(restored.state.root(), history[2].blocks.last().unwrap().header.state_root);
+    let value = manifest_value(dir.path());
+    assert!(value.get("fee_policy").is_some(), "{value}");
+    assert!(value.get("calldata_policy").is_some(), "{value}");
+}
+
+#[test]
+fn an_under_intrinsic_history_is_refused_on_load_and_on_append() {
+    let history = calldata_only_history(3);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    store.persist(&history[0]).unwrap();
+    store.persist(&history[1]).unwrap();
+
+    // A warm offline load pins height 2 in the verified-head cache.
+    let warm = open(dir.path());
+    assert_eq!(warm.load().unwrap().height(), 2);
+
+    // Tamper the recorded rate upward. Supplying the same rate passes the bind
+    // equality, so only the replay floor can catch the now-underpriced history:
+    // 32_000 gas covers 2_000 bytes at 16, not at 32.
+    let mut value = manifest_value(dir.path());
+    value["calldata_policy"]["gas_per_byte"] = serde_json::json!(32);
+    write_manifest_value(dir.path(), &value);
+
+    let error = open_with_calldata(dir.path(), other_calldata_policy()).load().unwrap_err();
+    assert!(error.to_string().contains("breaks the calldata floor"), "{error}");
+    assert!(error.to_string().contains("below the intrinsic calldata gas"), "{error}");
+
+    // The suffix path replays the append on the cached head under the same
+    // tampered schedule, and refuses it there too.
+    let appending = warm.with_calldata_policy(other_calldata_policy()).unwrap();
+    let error = appending.persist(&history[2]).unwrap_err();
+    assert!(error.to_string().contains("breaks the calldata floor"), "{error}");
+    assert!(error.to_string().contains("on the verified head"), "{error}");
+}
+
+#[test]
+fn version_three_blocks_without_a_schedule_are_refused() {
+    let history = calldata_only_history(1);
+    let dir = tempfile::tempdir().unwrap();
+    // Fresh store, nothing recorded: the bind refuses before any write.
+    let error = open(dir.path()).persist(&history[0]).unwrap_err();
+    assert!(error.to_string().contains("needs a calldata policy"), "{error}");
+
+    // A committed v3 ledger whose manifest lost the schedule is refused on load.
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    store.persist(&history[0]).unwrap();
+    let mut value = manifest_value(dir.path());
+    value.as_object_mut().unwrap().remove("calldata_policy");
+    write_manifest_value(dir.path(), &value);
+    let error = open_with_calldata(dir.path(), calldata_policy()).load().unwrap_err();
+    assert!(error.to_string().contains("records no calldata policy"), "{error}");
+}
+
+#[test]
+fn a_different_supplied_schedule_is_refused_on_load_and_persist() {
+    let history = calldata_only_history(2);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+
+    let other = open_with_calldata(dir.path(), other_calldata_policy());
+    let error = other.load().unwrap_err();
+    assert!(error.to_string().contains("differs from the recorded one"), "{error}");
+    let error = other.persist(&history[1]).unwrap_err();
+    assert!(error.to_string().contains("differs from the recorded one"), "{error}");
+}
+
+#[test]
+fn offline_load_uses_the_recorded_schedule_but_persist_cannot_drop_it() {
+    let history = calldata_only_history(2);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+
+    // No supplied schedule: load uses the recorded one, the offline case.
+    let offline = open(dir.path());
+    assert_eq!(offline.load().unwrap().height(), 2);
+    // Persisting without it would drop the recorded schedule, so it is refused.
+    let error = offline.persist(&history[1]).unwrap_err();
+    assert!(error.to_string().contains("cannot drop the recorded calldata policy"), "{error}");
+}
+
+#[test]
+fn a_schedule_cannot_be_bound_to_a_legacy_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    store.persist(&ledger(2).0).unwrap();
+    let error = open_with_calldata(dir.path(), calldata_policy()).load().unwrap_err();
+    assert!(error.to_string().contains("cannot be bound to a pre-version-3 ledger"), "{error}");
+}
+
+#[test]
+fn a_schedule_cannot_be_bound_to_a_fee_only_ledger() {
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy);
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+    // v2 calldata was committed unpriced: a supplied schedule must not price it.
+    let priced =
+        open_with_policy(dir.path(), fee_policy()).with_calldata_policy(calldata_policy()).unwrap();
+    let error = priced.load().unwrap_err();
+    assert!(error.to_string().contains("cannot be bound to a pre-version-3 ledger"), "{error}");
+}
+
+#[test]
+fn a_recorded_schedule_refuses_pre_v3_blocks() {
+    // Rule 2: even a recorded schedule cannot coexist with pre-v3 history.
+    // Graft the schedule onto a fee-only manifest to reach the rule directly.
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy);
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+    let mut value = manifest_value(dir.path());
+    value["calldata_policy"] = serde_json::json!({"version": 1, "gas_per_byte": 16});
+    write_manifest_value(dir.path(), &value);
+    let error = open(dir.path()).load().unwrap_err();
+    assert!(error.to_string().contains("cannot contain pre-version-3 blocks"), "{error}");
+}
+
+#[test]
+fn replay_refuses_a_pre_v3_block_mixed_into_a_priced_history() {
+    let policy = fee_policy();
+    let v3 = v3_history(vec![vec![calldata_transfer(0, 100, 21_000)]], Some(&policy), producer());
+    let v2 = v2_history(1, &policy, producer());
+    let mut blocks = v3[0].blocks.clone();
+    blocks.extend(v2[0].blocks.clone());
+    let mut state = genesis_state();
+    let error = replay_blocks(
+        &blocks,
+        None,
+        Some(&policy),
+        Some(&calldata_policy()),
+        &mut state,
+        "in test",
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("mixes a pre-version-3 header into a calldata-priced history"),
+        "{error}"
+    );
+}
+
+#[test]
+fn replay_refuses_v3_blocks_without_a_schedule() {
+    let history = calldata_only_history(1);
+    let mut state = genesis_state();
+    let error =
+        replay_blocks(&history[0].blocks, None, None, None, &mut state, "in test").unwrap_err();
+    assert!(error.to_string().contains("a version 3 block requires a calldata policy"), "{error}");
+}
+
+#[test]
+fn a_maximum_size_transaction_at_the_exact_floor_round_trips() {
+    let gas = 16 * MAX_TX_DATA_BYTES as u64;
+    assert_eq!(gas, 2_097_152);
+    let history =
+        v3_history(vec![vec![calldata_transfer(0, MAX_TX_DATA_BYTES, gas)]], None, Address::ZERO);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    store.persist(&history[0]).unwrap();
+    let restored = open_with_calldata(dir.path(), calldata_policy()).load().unwrap();
+    assert_eq!(restored.height(), 1);
+    assert_eq!(restored.state.root(), history[0].blocks[0].header.state_root);
+}
+
+#[test]
+fn an_oversized_transaction_is_refused_even_when_the_gas_floor_is_met() {
+    // R-L2-02: the protocol cap is consensus validity on replay, not just the
+    // local mempool cap. The gas limit covers the oversized payload's intrinsic
+    // gas, so only the length refusal can catch it.
+    let data_len = MAX_TX_DATA_BYTES + 1;
+    let history = v3_history(
+        vec![vec![calldata_transfer(0, data_len, 16 * data_len as u64)]],
+        None,
+        Address::ZERO,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    let error = store.persist(&history[0]).unwrap_err();
+    assert!(error.to_string().contains("exceeds the protocol maximum"), "{error}");
+}
+
+#[test]
+fn a_nonzero_base_fee_without_a_fee_policy_is_refused() {
+    let history = calldata_only_history(1);
+    let mut blocks = history[0].blocks.clone();
+    blocks[0].header.base_fee_per_gas = 1;
+    let mut state = genesis_state();
+    let error = replay_blocks(&blocks, None, None, Some(&calldata_policy()), &mut state, "in test")
+        .unwrap_err();
+    assert!(error.to_string().contains("a calldata-only chain settles at base fee 0"), "{error}");
+}
+
+#[test]
+fn an_ephemeral_store_enforces_the_calldata_floor() {
+    let store = LedgerStore::ephemeral(1).unwrap().with_calldata_policy(calldata_policy()).unwrap();
+    seed(&store);
+    let honest = calldata_only_history(2);
+    store.persist(&honest[0]).unwrap();
+    store.persist(&honest[1]).unwrap();
+
+    // An under-intrinsic history is refused on the ephemeral replay too.
+    let under = v3_history(vec![vec![calldata_transfer(0, 2_000, 16_000)]], None, Address::ZERO);
+    let fresh = LedgerStore::ephemeral(1).unwrap().with_calldata_policy(calldata_policy()).unwrap();
+    seed(&fresh);
+    let error = fresh.persist(&under[0]).unwrap_err();
+    assert!(error.to_string().contains("breaks the calldata floor"), "{error}");
+}
+
+#[test]
+fn prune_round_trips_the_calldata_policy() {
+    let history = calldata_only_history(5);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    for snapshot in &history {
+        store.persist_with_limits(snapshot, 1, 1).unwrap();
+    }
+    let before = manifest_value(dir.path())["calldata_policy"].clone();
+    store.prune(2).unwrap();
+    assert_eq!(manifest_value(dir.path())["calldata_policy"], before);
+    let restored = open_with_calldata(dir.path(), calldata_policy()).load().unwrap();
+    assert_eq!(restored.height(), 5);
+    assert_eq!(restored.state.root(), history[4].blocks.last().unwrap().header.state_root);
+}
+
+#[test]
+fn prune_to_height_round_trips_the_calldata_policy() {
+    let history = calldata_only_history(6);
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_calldata(dir.path(), calldata_policy());
+    seed(&store);
+    for snapshot in &history {
+        store.persist_with_limits(snapshot, 1, 2).unwrap();
+    }
+    let before = manifest_value(dir.path())["calldata_policy"].clone();
+    store.prune_to_height(3).unwrap();
+    assert_eq!(manifest_value(dir.path())["calldata_policy"], before);
+    let restored = open_with_calldata(dir.path(), calldata_policy()).load().unwrap();
+    assert_eq!(restored.base_height, 3);
+    assert_eq!(restored.height(), 6);
+}
+
+#[test]
+fn a_fee_only_manifest_records_no_calldata_policy() {
+    let policy = fee_policy();
+    let history = v2_history(2, &policy, producer());
+    let dir = tempfile::tempdir().unwrap();
+    let store = open_with_policy(dir.path(), policy);
+    seed(&store);
+    store.persist(&history[1]).unwrap();
+    let value = manifest_value(dir.path());
+    assert!(value.get("fee_policy").is_some(), "{value}");
+    assert!(value.get("calldata_policy").is_none(), "{value}");
     assert_eq!(value["version"], 2);
 }
 

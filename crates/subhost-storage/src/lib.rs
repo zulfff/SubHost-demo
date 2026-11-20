@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::SystemTime;
 use subhost_core::{
-    encode_canonical, settle_block_fees, tx_root_of, Address, Block, BlockHeader, ChainId,
-    FeePolicy, Gas, Hash, Receipt, ReceiptStatus, FEE_HEADER_VERSION,
+    encode_canonical, settle_block_fees, tx_root_of, Address, Block, BlockHeader, CalldataPolicy,
+    ChainId, FeePolicy, Gas, Hash, Receipt, ReceiptStatus, CALLDATA_HEADER_VERSION,
+    FEE_HEADER_VERSION,
 };
 use subhost_state::{State, StateSnapshot};
 use tracing::debug;
@@ -179,6 +180,7 @@ pub struct LedgerStore {
     chain_id: ChainId,
     head: Arc<HeadCache>,
     fee_policy: Option<FeePolicy>,
+    calldata_policy: Option<CalldataPolicy>,
 }
 
 impl LedgerStore {
@@ -195,6 +197,7 @@ impl LedgerStore {
             chain_id,
             head: Arc::new(Mutex::new(None)),
             fee_policy: None,
+            calldata_policy: None,
         })
     }
 
@@ -203,7 +206,13 @@ impl LedgerStore {
         if chain_id == 0 {
             return Err(StorageError::InvalidChainId);
         }
-        Ok(Self { path: None, chain_id, head: Arc::new(Mutex::new(None)), fee_policy: None })
+        Ok(Self {
+            path: None,
+            chain_id,
+            head: Arc::new(Mutex::new(None)),
+            fee_policy: None,
+            calldata_policy: None,
+        })
     }
 
     /// Bind the genesis fee policy this store replays version 2 blocks with.
@@ -225,6 +234,26 @@ impl LedgerStore {
     /// The policy this store was opened with, if any.
     pub fn fee_policy(&self) -> Option<&FeePolicy> {
         self.fee_policy.as_ref()
+    }
+
+    /// Bind the genesis calldata schedule this store replays version 3 blocks
+    /// with (Q-037 L3). Mirrors [`Self::with_fee_policy`]: attach after
+    /// `open`/`ephemeral` and before the first `load`/`persist`; a durable store
+    /// records it in the manifest at the first persist and refuses any later
+    /// change; offline tools pass nothing and use the recorded schedule. A
+    /// calldata-bound chain is v3 from block 1, with or without a fee policy.
+    ///
+    /// Structural validation needs the chain's block gas limit, which only the
+    /// anchor or first header supplies, so it happens during replay
+    /// (`CalldataPolicy::validate`), not here.
+    pub fn with_calldata_policy(mut self, policy: CalldataPolicy) -> Result<Self, StorageError> {
+        self.calldata_policy = Some(policy);
+        Ok(self)
+    }
+
+    /// The calldata schedule this store was opened with, if any.
+    pub fn calldata_policy(&self) -> Option<&CalldataPolicy> {
+        self.calldata_policy.as_ref()
     }
 
     pub fn chain_id(&self) -> ChainId {
@@ -258,7 +287,12 @@ impl LedgerStore {
             Some(path) => {
                 let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
                 if segmented::manifest_path(data_dir).is_file() {
-                    segmented::load(self.chain_id, data_dir, self.fee_policy.as_ref())?
+                    segmented::load(
+                        self.chain_id,
+                        data_dir,
+                        self.fee_policy.as_ref(),
+                        self.calldata_policy.as_ref(),
+                    )?
                 } else if !path.is_file() {
                     self.empty()
                 } else {
@@ -277,7 +311,12 @@ impl LedgerStore {
 
     /// Validate a decoded snapshot and rebuild the in-memory ledger from it.
     pub fn restore(&self, snapshot: LedgerSnapshot) -> Result<RestoredLedger, StorageError> {
-        let state = validate_snapshot(&snapshot, self.chain_id, self.fee_policy.as_ref())?;
+        let state = validate_snapshot(
+            &snapshot,
+            self.chain_id,
+            self.fee_policy.as_ref(),
+            self.calldata_policy.as_ref(),
+        )?;
         debug!(
             blocks = snapshot.blocks.len(),
             receipts = snapshot.receipts.len(),
@@ -319,6 +358,7 @@ impl LedgerStore {
                 snapshot,
                 &self.head,
                 self.fee_policy.as_ref(),
+                self.calldata_policy.as_ref(),
             );
         };
         let data_dir = path.parent().ok_or(StorageError::MissingParentDirectory)?;
@@ -334,6 +374,7 @@ impl LedgerStore {
             snapshot_interval,
             &self.head,
             self.fee_policy.as_ref(),
+            self.calldata_policy.as_ref(),
         )
     }
 
@@ -506,8 +547,9 @@ pub(crate) fn validate_snapshot(
     snapshot: &LedgerSnapshot,
     chain_id: ChainId,
     policy: Option<&FeePolicy>,
+    schedule: Option<&CalldataPolicy>,
 ) -> Result<State, StorageError> {
-    validate_snapshot_from(snapshot, chain_id, 0, policy, None)
+    validate_snapshot_from(snapshot, chain_id, 0, policy, schedule, None)
 }
 
 /// Validate a snapshot whose history starts after `base_height`.
@@ -521,6 +563,7 @@ fn validate_snapshot_from(
     chain_id: ChainId,
     base_height: u64,
     policy: Option<&FeePolicy>,
+    schedule: Option<&CalldataPolicy>,
     anchor: Option<&ReplayAnchor>,
 ) -> Result<State, StorageError> {
     if snapshot.chain_id != chain_id || snapshot.state.chain_id != chain_id {
@@ -533,7 +576,7 @@ fn validate_snapshot_from(
     let state = if fee_enabled {
         let anchor = anchor.ok_or_else(|| {
             StorageError::Invalid(
-                "a fee-enabled ledger needs a committed state anchor: persist the genesis state first"
+                "a version 2+ ledger needs a committed state anchor: persist the genesis state first"
                     .into(),
             )
         })?;
@@ -547,6 +590,7 @@ fn validate_snapshot_from(
             blocks,
             anchor.header.as_ref(),
             policy,
+            schedule,
             &mut state,
             "on the committed anchor",
         )?;
@@ -570,6 +614,12 @@ fn validate_snapshot_from(
 /// committed ledger that records none cannot hold version 2 blocks at all.
 /// `persisting` separates the two asymmetries: `load` with no supplied policy
 /// uses the recorded one (offline tools), `persist` refuses to drop it.
+///
+/// Q-037 L3: the "needs a fee policy" rules key on strictly-v2 blocks. A v3
+/// block settles fees only when a fee policy is bound; a calldata-only chain
+/// (v3 + schedule, no fee policy) is valid (ruling 1), and v3 without any
+/// policy is refused by [`bind_calldata_policy`] instead. The drop rule keeps
+/// the full v2+ range: a recorded fee policy covers v3 blocks too.
 pub(crate) fn bind_fee_policy(
     recorded: Option<&FeePolicy>,
     supplied: Option<&FeePolicy>,
@@ -578,6 +628,9 @@ pub(crate) fn bind_fee_policy(
     persisting: bool,
 ) -> Result<Option<FeePolicy>, StorageError> {
     let has_v2 = blocks.iter().any(|block| block.header.version >= FEE_HEADER_VERSION);
+    let has_fee_only = blocks
+        .iter()
+        .any(|block| (FEE_HEADER_VERSION..CALLDATA_HEADER_VERSION).contains(&block.header.version));
     let has_legacy = blocks.iter().any(|block| block.header.version < FEE_HEADER_VERSION);
     if let (Some(recorded), Some(supplied)) = (recorded, supplied) {
         if recorded != supplied {
@@ -591,7 +644,7 @@ pub(crate) fn bind_fee_policy(
             "a fee-enabled ledger cannot contain legacy version 1 blocks".into(),
         ));
     }
-    if committed && recorded.is_none() && has_v2 {
+    if committed && recorded.is_none() && has_fee_only {
         return Err(StorageError::Invalid(
             "version 2 blocks in a ledger that records no fee policy".into(),
         ));
@@ -606,7 +659,7 @@ pub(crate) fn bind_fee_policy(
             "persist cannot drop the recorded fee policy of a fee-enabled ledger".into(),
         ));
     }
-    if has_v2 && recorded.is_none() && supplied.is_none() {
+    if has_fee_only && recorded.is_none() && supplied.is_none() {
         return Err(StorageError::Invalid(
             "a fee-enabled ledger needs a fee policy: persist the genesis state first".into(),
         ));
@@ -614,7 +667,62 @@ pub(crate) fn bind_fee_policy(
     Ok(recorded.or(supplied).cloned())
 }
 
-/// Execute `blocks` on `state`, settling version 2 fees once per block.
+/// Bind the recorded calldata schedule to the one this call supplies (Q-037
+/// L3, mirror of [`bind_fee_policy`]).
+///
+/// A priced ledger is ALL-v3 (ruling 2): a recorded or supplied schedule
+/// refuses version 1 AND version 2 blocks alike: v2 blocks carry unpriced
+/// calldata, so admitting a pre-v3 prefix under a schedule would commit
+/// unpriced history on a priced chain and reopen SUBHOST-2026-003. Binding on
+/// an empty ledger stays allowed: genesis bootstrap binds before the first
+/// block, exactly as fee does.
+pub(crate) fn bind_calldata_policy(
+    recorded: Option<&CalldataPolicy>,
+    supplied: Option<&CalldataPolicy>,
+    blocks: &[Block],
+    committed: bool,
+    persisting: bool,
+) -> Result<Option<CalldataPolicy>, StorageError> {
+    let has_v3 = blocks.iter().any(|block| block.header.version >= CALLDATA_HEADER_VERSION);
+    let has_pre_v3 = blocks.iter().any(|block| block.header.version < CALLDATA_HEADER_VERSION);
+    if let (Some(recorded), Some(supplied)) = (recorded, supplied) {
+        if recorded != supplied {
+            return Err(StorageError::Invalid(
+                "supplied calldata policy differs from the recorded one".into(),
+            ));
+        }
+    }
+    if recorded.is_some() && has_pre_v3 {
+        return Err(StorageError::Invalid(
+            "a calldata-priced ledger cannot contain pre-version-3 blocks".into(),
+        ));
+    }
+    if committed && recorded.is_none() && has_v3 {
+        return Err(StorageError::Invalid(
+            "version 3 blocks in a ledger that records no calldata policy".into(),
+        ));
+    }
+    if supplied.is_some() && recorded.is_none() && has_pre_v3 {
+        return Err(StorageError::Invalid(
+            "a calldata policy cannot be bound to a pre-version-3 ledger".into(),
+        ));
+    }
+    if persisting && committed && recorded.is_some() && supplied.is_none() && has_v3 {
+        return Err(StorageError::Invalid(
+            "persist cannot drop the recorded calldata policy of a calldata-priced ledger".into(),
+        ));
+    }
+    if has_v3 && recorded.is_none() && supplied.is_none() {
+        return Err(StorageError::Invalid(
+            "a calldata-priced ledger needs a calldata policy: persist the genesis state first"
+                .into(),
+        ));
+    }
+    Ok(recorded.or(supplied).cloned())
+}
+
+/// Execute `blocks` on `state`, settling version 2 fees once per block and
+/// enforcing the version 3 calldata floor once per transaction (Q-037 L3).
 ///
 /// `parent` is the header immediately before `blocks[0]`, taken from the offered
 /// snapshot or the retained history — never from the cache. With no parent the
@@ -622,16 +730,42 @@ pub(crate) fn bind_fee_policy(
 /// every transaction of the block, so a tip is never spendable inside its own
 /// block, and the recorded base fee must equal the derived one.
 ///
+/// `schedule` is the bound calldata policy. Any version 3 block requires it,
+/// and `check_floor` runs per transaction BEFORE `apply_transaction`: the
+/// same pure rule admission and selection enforce, applied here from the
+/// recorded schedule independently of them (dewi's floor condition). The
+/// length refusal inside `check_floor` makes the protocol cap consensus
+/// validity on replay too (R-L2-02). A calldata-only chain (v3, schedule, no
+/// fee policy) executes without settlement at base fee 0 (ruling 1); fee
+/// settlement stays keyed on the fee policy alone.
+///
 /// Legacy blocks are executed without settlement, which is what restore has
-/// always done; a legacy block inside a fee-enabled history is refused.
+/// always done; a legacy block inside a fee-enabled history is refused, and a
+/// pre-v3 block inside a calldata-priced history is refused (no downgrade,
+/// defense in depth on top of the bind rules).
 pub(crate) fn replay_blocks(
     blocks: &[Block],
     parent: Option<&BlockHeader>,
     policy: Option<&FeePolicy>,
+    schedule: Option<&CalldataPolicy>,
     state: &mut State,
     anchor: &str,
 ) -> Result<(), StorageError> {
-    let fee_enabled = blocks.iter().any(|block| block.header.version >= FEE_HEADER_VERSION);
+    let calldata_enabled =
+        blocks.iter().any(|block| block.header.version >= CALLDATA_HEADER_VERSION);
+    let schedule = if calldata_enabled {
+        Some(schedule.ok_or_else(|| {
+            StorageError::Invalid("a version 3 block requires a calldata policy".into())
+        })?)
+    } else {
+        None
+    };
+    // Strictly-v2 blocks always need a fee policy; v3 blocks settle only when
+    // one is bound (a calldata-only chain has none). Mirrors bind_fee_policy.
+    let has_fee_only = blocks
+        .iter()
+        .any(|block| (FEE_HEADER_VERSION..CALLDATA_HEADER_VERSION).contains(&block.header.version));
+    let fee_enabled = policy.is_some() || has_fee_only;
     let policy = if fee_enabled {
         Some(policy.ok_or_else(|| {
             StorageError::Invalid("a version 2 block requires a fee policy".into())
@@ -643,9 +777,28 @@ pub(crate) fn replay_blocks(
         || blocks.first().map_or(0, |block| block.header.gas_limit),
         |header| header.gas_limit,
     );
+    if let Some(schedule) = schedule {
+        schedule.validate(limit).map_err(|error| {
+            StorageError::Invalid(format!("cannot bind the calldata policy {anchor}: {error}"))
+        })?;
+    }
     let mut previous = parent;
     for block in blocks {
         let height = block.header.height;
+        if calldata_enabled && block.header.version < CALLDATA_HEADER_VERSION {
+            return Err(StorageError::Invalid(format!(
+                "block {height} mixes a pre-version-3 header into a calldata-priced history"
+            )));
+        }
+        if let Some(schedule) = schedule {
+            for transaction in &block.transactions {
+                schedule.check_floor(transaction).map_err(|error| {
+                    StorageError::Invalid(format!(
+                        "block {height} breaks the calldata floor {anchor}: {error}"
+                    ))
+                })?;
+            }
+        }
         if let Some(policy) = policy {
             if block.header.version < FEE_HEADER_VERSION {
                 return Err(StorageError::Invalid(format!(
@@ -697,6 +850,15 @@ pub(crate) fn replay_blocks(
                 ))
             })?;
         } else {
+            // Calldata-only: v3 validity rule, legacy settlement, base fee 0
+            // (ruling 1). A nonzero recorded base fee without a fee policy
+            // would commit to fees nothing settles.
+            if block.header.version >= FEE_HEADER_VERSION && block.header.base_fee_per_gas != 0 {
+                return Err(StorageError::Invalid(format!(
+                    "block {height} records base fee {} without a fee policy; a calldata-only chain settles at base fee 0",
+                    block.header.base_fee_per_gas
+                )));
+            }
             for transaction in &block.transactions {
                 state.apply_transaction(transaction).map_err(|error| {
                     StorageError::Invalid(format!("cannot replay block {height} {anchor}: {error}"))

@@ -367,6 +367,31 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   produces version 3 or enforces the floor until the L4 activation wiring;
   L3 (Track B) mirrors the binding in the manifest and dispatches replay from
   the header version.
+- **Calldata floor replay dispatch in ledger storage (Q-037 L3, ADR-015,
+  SUBHOST-2026-003).** `subhost-storage` gains a genesis-bound calldata
+  binding (`LedgerStore::with_calldata_policy`, accessor `calldata_policy`)
+  mirroring the fee-policy binding: the manifest records the schedule as an
+  additive optional field (manifest version stays 2; unpriced and fee-only
+  manifests stay byte-identical), load uses the recorded schedule when none
+  is supplied, a differing supplied schedule is refused, and persist cannot
+  drop the recorded one. Priced ledgers are v3-only: binding refuses version
+  1 and version 2 history alike under a recorded or supplied schedule, and
+  replay refuses a pre-v3 block mixed into a priced slice. `replay_blocks`
+  dispatches on the header version: version 3 settles fees only when a fee
+  policy is bound (calldata-only chains settle at base fee 0; with a fee
+  policy the legacy settlement applies) and runs `CalldataPolicy::check_floor`
+  per transaction before execution, so under-intrinsic gas and the protocol
+  calldata cap are validity refusals on every replay path: full load,
+  appended suffix on the verified head, ephemeral validation, and snapshot
+  re-anchor after prune. Both prune paths carry the schedule forward.
+  `RpcState::with_calldata_policy` validates the schedule against the genesis
+  block gas limit, refuses to reprice a restored pre-v3 ledger, and passes
+  the schedule into the store. Tests: 18 storage tests (calldata-only and
+  fee-enabled v3 round-trips, manifest rate tamper refused on load and on the
+  suffix, missing/differing/dropped schedule refusals, exact-floor 128 KiB
+  round-trip, oversized refusal, mixed-version refusal, ephemeral floor,
+  both prune round-trips, manifest byte-identity) plus 3 rpc binding tests.
+  Replay-only: block production and admission wiring remain L4.
 - **OTLP export wiring in the `subhost` CLI (S8.1, Q-035).** The CLI now enables
   the `subhost-telemetry` `otlp` feature and wires the merged provider (#74):
   a global `--otlp-endpoint <URL>` flag (env `SUBHOST_OTLP_ENDPOINT`) opts in to
