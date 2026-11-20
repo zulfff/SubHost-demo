@@ -133,6 +133,7 @@ fn validator_mode_boots_with_the_default_producer_key() {
         &mut driver,
         node.consensus_journal.as_deref(),
         node.certified_history.as_deref(),
+        node.retention.as_deref(),
     )
     .unwrap()
     .is_some());
@@ -144,6 +145,14 @@ fn validator_mode_boots_with_the_default_producer_key() {
 }
 
 pub(super) fn validator_nodes(count: u8) -> (Vec<tempfile::TempDir>, Vec<Node>) {
+    validator_nodes_with_retention(count, None)
+}
+
+/// The same cluster with an optional automatic-retention bound (Q-036).
+fn validator_nodes_with_retention(
+    count: u8,
+    retention_blocks: Option<u64>,
+) -> (Vec<tempfile::TempDir>, Vec<Node>) {
     let tx_key = signing_key(7);
     let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
     let keys: Vec<_> = (0..count).map(|_| BLSScheme::keygen().0).collect();
@@ -175,6 +184,7 @@ pub(super) fn validator_nodes(count: u8) -> (Vec<tempfile::TempDir>, Vec<Node>) 
             Node::bootstrap(NodeConfig {
                 validator: true,
                 single_writer: false,
+                retention_blocks,
                 ..test_config(dir.path())
             })
             .unwrap()
@@ -1046,6 +1056,7 @@ pub(super) fn produce_for_test(node: &Node) -> Result<Option<ProducedRound>, Nod
         &mut node.consensus().unwrap().lock().unwrap(),
         node.consensus_journal.as_deref(),
         node.certified_history.as_deref(),
+        node.retention.as_deref(),
     )
 }
 
@@ -1075,6 +1086,7 @@ pub(super) fn node_commit<'a>(
         candidates,
         metrics: Some(&node.metrics),
         runtime: Some(&node.runtime),
+        retention: node.retention.as_deref(),
     }
 }
 
@@ -1505,6 +1517,186 @@ fn node_config_defaults_to_no_automatic_retention() {
     assert_eq!(configured.retention_blocks, Some(50_000));
 }
 
+/// Commit `blocks` one-transaction blocks to a durable ledger.
+fn chain_with_blocks(dir: &Path, blocks: u64) -> RpcState {
+    let key = signing_key(7);
+    let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+    let state = RpcState::with_data_dir(1, dir).unwrap();
+    state.seed_accounts([(sender, 1_000_000)]).unwrap();
+    for nonce in 0..blocks {
+        state.submit_transaction(signed_transfer(&key, nonce, 0)).unwrap();
+    }
+    state
+}
+
+#[test]
+fn retention_attempts_only_past_the_bound_and_waits_out_the_backoff() {
+    // Q-036: `tip - base > keep` is the trigger, at most one attempt per commit,
+    // and an attempt that made no progress defers by `max(1, keep / 8)`.
+    let trigger = RetentionTrigger::new(64);
+    assert_eq!(trigger.retry_after(), 8);
+    // At the bound, not past it: no attempt.
+    assert_eq!(trigger.target(64, 0), None);
+    // Past it: the target keeps exactly `keep` blocks above the base.
+    assert_eq!(trigger.target(65, 0), Some(1));
+    assert_eq!(trigger.target(100, 0), Some(36));
+    // A later base does not widen the window: the bound is on the retained span.
+    assert_eq!(trigger.target(200, 100), Some(136));
+
+    let refusal = Ok(PruneOutcome::RefusedBySnapshot { snapshot_height: 0, requested_height: 36 });
+    trigger.record(100, &refusal);
+    assert_eq!(trigger.next_attempt.load(Ordering::SeqCst), 108);
+    assert_eq!(trigger.target(107, 0), None, "the backoff defers every commit");
+    assert_eq!(trigger.target(108, 0), Some(44), "the window reopens at the bound");
+
+    // A successful prune is progress, so it arms no backoff.
+    let pruned =
+        Ok(PruneOutcome::Pruned { dropped_segments: 1, retained_segments: 1, base_height: 44 });
+    trigger.record(150, &pruned);
+    assert_eq!(trigger.next_attempt.load(Ordering::SeqCst), 108);
+    assert_eq!(trigger.target(150, 44), Some(86));
+
+    // The retry window never collapses to zero, even for a tiny bound.
+    assert_eq!(RetentionTrigger::new(1).retry_after(), 1);
+    assert_eq!(RetentionTrigger::new(8).retry_after(), 1);
+    assert_eq!(RetentionTrigger::new(16).retry_after(), 2);
+}
+
+#[test]
+fn retention_stays_inactive_inside_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = chain_with_blocks(dir.path(), 2);
+    let trigger = RetentionTrigger::new(2);
+    // `tip - base == keep`, not above it, so no attempt is made.
+    assert!(trigger.attempt(&state).is_none());
+    assert_eq!(state.base_height(), 0);
+    assert_eq!(state.block_count(), 2);
+}
+
+#[test]
+fn retention_refusal_at_the_snapshot_floor_is_a_no_op_and_defers() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = chain_with_blocks(dir.path(), 5);
+    let trigger = RetentionTrigger::new(2);
+    let tip = state.head_height();
+    let outcome = trigger.attempt(&state).expect("the retained span exceeds the bound");
+    assert!(
+        matches!(
+            outcome,
+            Ok(PruneOutcome::RefusedBySnapshot { snapshot_height: 0, requested_height: 3 })
+        ),
+        "the snapshot anchor is the hard floor: {outcome:?}"
+    );
+    // A refusal is a normal no-op: memory and the base stay untouched and the
+    // commit path is not failed.
+    assert_eq!(state.base_height(), 0);
+    assert_eq!(state.block_count(), 5);
+    // The refusal consumed the n/8 backoff, so the same tip does not retry.
+    assert_eq!(trigger.retry_after(), 1);
+    assert!(trigger.attempt(&state).is_none());
+    assert_eq!(trigger.next_attempt.load(Ordering::SeqCst), tip + 1);
+}
+
+#[test]
+fn a_failed_retention_attempt_is_swallowed_and_later_commits_still_work() {
+    let key = signing_key(7);
+    let sender = Address::from_public_key(&key.verifying_key().to_bytes());
+    // An ephemeral store cannot prune; this is a genuine storage error, not the
+    // typed snapshot refusal.
+    let state = RpcState::in_memory(1).unwrap();
+    state.seed_accounts([(sender, 1_000_000)]).unwrap();
+    for nonce in 0..4 {
+        state.submit_transaction(signed_transfer(&key, nonce, 1)).unwrap();
+    }
+    let trigger = RetentionTrigger::new(1);
+    assert!(trigger.attempt(&state).expect("the retained span exceeds the bound").is_err());
+    assert_eq!(state.base_height(), 0);
+    assert_eq!(state.block_count(), 4);
+    // `after_commit` has no error path, so a prune fault cannot fail a commit.
+    trigger.after_commit(&state);
+    state.submit_transaction(signed_transfer(&key, 4, 1)).unwrap();
+    assert_eq!(state.block_height(), 5);
+}
+
+/// Produce and commit one block through the real commit path of a live cluster.
+///
+/// The leader rotates per view, so the producer is whichever node leads the
+/// current one; every other node adopts the proposal and votes.
+fn commit_next_block(nodes: &[Node]) {
+    let leader = nodes
+        .iter()
+        .position(|node| node.consensus().unwrap().lock().unwrap().is_leader())
+        .expect("a live cluster has a leader for the current view");
+    let round = {
+        let node = &nodes[leader];
+        let nonce = node.state().block_height();
+        node.state().submit_transaction(signed_transfer(&signing_key(7), nonce, 1)).unwrap();
+        produce_for_test(node).unwrap().expect("the leader must propose")
+    };
+    let mut prepares = vec![round.vote.clone().expect("the leader must vote")];
+    for (index, node) in nodes.iter().enumerate() {
+        if index != leader {
+            prepares
+                .push(deliver_for_test(node, proposal_for_test(&round.proposal)).unwrap().unwrap());
+        }
+    }
+    for node in nodes {
+        for vote in &prepares {
+            deliver_for_test(node, vote_message(vote)).unwrap();
+        }
+    }
+    let commits: Vec<_> = nodes
+        .iter()
+        .filter_map(|node| node.consensus().unwrap().lock().unwrap().own_commit_vote().cloned())
+        .collect();
+    assert!(!commits.is_empty(), "every node must reach the commit phase");
+    for node in nodes {
+        for vote in &commits {
+            deliver_for_test(node, vote_message(vote)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn commits_reach_the_retention_trigger_without_ever_failing_the_block() {
+    // Q-036: the trigger is node-owned, so this drives a real certified commit
+    // and checks that the commit path reaches it. `keep = 1` is inside the bound
+    // after one block, so the first commit must not attempt a prune; after the
+    // second the retained span is above the bound and the attempt is a typed
+    // snapshot refusal, which must leave the block committed.
+    let _cluster = NETWORK_TEST_LOCK.blocking_lock();
+    let (_dirs, nodes) = validator_nodes_with_retention(4, Some(1));
+    let trigger = nodes[0].retention.clone().expect("the configured bound installs the trigger");
+    assert_eq!(trigger.next_attempt.load(Ordering::SeqCst), 0);
+
+    commit_next_block(&nodes);
+    assert_eq!(nodes[0].state().block_height(), 1);
+    assert_eq!(trigger.next_attempt.load(Ordering::SeqCst), 0, "inside the bound: no attempt");
+
+    commit_next_block(&nodes);
+    assert_eq!(nodes[0].state().block_height(), 2, "retention must not fail the commit");
+    assert_eq!(nodes[0].state().base_height(), 0);
+    assert_eq!(nodes[0].state().block_count(), 2);
+    // One attempt was made and refused at the snapshot anchor (height 0), and
+    // `max(1, keep / 8)` armed the next one at tip + 1.
+    assert_eq!(trigger.next_attempt.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn bootstrap_rejects_zero_retention_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = NodeConfig { retention_blocks: Some(0), ..test_config(dir.path()) };
+    let error = match Node::bootstrap(config) {
+        Err(error) => error,
+        Ok(_) => panic!("zero retention is not a valid bound"),
+    };
+    assert!(
+        matches!(error, NodeError::InvalidConsensusConfiguration(ref message)
+            if message.contains("at least 1")),
+        "got: {error}"
+    );
+}
+
 #[test]
 fn bootstrap_ignores_a_stray_pending_file_without_an_attached_store() {
     // With persistence opt-in unset, the bootstrap restore must be inert: it
@@ -1594,6 +1786,7 @@ fn a_supplied_producer_key_boots_a_validator_without_any_key_file() {
         &mut driver,
         node.consensus_journal.as_deref(),
         node.certified_history.as_deref(),
+        node.retention.as_deref(),
     )
     .unwrap()
     .expect("a validator with a pending transaction must propose");

@@ -9,6 +9,7 @@ fn produce(node: &Node) -> Result<Option<ProducedRound>, NodeError> {
         &mut node.consensus().unwrap().lock().unwrap(),
         node.consensus_journal.as_deref(),
         node.certified_history.as_deref(),
+        node.retention.as_deref(),
     )
 }
 

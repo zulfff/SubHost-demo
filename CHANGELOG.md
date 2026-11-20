@@ -317,6 +317,22 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Automatic ledger retention in the node (Q-036 Q6, S12.3).**
+  `NodeConfig.retention_blocks = Some(n)` now prunes instead of being inert. The
+  trigger runs once per successful commit, on the produced path and on certified
+  sync adoption, only when the retained span exceeds the bound (`tip -
+  base_height > n`), and asks `RpcState::retain_from(tip - n)`, which prunes
+  storage and trims the in-memory `blocks`, `receipts` and `base_height` under
+  one commit lock. A prune is best-effort: a refusal at the newest snapshot
+  anchor or a storage error is logged and counted through the existing metrics,
+  never propagated, never halts, and never fails an already durable commit.
+  After an attempt that made no progress the next one waits `max(1, n / 8)`
+  blocks, so a persistent floor does not attempt on every commit. Any `n >= 1`
+  is accepted and `0` is refused at bootstrap; values below the 4096-item
+  certified archive window warn at boot because the sync-serving range degrades,
+  and explicit `--single-writer` demo mode is excluded because committed history
+  is not final there. The bound stays `n` plus up to one snapshot cadence.
+
 - **Mempool TTL expiry and sender-depth gauge (S6.3, Q-039).** Pending
   transactions now expire: `MempoolConfig.tx_ttl` (default 30 minutes, zero
   refused) measured from admission, swept lazily by `Mempool::expire_before(now)`
@@ -333,9 +349,9 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 - **`subhost node --retention-blocks` configuration flag (Q-036 Q5, S12.3).**
   Stacks on the `NodeConfig.retention_blocks` field (#76): clap `u64` range
-  `1..`, unset = off, no env var, passed straight into the node config. The
-  flag is accepted now but **inert** until the node-side prune trigger lands;
-  `subhost db prune --keep-segments` remains the only prune path until then.
+  `1..`, unset = off, no env var, passed straight into the node config. The flag
+  is live once the node trigger above lands; with the bound unset,
+  `subhost db prune --keep-segments` remains the only prune path.
   Runbook: `docs/operations/ledger-repair.md` gains the automatic-retention
   section (snapshot floor = cadence + N, failure never halts, boot warning
   below 4096 with the degraded sync-serving role, validator/observer-only
