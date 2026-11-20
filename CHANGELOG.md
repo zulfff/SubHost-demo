@@ -405,8 +405,22 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   honours `OTEL_EXPORTER_OTLP_TIMEOUT` (default 10 s). No new dependencies (the
   otel 0.33 set landed with #74, MSRV 1.75 ≤ workspace 1.89). New tests cover
   flag parsing, endpoint normalization, malformed-endpoint refusal and the
-  non-fatal fallback. The sync-relay example keeps plain logging (follow-up).
-  Documented in `docs/operations/observability.md`.
+  non-fatal fallback. The sync-relay example export wiring is the follow-up
+  entry below. Documented in `docs/operations/observability.md`.
+- **OTLP export wiring in the `sync-relay` example (S8.1, Q-035 follow-up).**
+  The certified-history relay example now wires the same opt-in provider as
+  the CLI (#88): an `--otlp-endpoint <URL>` flag (env `SUBHOST_OTLP_ENDPOINT`)
+  opts in to OTLP HTTP/protobuf span export. Export stays off until an
+  endpoint is configured: default behaviour and log output are unchanged and
+  no exporter is constructed. Telemetry init happens inside the tokio runtime
+  (the batch processor needs a runtime context); the shutdown guard is
+  retained for the process lifetime and flushes on exit. Construction or
+  install failure warns and falls back to plain logging, never fatal; an
+  empty endpoint behaves like unset. The endpoint is used verbatim including
+  `/v1/traces`. No new dependencies: the `otlp` feature is already enabled for
+  subhost-cli since #88. New tests cover flag parsing, endpoint normalization,
+  malformed-endpoint refusal and the non-fatal fallback. Documented in
+  `docs/operations/observability.md`.
 
 - **Public genesis prep script (Q-012/Q-037).** Added
   `scripts/testnet/prepare-public-genesis.sh`: generates the four distinct

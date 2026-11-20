@@ -25,6 +25,51 @@ struct Options {
     replay_interval_ms: u64,
     #[arg(long, default_value_t = 67_108_864)]
     max_history_bytes: u64,
+    /// Export tracing spans over OTLP HTTP/protobuf to this collector endpoint,
+    /// including the signal path (`/v1/traces`). Unset or empty keeps export off.
+    #[arg(long, env = "SUBHOST_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+}
+
+/// Normalize a configured OTLP endpoint: trimmed, and an empty value means
+/// export stays off. The endpoint is used verbatim by the exporter, so it must
+/// include the signal path (`/v1/traces`).
+fn normalize_otlp_endpoint(value: Option<String>) -> Option<String> {
+    value.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+}
+
+/// Install relay telemetry. With an OTLP endpoint configured, spans export
+/// through the provider and the returned shutdown guard must be retained for
+/// the process lifetime (drop flushes). Construction or install failure is
+/// reported and falls back to plain logging, never fatal to boot (Q-035).
+/// Must be called inside a tokio runtime: the OTLP batch processor needs one.
+fn init_telemetry(
+    otlp_endpoint: Option<String>,
+    verbosity: Verbosity,
+) -> Option<subhost_telemetry::otlp::OtlpGuard> {
+    match normalize_otlp_endpoint(otlp_endpoint) {
+        Some(endpoint) => {
+            let otlp = subhost_telemetry::otlp::OtlpConfig {
+                endpoint,
+                ..subhost_telemetry::otlp::OtlpConfig::default()
+            };
+            match subhost_telemetry::otlp::init_with_otlp(
+                TelemetryConfig::from_env(verbosity),
+                otlp,
+            ) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    eprintln!("warning: OTLP export disabled: {error}");
+                    subhost_telemetry::init_or_warn(TelemetryConfig::from_env(verbosity));
+                    None
+                }
+            }
+        }
+        None => {
+            subhost_telemetry::init_or_warn(TelemetryConfig::from_env(verbosity));
+            None
+        }
+    }
 }
 
 struct AbortNetworkOnDrop(tokio::task::AbortHandle);
@@ -92,7 +137,10 @@ async fn main() -> Result<()> {
     if options.replay_interval_ms == 0 || options.max_history_bytes == 0 {
         bail!("replay interval and history byte limit must be positive");
     }
-    subhost_telemetry::init(TelemetryConfig::from_env(Verbosity::Normal))?;
+    // Retained for the process lifetime; dropping it flushes pending spans.
+    // Installed inside the runtime: the OTLP batch processor needs a tokio
+    // context (Q-035).
+    let _otlp_guard = init_telemetry(options.otlp_endpoint, Verbosity::Normal);
     let genesis = GenesisConfig::load(&options.genesis)?;
     let history = History::open(&options.data_dir, &genesis, options.max_history_bytes)?;
     relay(

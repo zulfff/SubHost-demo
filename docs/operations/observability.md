@@ -143,8 +143,8 @@ log output are unchanged, and no exporter is constructed.
 - What exports is governed by the same per-layer `EnvFilter` as the logs
   (`RUST_LOG`, else the verbosity directive): info spans such as `rpc_call`
   pass the default. Only bounded operational fields enter spans, never secrets.
-- The `sync-relay` example still uses plain logging; relay span export is a
-  follow-up slice.
+- The `sync-relay` example wires the same opt-in export (`--otlp-endpoint` /
+  `SUBHOST_OTLP_ENDPOINT`); unset or empty keeps plain logging.
 
 ## Block and consensus spans (S8.1)
 
@@ -260,7 +260,7 @@ quorum certificates exist), so that alert must stay disabled for demo deployment
   `otlp` feature (Q-035): `otlp::init_with_otlp` installs the export layer and
   returns a retained shutdown guard. The `subhost` CLI now wires it (global
   `--otlp-endpoint` / `SUBHOST_OTLP_ENDPOINT`, opt-in at runtime); RPC method
-  spans (#69) and the Track A block/consensus spans (Q-035) export once an
-  endpoint is set. The sync-relay export wiring follows.
+  spans (#69), the Track A block/consensus spans (Q-035) and the `sync-relay`
+  example export once an endpoint is set.
 - The exporter is unauthenticated: bind loopback or a private interface, or
   front it with an authenticating proxy. `/health/*` reveals readiness state.

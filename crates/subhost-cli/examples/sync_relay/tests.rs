@@ -455,3 +455,59 @@ async fn fresh_node_automatically_backfills_one_hundred_certified_blocks_over_p2
     assert_eq!(state.balance(&Address::new([9; 20])), 1_000);
     assert_ne!(state.tip_hash(), Hash::ZERO);
 }
+
+#[test]
+fn the_otlp_endpoint_flag_is_optional() {
+    use clap::CommandFactory;
+    Options::command().debug_assert();
+    let base = [
+        "sync-relay",
+        "--genesis",
+        "genesis.json",
+        "--data-dir",
+        "data",
+        "--p2p-listen",
+        "127.0.0.1:0",
+        "--bootstrap-peer",
+        "/ip4/127.0.0.1/tcp/1",
+    ];
+    let options = Options::try_parse_from(base).unwrap();
+    assert_eq!(options.otlp_endpoint, None);
+    let mut args = base.to_vec();
+    args.extend(["--otlp-endpoint", "http://127.0.0.1:4318/v1/traces"]);
+    let options = Options::try_parse_from(args).unwrap();
+    assert_eq!(options.otlp_endpoint.as_deref(), Some("http://127.0.0.1:4318/v1/traces"));
+}
+
+#[test]
+fn an_unset_or_empty_otlp_endpoint_means_no_export() {
+    assert_eq!(normalize_otlp_endpoint(None), None);
+    assert_eq!(normalize_otlp_endpoint(Some(String::new())), None);
+    assert_eq!(normalize_otlp_endpoint(Some("   ".into())), None);
+    assert_eq!(
+        normalize_otlp_endpoint(Some("  http://127.0.0.1:4318/v1/traces  ".into())),
+        Some("http://127.0.0.1:4318/v1/traces".into())
+    );
+}
+
+#[test]
+fn a_malformed_otlp_endpoint_is_refused_before_any_global_install() {
+    let otlp = subhost_telemetry::otlp::OtlpConfig {
+        endpoint: "not a valid url".into(),
+        timeout: Duration::from_millis(50),
+    };
+    let result = subhost_telemetry::otlp::init_with_otlp(TelemetryConfig::default(), otlp);
+    assert!(result.is_err(), "exporter construction must refuse a malformed endpoint");
+}
+
+#[test]
+fn telemetry_init_falls_back_to_plain_logging_without_panicking() {
+    // No endpoint: plain logging, no guard. A global subscriber may already
+    // exist in this test binary; init_or_warn tolerates that by contract.
+    assert!(init_telemetry(None, Verbosity::Normal).is_none());
+    // Malformed endpoint: construction fails, the fallback installs plain
+    // logging (or warns), and boot continues without a guard.
+    assert!(init_telemetry(Some("not a valid url".into()), Verbosity::Quiet).is_none());
+    // Empty endpoint behaves exactly like unset.
+    assert!(init_telemetry(Some("  ".into()), Verbosity::Normal).is_none());
+}
