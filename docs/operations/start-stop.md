@@ -51,6 +51,10 @@ subhost node --validator \
   (`<data-dir>/mempool.bin`, restored on start-up; a corrupt or foreign
   snapshot refuses boot). Default off keeps the pool volatile. See
   [mempool-persistence.md](mempool-persistence.md).
+- `--otlp-endpoint <URL>` (env `SUBHOST_OTLP_ENDPOINT`) opts into OTLP span
+  export. It is a global flag accepted on any subcommand; unset keeps export
+  off and log output unchanged. The endpoint is used verbatim, so include
+  `/v1/traces`. See [observability.md](observability.md).
 
 ## Confirm it is healthy
 
