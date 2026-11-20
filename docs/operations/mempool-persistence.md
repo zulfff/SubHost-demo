@@ -55,6 +55,20 @@ the local gas-price floor (`Mempool::admit_restored`). Rewriting the filtered
 pool to `mempool.bin` is best-effort, so a pending-file problem cannot stop a
 node whose ledger is durable.
 
+### Entry lifetime
+
+Pending entries expire after `MempoolConfig::tx_ttl` (default 30 minutes; a
+zero value is refused at configuration time). Expiry is lazy: each admission
+first drops entries admitted at or before `now - tx_ttl`, before capacity or
+byte-budget eviction runs, so an expired entry never displaces a live one.
+The node has no background sweep yet; expiry runs on admission only until the
+optional node timer lands (`Mempool::expire_before(now)` is public and takes
+the clock as an argument, so a timer can drive the same sweep). Because the
+snapshot stores transactions, not admission timestamps, restoring
+`mempool.bin` gives every entry a fresh TTL window; the operator-facing
+consequence is documented in the restart section of
+[start-stop.md](start-stop.md).
+
 The aggregate runtime byte budget (`MempoolConfig::max_pending_bytes`, default
 32 MiB) binds with persistence on or off; count and per-sender caps alone do not
 bound memory, since `max_pending * max_tx_data_bytes` exceeds a GiB at the

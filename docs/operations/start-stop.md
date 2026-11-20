@@ -88,3 +88,10 @@ node replays the retained suffix against the verified head and re-authenticates
 restored voting obligations. If the previous run halted on a fork incident, the
 restart stays halted until an operator resolves it: a restart is not a recovery
 path.
+
+The pending pool ages from the restart, not from original acceptance: the
+mempool snapshot stores transactions, not admission timestamps, so restored
+entries get a fresh TTL window. With the 30-minute default, an entry parked
+across a restart expires 30 minutes after the node starts again. That is
+intended revalidation, not data loss; see
+[mempool-persistence.md](mempool-persistence.md).
