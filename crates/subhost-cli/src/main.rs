@@ -175,13 +175,12 @@ enum Commands {
         #[arg(long, requires = "rpc_auth_token_file")]
         rpc_allow_public: bool,
 
-        /// Automatic ledger retention in blocks (Q-036). Unset = off.
-        /// Accepted now; the prune trigger lands with the S12.3 retention
-        /// slice, so until then this has no effect on a running node and
-        /// `subhost db prune` remains the only prune path. The newest
-        /// snapshot is the hard floor: the real bound is snapshot cadence + N.
-        /// Values below 4096 warn at boot once the trigger lands (degraded
-        /// sync-serving role).
+        /// Automatic ledger retention in blocks (Q-036). Unset = off. The node
+        /// prunes after a successful commit when the retained span exceeds N.
+        /// The newest snapshot is the hard floor, so the bound is N plus up to
+        /// one snapshot cadence (1024 blocks). Values below 4096 warn at boot:
+        /// the certified-sync serving range degrades. Not installed in explicit
+        /// --single-writer demo mode.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         retention_blocks: Option<u64>,
     },
