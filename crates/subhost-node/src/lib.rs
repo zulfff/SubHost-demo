@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use subhost_consensus::{
     driver::{
@@ -52,7 +52,7 @@ use subhost_network::{NetworkConfig, NetworkHandle, NetworkManager, NetworkMessa
 use subhost_rpc::{
     BlockAuthority, BlockEvent, RpcSecurityConfig, RpcServer, RpcServerConfig, RpcState,
 };
-use subhost_storage::LedgerStore;
+use subhost_storage::{LedgerStore, PruneOutcome};
 use tracing::{debug, info, warn};
 
 // Real-network tests share a four-validator machine budget. Running many debug
@@ -104,11 +104,13 @@ pub struct NodeConfig {
     /// Blocks to retain automatically, or `None` for today's offline-only prune.
     ///
     /// This is the configuration surface for `SUBHOST-2026-003` fix 3 (Q-036):
-    /// `Some(n)` will prune the ledger when `tip - base_height > n`, keeping the
-    /// newest snapshot as the replay anchor. The trigger lands in the S12.3
-    /// retention slice; until then the field is accepted and documented by the
-    /// CLI but has no effect on a running node. `None` is the default and keeps
-    /// `subhost db prune --keep-segments` as the only prune path.
+    /// `Some(n)` prunes the ledger after a successful commit when
+    /// `tip - base_height > n`. The newest snapshot is the replay anchor and the
+    /// hard floor, so the honest bound is `n` plus up to one snapshot cadence.
+    /// `None` is the default and keeps `subhost db prune --keep-segments` as the
+    /// only prune path. Values below the certified-archive window warn at boot;
+    /// explicit `--single-writer` demo mode is excluded because there committed
+    /// history is not final.
     pub retention_blocks: Option<u64>,
     /// Whether the pending pool is persisted to `<data_dir>/mempool.bin`.
     ///
@@ -153,6 +155,106 @@ impl NodeConfig {
     }
 }
 
+/// Node-owned automatic-retention trigger (Q-036).
+///
+/// The consensus commit path calls [`Self::after_commit`] once per successful
+/// commit. When the retained span exceeds the configured bound, the trigger
+/// asks storage to prune through [`RpcState::retain_from`], which owns the
+/// storage write and the matching in-memory trim under the commit lock.
+///
+/// A prune is best-effort by contract: a refusal at the snapshot floor or a
+/// storage error is logged and never propagated, so it cannot fail an already
+/// durable commit. After an attempt that made no progress the trigger waits
+/// `max(1, keep / 8)` blocks, so a persistent floor does not turn every commit
+/// into a prune attempt.
+#[derive(Debug)]
+struct RetentionTrigger {
+    keep: u64,
+    /// Head height at which the next attempt is allowed.
+    next_attempt: AtomicU64,
+}
+
+impl RetentionTrigger {
+    fn new(keep: u64) -> Self {
+        Self { keep, next_attempt: AtomicU64::new(0) }
+    }
+
+    /// Blocks to wait after an attempt that made no progress.
+    fn retry_after(&self) -> u64 {
+        (self.keep / 8).max(1)
+    }
+
+    /// Try to prune after a successful commit; never returns a failure.
+    fn after_commit(&self, state: &RpcState) {
+        let Some(outcome) = self.attempt(state) else { return };
+        match outcome {
+            Ok(PruneOutcome::Pruned { dropped_segments, retained_segments, base_height }) => {
+                info!(
+                    base_height,
+                    dropped_segments,
+                    retained_segments,
+                    "automatically pruned retained ledger history"
+                );
+            }
+            Ok(PruneOutcome::NothingToPrune { segments }) => {
+                debug!(segments, "automatic retention made no change");
+            }
+            Ok(PruneOutcome::RefusedBySnapshot { snapshot_height, requested_height }) => {
+                debug!(
+                    snapshot_height,
+                    requested_height,
+                    "retention is held by the newest snapshot anchor; retrying after the backoff"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "automatic ledger retention failed; the commit is unaffected and the \
+                     attempt retries after the backoff"
+                );
+            }
+        }
+    }
+
+    /// Height to prune to, or `None` while the bound or the backoff says no.
+    ///
+    /// `tip - base > keep` is the only state that triggers an attempt, and the
+    /// backoff can only delay one: it never raises the bound or widens the
+    /// retained span. The returned height is strictly above `base`, so storage
+    /// always has something to consider.
+    fn target(&self, tip: u64, base: u64) -> Option<u64> {
+        if tip.saturating_sub(base) <= self.keep {
+            return None;
+        }
+        if tip < self.next_attempt.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(tip - self.keep)
+    }
+
+    /// Apply one attempt's effect on the backoff window.
+    ///
+    /// `Pruned` is progress, so the next commit may attempt again as soon as
+    /// the bound is exceeded. Every other result (a snapshot refusal or a
+    /// storage error) waits `max(1, keep / 8)` blocks, so a persistent floor
+    /// does not turn every commit into a prune attempt.
+    fn record(&self, tip: u64, outcome: &Result<PruneOutcome, subhost_rpc::RpcError>) {
+        if matches!(outcome, Ok(PruneOutcome::Pruned { .. })) {
+            return;
+        }
+        self.next_attempt.store(tip.saturating_add(self.retry_after()), Ordering::SeqCst);
+    }
+
+    /// One attempt, or `None` while the bound or the backoff says no.
+    fn attempt(&self, state: &RpcState) -> Option<Result<PruneOutcome, subhost_rpc::RpcError>> {
+        let tip = state.head_height();
+        let target = self.target(tip, state.base_height())?;
+        let outcome = state.retain_from(target);
+        self.record(tip, &outcome);
+        Some(outcome)
+    }
+}
+
 /// A booted node: ledger restored, genesis applied, ready to serve.
 pub struct Node {
     state: RpcState,
@@ -170,6 +272,9 @@ pub struct Node {
     catching_up: Arc<AtomicBool>,
     /// Truthful S8 health predicates and proposal-latency observations.
     runtime: Arc<RuntimeHealth>,
+    /// Automatic ledger retention, installed by bootstrap when the operator
+    /// configured a bound and this is not an explicit single-writer demo.
+    retention: Option<Arc<RetentionTrigger>>,
 }
 
 impl Node {
@@ -246,6 +351,28 @@ impl Node {
             return Err(NodeError::InvalidConsensusConfiguration(
                 "configure genesis validators or explicitly select --single-writer".into(),
             ));
+        }
+        if let Some(keep) = config.retention_blocks {
+            // The CLI enforces `1..`, but `NodeConfig` is also a library API.
+            if keep == 0 {
+                return Err(NodeError::InvalidConsensusConfiguration(
+                    "retention_blocks must be at least 1; omit it to disable automatic retention"
+                        .into(),
+                ));
+            }
+            if config.single_writer {
+                warn!(
+                    retention_blocks = keep,
+                    "automatic retention is disabled in single-writer demo mode"
+                );
+            } else if keep < certified_history::RETENTION as u64 {
+                warn!(
+                    retention_blocks = keep,
+                    certified_archive_window = certified_history::RETENTION,
+                    "retention is below the certified-archive window; this node serves a \
+                     degraded sync range"
+                );
+            }
         }
         let proposal_limit = if validator_count > 0 {
             Some(consensus_block_budget(validator_count)?)
@@ -467,6 +594,13 @@ impl Node {
         // above; the block pipeline has not started, so readiness stays false.
         runtime.ledger_loaded.store(true, Ordering::SeqCst);
         runtime.publish(&metrics, false);
+        // Q-036: installed once at boot so every commit site, and the tests
+        // that drive those sites, uses the same trigger. Single-writer demo
+        // mode is excluded because committed history is not final there.
+        let retention = config
+            .retention_blocks
+            .filter(|_| !config.single_writer)
+            .map(|keep| Arc::new(RetentionTrigger::new(keep)));
 
         Ok(Self {
             state,
@@ -479,6 +613,7 @@ impl Node {
             fork_log,
             catching_up,
             runtime,
+            retention,
         })
     }
 
@@ -528,6 +663,13 @@ impl Node {
         info!(chain_id = self.chain_id(), height = self.state.block_height(),
             data_dir = %self.config.data_dir.display(), validator = self.config.validator,
             "starting node");
+        // Attach the metrics registry before the pipeline starts: the retention
+        // trigger prunes through this shared state, so `retain_from` publishes
+        // `subhost_ledger_prune_total` and seeds `subhost_ledger_base_height`.
+        // `with_metrics` also arms the RPC method instrumentation used below.
+        let rpc = RpcServer::new(self.state.clone()).with_metrics(self.metrics.clone());
+        let state = rpc.state().clone();
+        let retention = self.retention.clone();
         let mut services = tokio::task::JoinSet::<Result<(), NodeError>>::new();
         if let Some(addr) = self.config.metrics_addr {
             let metrics = self.metrics.clone();
@@ -538,7 +680,7 @@ impl Node {
         }
         {
             let metrics = self.metrics.clone();
-            let state = self.state.clone();
+            let state = state.clone();
             services.spawn(async move {
                 let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -557,7 +699,7 @@ impl Node {
         }
         match (self.config.network.clone(), self.consensus.clone()) {
             (Some(config), driver) => {
-                let state = self.state.clone();
+                let state = state.clone();
                 let runtime = self.runtime.clone();
                 let node_services = NodeServices {
                     journal: self.consensus_journal.clone(),
@@ -566,6 +708,7 @@ impl Node {
                     catching_up: self.catching_up.clone(),
                     metrics: Some(self.metrics.clone()),
                     runtime: self.runtime.clone(),
+                    retention: retention.clone(),
                 };
                 services.spawn(async move {
                     runtime.pipeline_alive.store(true, Ordering::SeqCst);
@@ -576,7 +719,7 @@ impl Node {
                 });
             }
             (None, Some(driver)) => {
-                let state = self.state.clone();
+                let state = state.clone();
                 let runtime = self.runtime.clone();
                 let node_services = NodeServices {
                     journal: self.consensus_journal.clone(),
@@ -585,6 +728,7 @@ impl Node {
                     catching_up: self.catching_up.clone(),
                     metrics: Some(self.metrics.clone()),
                     runtime: self.runtime.clone(),
+                    retention: retention.clone(),
                 };
                 services.spawn(async move {
                     runtime.pipeline_alive.store(true, Ordering::SeqCst);
@@ -595,7 +739,6 @@ impl Node {
             }
             (None, None) => {}
         }
-        let rpc = RpcServer::new(self.state.clone()).with_metrics(self.metrics.clone());
         let (_, handle) = match rpc.start(rpc_config).await {
             Ok(server) => server,
             Err(error) => {
@@ -764,6 +907,8 @@ struct NodeServices {
     catching_up: Arc<AtomicBool>,
     metrics: Option<Metrics>,
     runtime: Arc<RuntimeHealth>,
+    /// Automatic ledger retention, when the operator opted in.
+    retention: Option<Arc<RetentionTrigger>>,
 }
 
 /// Pump gossip until the process shuts down.
@@ -833,6 +978,7 @@ async fn run_network_inner(
                 catching_up: &services.catching_up,
                 metrics: services.metrics.as_ref(),
                 runtime: &services.runtime,
+                retention: services.retention.as_deref(),
             },
         ) => {
             Ok(())
@@ -939,6 +1085,7 @@ fn commit_ready(
     driver: &mut ConsensusDriver,
     journal: Option<&ConsensusJournal>,
     history: Option<&Mutex<CertifiedHistory>>,
+    retention: Option<&RetentionTrigger>,
 ) -> Result<(), NodeError> {
     let Some(qc) = driver.pending_qc() else { return Ok(()) };
     let block = driver.open_proposal().expect("pending QC requires a proposal").block.clone();
@@ -982,6 +1129,11 @@ fn commit_ready(
     if let Some(journal) = journal {
         journal.save(driver)?;
     }
+    // Q-036: the block is durable and the driver advanced; retention is
+    // best-effort and can never turn this success into a failure.
+    if let Some(trigger) = retention {
+        trigger.after_commit(state);
+    }
     Ok(())
 }
 
@@ -991,8 +1143,9 @@ fn produce_once_inner(
     driver: &mut ConsensusDriver,
     journal: Option<&ConsensusJournal>,
     history: Option<&Mutex<CertifiedHistory>>,
+    retention: Option<&RetentionTrigger>,
 ) -> Result<Option<ProducedRound>, NodeError> {
-    commit_ready(state, driver, journal, history)?;
+    commit_ready(state, driver, journal, history, retention)?;
     let initial_view =
         driver.committed_qc().map_or(driver.height(), |qc| qc.view).checked_add(1).ok_or_else(
             || NodeError::InvalidConsensusConfiguration("view counter overflow".into()),
@@ -1041,7 +1194,7 @@ fn produce_once_inner(
         .open_proposal()
         .cloned()
         .map(|proposal| ProducedRound { proposal, vote: driver.own_vote().cloned() });
-    commit_ready(state, driver, journal, history)?;
+    commit_ready(state, driver, journal, history, retention)?;
     Ok(round)
 }
 
@@ -1050,7 +1203,7 @@ fn produce_once(
     state: &RpcState,
     driver: &mut ConsensusDriver,
 ) -> Result<Option<ProducedRound>, NodeError> {
-    produce_once_inner(state, driver, None, None)
+    produce_once_inner(state, driver, None, None, None)
 }
 
 fn adopt_pending(
@@ -1173,7 +1326,7 @@ fn handle_consensus_message_inner(
     message: NetworkMessage,
     commit: &mut CommitContext<'_>,
 ) -> Result<Option<Vote>, NodeError> {
-    commit_ready(state, driver, commit.journal, commit.history)?;
+    commit_ready(state, driver, commit.journal, commit.history, commit.retention)?;
     match message {
         NetworkMessage::ConsensusProposal { data } => {
             let proposal: DriverProposal = decode_consensus(&data)?;
@@ -1215,7 +1368,7 @@ fn handle_consensus_message_inner(
             if let Some(runtime) = commit.runtime {
                 runtime.note_proposal(view);
             }
-            commit_ready(state, driver, commit.journal, commit.history)?;
+            commit_ready(state, driver, commit.journal, commit.history, commit.retention)?;
             Ok(vote)
         }
         NetworkMessage::ConsensusVote { data } => {
@@ -1223,7 +1376,7 @@ fn handle_consensus_message_inner(
             let mut candidate = driver.clone();
             let fresh = candidate.record_vote(vote.clone())?;
             adopt_pending(driver, candidate, commit.journal)?;
-            commit_ready(state, driver, commit.journal, commit.history)?;
+            commit_ready(state, driver, commit.journal, commit.history, commit.retention)?;
             Ok(fresh.then_some(vote))
         }
         NetworkMessage::PreparedBlock { data } => {
@@ -1257,7 +1410,7 @@ fn handle_consensus_message_inner(
                 result
             }?;
             adopt_pending(driver, candidate, commit.journal)?;
-            commit_ready(state, driver, commit.journal, commit.history)?;
+            commit_ready(state, driver, commit.journal, commit.history, commit.retention)?;
             Ok(vote)
         }
         NetworkMessage::ViewChange { data } => {
@@ -1397,6 +1550,7 @@ struct CertifiedSync<'a> {
     catching_up: &'a AtomicBool,
     metrics: Option<&'a Metrics>,
     runtime: &'a RuntimeHealth,
+    retention: Option<&'a RetentionTrigger>,
 }
 
 impl SyncState {
@@ -1512,6 +1666,7 @@ struct CommitContext<'a> {
     candidates: &'a mut CandidateBuffer,
     metrics: Option<&'a Metrics>,
     runtime: Option<&'a RuntimeHealth>,
+    retention: Option<&'a RetentionTrigger>,
 }
 
 impl CommitContext<'_> {
@@ -1525,6 +1680,7 @@ impl CommitContext<'_> {
             candidates,
             metrics: None,
             runtime: None,
+            retention: None,
         }
     }
 }
@@ -1687,6 +1843,10 @@ fn apply_certified_item(
         journal.save(driver)?;
     }
     publish_finality(commit.metrics, commit.runtime, state, driver);
+    // Certified adoption is a commit too; retention applies on the same terms.
+    if let Some(trigger) = commit.retention {
+        trigger.after_commit(state);
+    }
     Ok(())
 }
 
@@ -1907,7 +2067,7 @@ async fn produce_blocks(
     outbound: Option<tokio::sync::mpsc::Sender<NetworkMessage>>,
     services: NodeServices,
 ) {
-    let NodeServices { journal, history, catching_up, metrics, runtime, .. } = services;
+    let NodeServices { journal, history, catching_up, metrics, runtime, retention, .. } = services;
     let Some(driver) = driver else {
         std::future::pending::<()>().await;
         return;
@@ -1939,7 +2099,13 @@ async fn produce_blocks(
             if let Some(metrics) = &metrics {
                 publish_health(metrics, &runtime, false);
             }
-            commit_ready(&state, &mut driver, journal.as_deref(), history.as_deref())?;
+            commit_ready(
+                &state,
+                &mut driver,
+                journal.as_deref(),
+                history.as_deref(),
+                retention.as_deref(),
+            )?;
             let mut candidate = driver.clone();
             let pending = state.pending_count() > 0;
             if pending && !had_pending {
@@ -1963,8 +2129,13 @@ async fn produce_blocks(
                 );
             }
             adopt_pending(&mut driver, candidate, journal.as_deref())?;
-            let round =
-                produce_once_inner(&state, &mut driver, journal.as_deref(), history.as_deref())?;
+            let round = produce_once_inner(
+                &state,
+                &mut driver,
+                journal.as_deref(),
+                history.as_deref(),
+                retention.as_deref(),
+            )?;
             // A locally produced proposal starts its own latency clock; the
             // verified commit below (or in a later cycle) closes the sample.
             if let Some(round) = &round {
@@ -2045,7 +2216,8 @@ async fn pump_gossip(
     driver: Option<&Arc<Mutex<ConsensusDriver>>>,
     certified: CertifiedSync<'_>,
 ) {
-    let CertifiedSync { journal, history, fork_log, catching_up, metrics, runtime } = certified;
+    let CertifiedSync { journal, history, fork_log, catching_up, metrics, runtime, retention } =
+        certified;
     let mut sync = SyncState::default();
     // Q-028: one node-owned store for the whole pump. It is never handed to the
     // driver, so an unauthenticated card cannot reach the ordered commit path.
@@ -2077,6 +2249,7 @@ async fn pump_gossip(
                                 candidates: &mut candidates,
                                 metrics,
                                 runtime: Some(runtime),
+                                retention,
                             };
                             let applied =
                                 apply_certified_range(state, &mut driver, &mut commit, &items)
@@ -2137,6 +2310,7 @@ async fn pump_gossip(
                                 candidates: &mut candidates,
                                 metrics,
                                 runtime: Some(runtime),
+                                retention,
                             };
                             // S3.1: classification and application happen together,
                             // so a gap beyond the next height buffers rather than drops.

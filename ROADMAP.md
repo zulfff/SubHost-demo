@@ -676,10 +676,17 @@ storage.
 incident log. Gated on SUBHOST-2026-003 fix 3 (automatic retention, Q-036): the
 storage/state mechanism (#87: `prune_to_height` + typed `RefusedBySnapshot` +
 `retain_from` atomic trim), height self-check (#89), `--retention-blocks` flag
-(#91) and prune metrics (#92) are merged; the node trigger (raka) is
-implemented on branch `s12.3/retention-node-trigger` (Q-041 agreed), PR
-pending, so retention stays inert on main until it lands. Fix 1 (calldata pricing) is Q-037 and gates activation
-separately (L4 merged+verified + nara re-probe).
+(#91), prune metrics (#92) and the post-commit node trigger are merged, so a
+node with a bound configured now prunes instead of staying inert. The trigger
+attempts once per successful commit, only past `tip - base_height > n`, stops
+at the newest snapshot anchor, backs off `max(1, n / 8)` blocks after an attempt
+that made no progress, and never fails a commit. Fix 1 (calldata pricing) is
+Q-037 and gates activation separately (L4 merged+verified + nara re-probe).
+Outstanding from this slice: pruning only makes a real segment drop on a ledger
+whose first segment already passed 64 MiB, so the node-level end-to-end prune
+test was dropped as too heavy for a unit gate and that path stays covered by
+the storage `prune_to_height` tests plus the trigger's refusal and backoff
+tests.
 **S12.4** Bug bounty scope and disclosure policy.
 **S12.5** v1.0 go/no-go against section 2.
 

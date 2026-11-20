@@ -239,8 +239,9 @@ Durability and integrity:
   `newest_snapshot_height` returns `PruneOutcome::RefusedBySnapshot` without
   writing, because the anchor's own block must stay retained. With snapshots
   every 1024 blocks the honest retention bound is `n + up to 1023 blocks`, not
-  `n`. A successful prune refreshes the verified-head cache's base in place, so
-  a warm append still takes the suffix path; head height, hash and state are
+  `n`, for the offline command and the automatic node trigger alike. A successful
+  prune refreshes the verified-head cache's base in place, so a warm append still
+  takes the suffix path; head height, hash and state are
   unchanged by retention. The caller serializes it with persist/load under the
   node's commit lock;
 - every read is validated before it is trusted: size bounds, magic, versions,
@@ -314,19 +315,27 @@ What the ledger does not guarantee:
 - no reorg: `persist` refuses a snapshot that does not extend the committed head
   (`StorageError::NonAppendPersist`), so a competing branch can only replace the
   chain by deleting the ledger directory and replaying from genesis;
-- no pruning and no bounded start-up I/O: a fresh snapshot is written every 1024
-  blocks and start-up executes at most that many blocks on top of it, but every
-  segment is still read and scanned, and old segments are never dropped, so
-  start-up I/O and disk use still grow with history until S4.3–S4.4;
+- no bounded start-up I/O: a fresh snapshot is written every 1024 blocks and
+  start-up executes at most that many blocks on top of it, but every retained
+  segment is still read and scanned, so start-up I/O grows with the retained
+  history. Disk use is bounded only when retention is configured
+  (`--retention-blocks` or an explicit prune); without it old segments are never
+  dropped (S4.3-S4.4);
 - pruning has two entry points: the offline `subhost db prune` (node stopped,
   newest N segments) and the online `RpcState::retain_from(h)`, which prunes
   storage and then trims the in-memory `blocks`, `receipts` and `base_height`
   under the commit lock, storage first. A refusal or failure leaves every
   in-memory view untouched, and a crash between the two is safe because `load()`
   rebuilds the views from the retained suffix. Both need the snapshot to stay
-  inside the retained history. The automatic node trigger and the
-  `--retention-blocks` flag are separate consumer slices; until they land,
-  retention still requires an explicit call. A
+  inside the retained history. `subhost node --retention-blocks N` makes the node
+  call `retain_from(tip - N)` after a successful commit, produced or adopted
+  through certified sync, whenever `tip - base_height > N`: at most one attempt
+  per commit, a refusal or storage error is logged and counted but never fails
+  the commit, and an attempt that made no progress defers the next one by
+  `max(1, N / 8)` blocks. Any `N >= 1` is accepted; values below the 4096-item
+  certified archive window warn at boot because the sync-serving range degrades,
+  and explicit `--single-writer` demo mode is excluded because committed history
+  is not final there. A
   pruned node is not an archive node: `eth_getBlockByNumber` returns `null` below its
   base height, `eth_getTransactionByHash` and `eth_getTransactionReceipt` return
   `null` for a pruned transaction, `earliest` is the oldest retained block, and
