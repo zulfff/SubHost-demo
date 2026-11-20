@@ -191,3 +191,37 @@ fn a_failed_disk_measurement_keeps_the_previous_gauge_value() {
         "a failed measurement keeps the last value, never a false zero"
     );
 }
+
+/// Yield until a gauge reaches an expected value, bounded by a short deadline.
+async fn wait_for_gauge(metrics: &Metrics, name: &str, expected: f64) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    while gauge(metrics, name) != Some(expected) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{name} never reached {expected}, last value {:?}",
+            gauge(metrics, name)
+        );
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test]
+async fn connected_peer_gauge_follows_the_network_watch() {
+    // S8: the gauge is event-driven from the network watch, so a connection
+    // change is visible without waiting for the 5 s sampling tick.
+    let metrics = Metrics::new().unwrap();
+    let (sender, receiver) = tokio::sync::watch::channel(0);
+    let task = tokio::spawn(publish_connected_peers(metrics.clone(), receiver));
+
+    assert_eq!(gauge(&metrics, "subhost_connected_peers"), Some(0.0));
+
+    sender.send_replace(3);
+    wait_for_gauge(&metrics, "subhost_connected_peers", 3.0).await;
+
+    sender.send_replace(0);
+    wait_for_gauge(&metrics, "subhost_connected_peers", 0.0).await;
+
+    // The watcher exits on its own when the network drops the sender.
+    drop(sender);
+    task.await.unwrap();
+}

@@ -5,8 +5,9 @@ hooks (Q-020/Q-032) and block/consensus tracing spans (Q-035): health
 predicates come from actual runtime state, finalized
 height and QC latency are published at the verified final commit path, and the
 ledger footprint/snapshot age are measured periodically under the commit lock.
-`subhost_connected_peers` is the remaining gated gauge (needs a network handle
-accessor). Nothing here infers readiness from peer counts or block height.
+`subhost_connected_peers` follows the network connection watch, so it moves on
+every connect and on the close of a peer's last connection. Nothing here infers
+readiness from peer counts or block height.
 
 ## Health endpoints
 
@@ -254,8 +255,11 @@ quorum certificates exist), so that alert must stay disabled for demo deployment
 ## Limitations
 
 - Node/consensus call-sites for the runtime gauges and health predicates are
-  landed (Q-020/Q-032). `subhost_connected_peers` still needs a network handle
-  accessor and stays 0 until then.
+  landed (Q-020/Q-032). `subhost_connected_peers` is transport reachability, not
+  topic participation: a peer can be connected before it announces the
+  application topic, so this gauge and `subscribed_peer_count` can legitimately
+  differ. A node without networking, and every unit test that does not run a
+  swarm, publishes 0.
 - OTLP tracing export provider (S8.1) is published behind the `subhost-telemetry`
   `otlp` feature (Q-035): `otlp::init_with_otlp` installs the export layer and
   returns a retained shutdown guard. The `subhost` CLI now wires it (global
