@@ -39,11 +39,19 @@ pub const MAX_SYNC_ITEMS: usize = 128;
 /// Capacity of the inbound and outbound channels.
 const CHANNEL_CAPACITY: usize = 1_000;
 
+/// Cadence for reaching a bootstrap peer that has never answered.
+const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Cap for a peer that was reachable and then dropped.
+const BOOTSTRAP_RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
+
 /// One configured endpoint, including the attempt ID used to match dial errors.
 struct BootstrapRetry {
     address: Multiaddr,
     attempt: Option<ConnectionId>,
     connected: Option<PeerId>,
+    /// Set by the first successful connection. Until then a refused dial only
+    /// means the endpoint is still starting.
+    ever_connected: bool,
     next_attempt: Instant,
     delay: Duration,
 }
@@ -54,15 +62,26 @@ impl BootstrapRetry {
             address,
             attempt: None,
             connected: None,
+            ever_connected: false,
             next_attempt: Instant::now(),
-            delay: Duration::from_secs(1),
+            delay: BOOTSTRAP_RETRY_DELAY,
         }
     }
 
+    /// Schedule the next dial after one that did not connect.
+    ///
+    /// Escalation starts only after the peer has answered once. A refused dial
+    /// against a peer that is still starting is not evidence that it is gone,
+    /// and doubling from the first attempt turns a two-second startup skew into
+    /// a fifteen-second stall (`1 + 2 + 4 + 8`). A peer that was reachable and
+    /// then dropped does back off to the cap, so a dead endpoint is not dialled
+    /// every second forever.
     fn failed(&mut self, now: Instant) {
         self.attempt = None;
         self.next_attempt = now + self.delay;
-        self.delay = (self.delay * 2).min(Duration::from_secs(30));
+        if self.ever_connected {
+            self.delay = (self.delay * 2).min(BOOTSTRAP_RETRY_MAX_DELAY);
+        }
     }
 }
 
@@ -459,7 +478,7 @@ impl NetworkManager {
             if peer.connected == Some(peer_id) {
                 peer.connected = None;
                 peer.attempt = None;
-                peer.delay = Duration::from_secs(1);
+                peer.delay = BOOTSTRAP_RETRY_DELAY;
                 peer.next_attempt = Instant::now() + peer.delay;
             }
         }
@@ -508,7 +527,8 @@ impl NetworkManager {
                     if peer.attempt == Some(connection_id) {
                         peer.attempt = None;
                         peer.connected = Some(peer_id);
-                        peer.delay = Duration::from_secs(1);
+                        peer.ever_connected = true;
+                        peer.delay = BOOTSTRAP_RETRY_DELAY;
                     }
                 }
                 debug!(%peer_id, peers = self.connected_peers.len(), "peer connected");
@@ -611,16 +631,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_transient_startup_failure_never_escalates_the_retry_ladder() {
+        // Regression for the CI flake on #97: escalating from the first refused
+        // dial put the next attempt `1 + 2 + 4 + 8 = 15 s` away while the peer
+        // was merely still starting, which is longer than the budget the
+        // gossip tests give a cluster to form. Recovery now stays at the
+        // initial cadence until the peer has answered once.
+        let address = "/ip4/127.0.0.1/tcp/30333".parse().unwrap();
+        let mut retry = BootstrapRetry::new(address);
+        let now = Instant::now();
+        for attempt in 0..8 {
+            retry.failed(now);
+            assert_eq!(
+                retry.next_attempt,
+                now + BOOTSTRAP_RETRY_DELAY,
+                "attempt {attempt} must keep the initial cadence"
+            );
+        }
+        assert_eq!(retry.delay, BOOTSTRAP_RETRY_DELAY);
+    }
+
+    #[test]
     fn retry_backoff_is_capped_and_final_disconnect_resets_it() {
         let address = "/ip4/127.0.0.1/tcp/30333".parse().unwrap();
         let mut retry = BootstrapRetry::new(address);
         let now = Instant::now();
         retry.failed(now);
-        assert_eq!(retry.next_attempt, now + Duration::from_secs(1));
+        assert_eq!(retry.next_attempt, now + BOOTSTRAP_RETRY_DELAY);
+        // Only a peer that has been reachable escalates: a refused dial against
+        // an endpoint that has never answered is retried at the initial cadence.
+        retry.ever_connected = true;
         for _ in 0..10 {
             retry.failed(now);
         }
-        assert_eq!(retry.delay, Duration::from_secs(30));
+        assert_eq!(retry.delay, BOOTSTRAP_RETRY_MAX_DELAY);
         let peer_id = PeerId::random();
         retry.connected = Some(peer_id);
         let (mut manager, _) =

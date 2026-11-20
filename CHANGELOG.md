@@ -114,6 +114,18 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Fixed
 
+- **Bootstrap retries no longer escalate a startup race into a stall (gossipsub
+  test flake).** `BootstrapRetry` doubled its delay from the first refused dial,
+  so a peer that was merely still binding its listener was next attempted after
+  `1 + 2 + 4 + 8 = 15` seconds, which is longer than a test cluster is given to
+  form. Escalation now starts only after the endpoint has answered once: a
+  refused dial against a peer that has never connected keeps the 1 second
+  cadence, and a peer that was reachable and then dropped still backs off to the
+  30 second cap, so a dead endpoint is not dialled every second forever. The
+  timeouts in the gossip tests are unchanged. Regression tests cover eight
+  consecutive startup failures at the initial cadence and the capped ladder
+  after a real connection.
+
 - **The legacy producer key loader no longer follows symlinks or trusts a
   separate stat (S9.6 Track A, ADR-011, Q-018 finding 2).** `read_producer_key`
   now reads through `subhost_keystore::read_bounded_owner_only`: `O_NOFOLLOW` on
