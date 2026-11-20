@@ -29,10 +29,13 @@ independently verified:
    verified**, not merely an interim mitigation. The option-C interim (tighter
    caps, fee-per-byte ranking) reduces but does not close the gap.
 2. **S9.6 encrypted bootstrap loader (Track A)**: public validators must start
-   from encrypted keystores, not plaintext `producer.key`. The keystore crate +
-   CLI are merged (#59); encrypted **node start-up** (`bootstrap_with_producer_key`)
-   is the pending Track A piece. A public validator holding a plaintext signing
-   key at rest is not acceptable.
+   from encrypted keystores, not plaintext `producer.key`. Encrypted node
+   start-up is available and is the recommended production path: the keystore
+   crate + CLI (#59), the hardened bootstrap API
+   (`bootstrap_with_producer_key`, #79) and the node credential flag
+   (`--producer-credential-file`, #85) are merged, with the security records
+   in #86. A public validator holding a plaintext signing key at rest is not
+   acceptable.
 
 Verification means: the fixed-suite proofs in §5 pass on the exact deployed
 revision, and the pricing change is confirmed by its own regressions (intrinsic
