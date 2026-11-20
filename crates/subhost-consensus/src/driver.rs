@@ -514,6 +514,26 @@ impl ConsensusDriver {
         self.prepared.clone()
     }
 
+    /// Distinct authenticated Prepare votes held for the open proposal.
+    pub fn prepare_count(&self) -> usize {
+        self.prepares.len()
+    }
+
+    /// Distinct authenticated Commit votes held for the open proposal.
+    pub fn commit_count(&self) -> usize {
+        self.commits.len()
+    }
+
+    /// Distinct authenticated view-change reports held (S8.1 span tallies).
+    pub fn view_change_count(&self) -> usize {
+        self.changes.len()
+    }
+
+    /// Votes needed for a quorum certificate (n − f).
+    pub fn quorum_threshold(&self) -> usize {
+        self.config.quorum_threshold
+    }
+
     fn leader_for(&self, view: u64) -> Address {
         self.leaders[((view - 1) % self.leaders.len() as u64) as usize]
     }

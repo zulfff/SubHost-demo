@@ -15,6 +15,9 @@
 
 mod certified_history;
 mod consensus_journal;
+#[cfg(test)]
+#[path = "consensus_span_tests.rs"]
+mod consensus_span_tests;
 mod fork_incident;
 #[cfg(test)]
 mod liveness_tests;
@@ -39,7 +42,7 @@ use subhost_consensus::{
         BlockProposal as DriverProposal, ConsensusDriver, FinalEvidence, HaltReason, PreparedBlock,
         TimeoutCertificate, ViewChange, Vote, VoteOutcome,
     },
-    ConsensusConfig, QuorumCertificate, ValidatorRegistry,
+    ConsensusConfig, ConsensusError, QuorumCertificate, ValidatorRegistry,
 };
 use subhost_core::{encode_canonical, Address, Block, BlockHeight, ChainId, GenesisConfig, Hash};
 use subhost_crypto::{BLSScheme, PrivateKey};
@@ -908,6 +911,27 @@ fn archive_commit(
     history.append(block.header.height, &encode_block(block), &encode_canonical(qc))
 }
 
+/// Bounded static classification of consensus-step failures for span fields
+/// (Q-035). Local participation/context problems are `context`; everything
+/// else is a protocol `rejected`. Raw error text never enters a span.
+fn consensus_error_kind(error: &ConsensusError) -> &'static str {
+    match error {
+        ConsensusError::NoProposal | ConsensusError::NotAValidator | ConsensusError::Halted(_) => {
+            "context"
+        }
+        _ => "rejected",
+    }
+}
+
+/// Terminal span outcome for a failed consensus step.
+fn consensus_outcome(error: &ConsensusError) -> &'static str {
+    if consensus_error_kind(error) == "context" {
+        "error"
+    } else {
+        "rejected"
+    }
+}
+
 /// Commit a certified candidate before advancing the live consensus driver.
 /// Valid votes stay in the live tally on I/O failure, so the ticker can retry.
 fn commit_ready(
@@ -918,8 +942,35 @@ fn commit_ready(
 ) -> Result<(), NodeError> {
     let Some(qc) = driver.pending_qc() else { return Ok(()) };
     let block = driver.open_proposal().expect("pending QC requires a proposal").block.clone();
+    // S8.1 (Q-035): one span per commit step, created only once a certificate
+    // is actually pending so an idle ticker emits nothing.
+    let span = tracing::info_span!(
+        "consensus_commit",
+        view = qc.view,
+        height = block.header.height,
+        block_hash = %block.hash(),
+        outcome = tracing::field::Empty,
+        error_kind = tracing::field::Empty,
+    );
     let mut candidate = driver.clone();
-    if !matches!(candidate.commit_open_proposal()?, VoteOutcome::Committed { .. }) {
+    let outcome = {
+        let _enter = span.enter();
+        let result = candidate.commit_open_proposal();
+        match &result {
+            Ok(VoteOutcome::Committed { .. }) => {
+                span.record("outcome", "ok");
+            }
+            Ok(_) => {
+                span.record("outcome", "pending");
+            }
+            Err(error) => {
+                span.record("outcome", consensus_outcome(error));
+                span.record("error_kind", consensus_error_kind(error));
+            }
+        }
+        result
+    };
+    if !matches!(outcome?, VoteOutcome::Committed { .. }) {
         return Ok(());
     }
     if let Some(journal) = journal {
@@ -959,7 +1010,30 @@ fn produce_once_inner(
         } {
             state.validate_proposal(&block)?;
             let mut candidate = driver.clone();
-            candidate.propose(block)?;
+            // S8.1 (Q-035): one span per propose step, not per vote.
+            let span = tracing::info_span!(
+                "consensus_propose",
+                view = candidate.view(),
+                height = block.header.height,
+                block_hash = %block.hash(),
+                outcome = tracing::field::Empty,
+                error_kind = tracing::field::Empty,
+            );
+            let proposed = {
+                let _enter = span.enter();
+                let result = candidate.propose(block);
+                match &result {
+                    Ok(_) => {
+                        span.record("outcome", "ok");
+                    }
+                    Err(error) => {
+                        span.record("outcome", consensus_outcome(error));
+                        span.record("error_kind", consensus_error_kind(error));
+                    }
+                }
+                result
+            };
+            proposed?;
             adopt_pending(driver, candidate, journal)?;
         }
     }
@@ -1112,7 +1186,30 @@ fn handle_consensus_message_inner(
             }
             let mut candidate = driver.clone();
             let view = proposal.view;
-            let vote = candidate.observe_proposal(proposal)?;
+            // S8.1 (Q-035): prepare-step span carries the tally, never one
+            // span per vote. No error_kind field on prepare spans.
+            let span = tracing::info_span!(
+                "consensus_prepare",
+                view = view,
+                block_hash = %proposal.block.hash(),
+                votes_have = tracing::field::Empty,
+                votes_need = candidate.quorum_threshold() as u64,
+                outcome = tracing::field::Empty,
+            );
+            let vote = {
+                let _enter = span.enter();
+                let result = candidate.observe_proposal(proposal);
+                span.record("votes_have", candidate.prepare_count() as u64);
+                match &result {
+                    Ok(_) => {
+                        span.record("outcome", "ok");
+                    }
+                    Err(error) => {
+                        span.record("outcome", consensus_outcome(error));
+                    }
+                }
+                result
+            }?;
             adopt_pending(driver, candidate, commit.journal)?;
             // Authenticated and adopted: start the proposal-to-commit clock.
             if let Some(runtime) = commit.runtime {
@@ -1136,7 +1233,29 @@ fn handle_consensus_message_inner(
             }
             validate_pending_block(state, driver, &prepared.block)?;
             let mut candidate = driver.clone();
-            let vote = candidate.receive_prepare(prepared)?;
+            // S8.1 (Q-035): receiving a prepared block is a prepare-phase step.
+            let span = tracing::info_span!(
+                "consensus_prepare",
+                view = candidate.view(),
+                block_hash = %prepared.block.hash(),
+                votes_have = tracing::field::Empty,
+                votes_need = candidate.quorum_threshold() as u64,
+                outcome = tracing::field::Empty,
+            );
+            let vote = {
+                let _enter = span.enter();
+                let result = candidate.receive_prepare(prepared);
+                span.record("votes_have", candidate.prepare_count() as u64);
+                match &result {
+                    Ok(_) => {
+                        span.record("outcome", "ok");
+                    }
+                    Err(error) => {
+                        span.record("outcome", consensus_outcome(error));
+                    }
+                }
+                result
+            }?;
             adopt_pending(driver, candidate, commit.journal)?;
             commit_ready(state, driver, commit.journal, commit.history)?;
             Ok(vote)
@@ -1147,7 +1266,34 @@ fn handle_consensus_message_inner(
                 return Ok(None);
             }
             let mut candidate = driver.clone();
-            let fresh = candidate.record_view_change(change.clone())?;
+            // S8.1 (Q-035): has_prepared is the local lock held when the report
+            // arrives; reports_have is the authenticated tally after the step.
+            let span = tracing::info_span!(
+                "consensus_view_change",
+                view = driver.view(),
+                target_view = change.view,
+                reports_have = tracing::field::Empty,
+                reports_need = candidate.quorum_threshold() as u64,
+                has_prepared = candidate.prepared_certificate().is_some(),
+                outcome = tracing::field::Empty,
+            );
+            let fresh = {
+                let _enter = span.enter();
+                let result = candidate.record_view_change(change.clone());
+                span.record("reports_have", candidate.view_change_count() as u64);
+                match &result {
+                    Ok(true) => {
+                        span.record("outcome", "ok");
+                    }
+                    Ok(false) => {
+                        span.record("outcome", "rejected");
+                    }
+                    Err(error) => {
+                        span.record("outcome", consensus_outcome(error));
+                    }
+                }
+                result
+            }?;
             if fresh {
                 if let Some(prepared) = &change.prepared {
                     validate_pending_block(state, driver, &prepared.block)?;
@@ -1163,7 +1309,30 @@ fn handle_consensus_message_inner(
             }
             validate_timeout_blocks(state, driver, &certificate)?;
             let mut candidate = driver.clone();
-            candidate.receive_timeout_certificate(certificate)?;
+            // S8.1 (Q-035): TC adoption enters certificate.view (not +1); the
+            // report count is the certificate's authenticated message list.
+            let span = tracing::info_span!(
+                "consensus_view_change",
+                view = driver.view(),
+                target_view = certificate.view,
+                reports_have = certificate.messages.len() as u64,
+                reports_need = candidate.quorum_threshold() as u64,
+                has_prepared = candidate.prepared_certificate().is_some(),
+                outcome = tracing::field::Empty,
+            );
+            {
+                let _enter = span.enter();
+                let result = candidate.receive_timeout_certificate(certificate);
+                match &result {
+                    Ok(_) => {
+                        span.record("outcome", "ok");
+                    }
+                    Err(error) => {
+                        span.record("outcome", consensus_outcome(error));
+                    }
+                }
+                result
+            }?;
             adopt_pending(driver, candidate, commit.journal)?;
             Ok(None)
         }
@@ -1483,7 +1652,30 @@ fn apply_certified_item(
     commit: &mut CommitContext<'_>,
 ) -> Result<(), NodeError> {
     let mut candidate = driver.clone();
-    candidate.receive_commit(block.clone(), qc.clone())?;
+    // S8.1 (Q-035): the certified-history commit step gets the same span as
+    // the live commit path; the ledger write below emits its own commit_qc.
+    let span = tracing::info_span!(
+        "consensus_commit",
+        view = qc.view,
+        height = block.header.height,
+        block_hash = %block.hash(),
+        outcome = tracing::field::Empty,
+        error_kind = tracing::field::Empty,
+    );
+    {
+        let _enter = span.enter();
+        let result = candidate.receive_commit(block.clone(), qc.clone());
+        match &result {
+            Ok(_) => {
+                span.record("outcome", "ok");
+            }
+            Err(error) => {
+                span.record("outcome", consensus_outcome(error));
+                span.record("error_kind", consensus_error_kind(error));
+            }
+        }
+        result
+    }?;
     state.validate_certified_block(block, qc)?;
     if let Some(journal) = commit.journal {
         journal.prepare_commit(driver, block.clone(), qc.clone())?;
@@ -1754,7 +1946,22 @@ async fn produce_blocks(
                 candidate.wake_on_work(clock.elapsed())?;
             }
             had_pending = pending;
-            candidate.tick(clock.elapsed())?;
+            let view_before = candidate.view();
+            let ticked = candidate.tick(clock.elapsed())?;
+            if let Some(change) = &ticked {
+                // S8.1 (Q-035): a no-op tick emits nothing (volume discipline).
+                // A signed report is a post-hoc event marker: every field is
+                // known after the step, and the span closes immediately.
+                let _marker = tracing::info_span!(
+                    "consensus_view_change",
+                    view = view_before,
+                    target_view = change.view,
+                    reports_have = candidate.view_change_count() as u64,
+                    reports_need = candidate.quorum_threshold() as u64,
+                    has_prepared = candidate.prepared_certificate().is_some(),
+                    outcome = "ok",
+                );
+            }
             adopt_pending(&mut driver, candidate, journal.as_deref())?;
             let round =
                 produce_once_inner(&state, &mut driver, journal.as_deref(), history.as_deref())?;
@@ -2326,7 +2533,7 @@ pub enum NodeError {
     Genesis(#[from] subhost_core::CoreError),
 
     #[error(transparent)]
-    Consensus(#[from] subhost_consensus::ConsensusError),
+    Consensus(#[from] ConsensusError),
 
     #[error(transparent)]
     Storage(#[from] subhost_storage::StorageError),

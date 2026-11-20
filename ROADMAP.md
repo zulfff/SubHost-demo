@@ -1,6 +1,6 @@
 # Roadmap to a full release
 
-Status: 2026-11-22 · `main` = `b8aaecc` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S6.2 complete (#60/#65/#71, ADR-010); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038, yoga flag); S6.3 TTL/eviction pending · S8 slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74) merged; node hooks in review (#78, approved); block/consensus spans next (sari); peer count gated on network accessor · S9.1–S9.5 (#48) + S9.6 Track B (#59) merged; Track A bootstrap in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) · S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep (#77) merged; R-57-01 fixed (#67/#73); activation gated on Q-037 calldata ladder (L0–L5 agreed, in progress) + S9.6 completion; 30-day soak time-gated · `Q-001`–`Q-038` agreed except Q-012/Q-037 (open, in progress)
+Status: 2026-11-22 · `main` = `b8aaecc` · S0, S1 (through S1.4), S2, S3, S4 (through S4.5) and S5 merged · S6.2 complete (#60/#65/#71, ADR-010); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038, yoga flag); S6.3 TTL/eviction pending · S8 slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74), node hooks (#78) merged; block/consensus spans in review (sari, Q-035); peer count gated on network accessor · S9.1–S9.5 (#48) + S9.6 Track B (#59) merged; Track A bootstrap in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) · S12.1 (#58/#63), S12.4 (#64), audit package (#72), activation prep (#77) merged; R-57-01 fixed (#67/#73); activation gated on Q-037 calldata ladder (L0–L5 agreed, in progress) + S9.6 completion; 30-day soak time-gated · `Q-001`–`Q-038` agreed except Q-012/Q-037 (open, in progress)
 This document is the work plan for turning the current pre-production workspace into
 a releasable network. It is written so two agents can work at the same time without
 editing the same files.
@@ -130,7 +130,7 @@ agent always sees the real state.
 | S5 | RPC auth, TLS posture, rate limits, method gaps | B | S0 | M | Merged: S5.1a auth/bind policy, S5.2 methods (#54), S5.3a middleware + S5.3b node wiring. TLS = documented reverse-proxy mode; rate limit per connection |
 | S6 | Durable mempool and fee market | B | S0 | M | S6.1a merged (#44); S6.1b hooks (#75) + wiring (#80) merged, consumer opt-in in progress (raka Q-038 + yoga flag); S6.2 steps 1-3 merged (#60/#65/#71); S6.3 counters merged (#51), TTL/eviction pending; Q-036 retention slice in progress (dewi); Q-037 calldata ladder L2 in review (bima, ADR-015), L3 next (dewi), L4 after L3 (bima) |
 | S7 | Network hardening: tx gossip, scoring, peer limits | A | S3 | M | Planned |
-| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74) merged; node runtime hooks in review (#78, approved); block/consensus spans next (sari); peer count gated on network accessor (raka) |
+| S8 | Observability, health, runbooks | B | S0 | M | Slice 1 (#47), mempool events (#51), runbooks + alerts (#66), RPC spans (#69), accessors (#70), OTLP exporter (#74), node runtime hooks (#78) merged; block/consensus spans in review (sari, Q-035); peer count gated on network accessor (raka) |
 | S9 | Release engineering | B | S5 | M | S9.1–S9.5 merged (#48); S9.6 keystore Track B merged (#59); Track A bootstrap API + hardened legacy loader in review (#79, approved + security-approved); CLI node credential flag next (yoga, activation gate) |
 | S10 | Execution layer (EVM or WASM) | C | S3 | XL | Planned |
 | S11 | IBC production light client + relayer | C | — | L | Planned |
@@ -580,10 +580,11 @@ looking traffic.
 | Task | Status |
 | --- | --- |
 | S8.2/S8.3 Platform API | Merged (PR #47, ADR-013, Q-020) |
-| S8.2/S8.3 node runtime hooks | In review (Q-032): truthful health predicates (`ledger_loaded` after recovery, `pipeline_alive` task liveness, `syncing` = catch-up, halt clears readiness), finalized height + QC latency at the verified commit path, periodic disk stats/snapshot age under the commit lock. Peer count still pending a network handle accessor (see `docs/operations/alerts.md`) |
+| S8.2/S8.3 node runtime hooks | Merged (#78, Q-032): truthful health predicates (`ledger_loaded` after recovery, `pipeline_alive` task liveness, `syncing` = catch-up, halt clears readiness), finalized height + QC latency at the verified commit path, periodic disk stats/snapshot age under the commit lock. Peer count still pending a network handle accessor (see `docs/operations/alerts.md`) |
 | S8.2 mempool event wiring | Merged (#51, Q-026): committed-only buffered events; `expired` awaits the S6.3 TTL path |
 | S8.1 RPC spans | Landed (Q-033, #69): per-call spans in the RPC metrics middleware, privacy-boundary tested |
-| S8.1 OTLP export | Provider published (tania, Q-035, `subhost-telemetry` `otlp` feature); binary wiring + Track A block/consensus spans pending |
+| S8.1 block/consensus spans | In review (sari, Q-035): one span per driver step (`seal_block`/`accept_block`/`commit_qc`, `consensus_propose`/`prepare`/`commit`/`view_change`), bounded fields + structural `error_kind`, per-step volume and privacy-boundary tested; driver tally accessors added |
+| S8.1 OTLP export | Provider published (tania, Q-035, #74, `subhost-telemetry` `otlp` feature); binary wiring pending |
 | S8.4 Runbooks | Complete: start/stop, key rotation, ledger repair, incident investigation + checklist (this PR); backup/restore, upgrade, certified-sync, mempool-persistence already present |
 | S8.5 Alerts | Canonical sample rules in `docs/operations/alerts.md` (height stall, no-quorum proxy, disk growth + live/gated metric table); `observability.md` keeps a summary |
 

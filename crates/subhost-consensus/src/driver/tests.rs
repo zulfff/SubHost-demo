@@ -1334,3 +1334,38 @@ fn timeout_certificate_support_bounds_hold_at_sixty_four_validators() {
     };
     one.validate_timeout_certificate(&single).unwrap();
 }
+
+#[test]
+fn tally_accessors_report_distinct_authenticated_votes() {
+    let (_, _, mut drivers) = setup(4);
+    assert_eq!(drivers[0].quorum_threshold(), 3);
+    assert_eq!(drivers[0].prepare_count(), 0);
+    assert_eq!(drivers[0].commit_count(), 0);
+    assert_eq!(drivers[0].view_change_count(), 0);
+
+    let (proposal, _) = drivers[0].propose(block(1, Hash::ZERO, 1)).unwrap();
+    let votes: Vec<_> =
+        (0..3).map(|i| drivers[i].observe_proposal(proposal.clone()).unwrap().unwrap()).collect();
+    // Only the own prepare vote is held before peers report theirs.
+    assert_eq!(drivers[0].prepare_count(), 1);
+    for vote in votes.iter().skip(1) {
+        drivers[0].record_vote(vote.clone()).unwrap();
+    }
+    assert_eq!(drivers[0].prepare_count(), 3);
+    // Prepare quorum produces the own commit vote, counted immediately.
+    assert_eq!(drivers[0].commit_count(), 1);
+    // An exact replay never consumes a second signer slot.
+    drivers[0].record_vote(votes[1].clone()).unwrap();
+    assert_eq!(drivers[0].prepare_count(), 3);
+
+    let changes = timeout(&mut drivers, &[1, 2, 3]);
+    for change in &changes {
+        drivers[0].record_view_change(change.clone()).unwrap();
+    }
+    // Three peer reports plus our own: joining the target view signs and
+    // retains an own report, which counts toward the tally like any other.
+    assert_eq!(drivers[0].view_change_count(), 4);
+    // Replaying a report does not inflate the tally.
+    drivers[0].record_view_change(changes[0].clone()).unwrap();
+    assert_eq!(drivers[0].view_change_count(), 4);
+}
