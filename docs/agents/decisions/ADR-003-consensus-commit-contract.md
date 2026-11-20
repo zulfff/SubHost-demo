@@ -34,11 +34,11 @@ See `docs/consensus.md` for the remaining limits.
 
 ## Evidence
 
-- https://arxiv.org/pdf/1803.05069 — §§3–4 specify `n = 3f + 1` and certificates
+- https://arxiv.org/pdf/1803.05069: §§3–4 specify `n = 3f + 1` and certificates
   from `n - f` replicas (verified 2026-11-18).
-- `crates/subhost-consensus/src/lib.rs`, `ConsensusConfig::new` — derives quorum
+- `crates/subhost-consensus/src/lib.rs`, `ConsensusConfig::new`: derives quorum
   from the genesis registry count.
-- `crates/subhost-rpc/src/block.rs`, `commit_qc` — verifies before persistence.
+- `crates/subhost-rpc/src/block.rs`, `commit_qc`: verifies before persistence.
 - Q-007 question and Track B reply are workspace-local and gitignored, per the
   inter-agent protocol. Track B agrees with pending receipts and requires the
   additive state API in its own contract commit.

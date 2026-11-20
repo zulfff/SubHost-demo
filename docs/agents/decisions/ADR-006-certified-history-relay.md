@@ -56,10 +56,10 @@ prepared separately and requires its own tested Protocol revision and rollout.
 
 ## Evidence
 
-- https://github.com/cometbft/cometbft/blob/main/blocksync/reactor.go — verifies
+- https://github.com/cometbft/cometbft/blob/main/blocksync/reactor.go: verifies
   historical validator commits before execution/persistence (verified 2026-11-18).
-- ADR-003/ADR-005 — certified commit and durable node voting contracts.
-- Q-012 replies — both tracks require full block/QC validation and a fresh
+- ADR-003/ADR-005: certified commit and durable node voting contracts.
+- Q-012 replies: both tracks require full block/QC validation and a fresh
   history; S2 revision `cfa9553` has verified quorum/recovery/reconnect support.
-- `crates/subhost-cli/examples/sync_relay/history.rs` — full validated archive,
+- `crates/subhost-cli/examples/sync_relay/history.rs`: full validated archive,
   atomic persistence and limits; failure tests and real 100-block P2P backfill.

@@ -67,7 +67,7 @@ rollback of finalized history (native S3, ADR-007).
 
 ## References
 
-- https://www.rfc-editor.org/rfc/rfc9380 — G2 suite and Appendix J.10.1 vectors, verified 2026-11-18.
-- https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-bls-signature — POP signature/proof domains, verified 2026-11-18.
-- https://pmg.csail.mit.edu/papers/osdi99.pdf — prepare/commit locks and view-change proofs.
-- https://github.com/cometbft/cometbft/blob/main/spec/consensus/consensus.md — authenticated locks and round progress, verified 2026-11-18.
+- https://www.rfc-editor.org/rfc/rfc9380: G2 suite and Appendix J.10.1 vectors, verified 2026-11-18.
+- https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-bls-signature: POP signature/proof domains, verified 2026-11-18.
+- https://pmg.csail.mit.edu/papers/osdi99.pdf: prepare/commit locks and view-change proofs.
+- https://github.com/cometbft/cometbft/blob/main/spec/consensus/consensus.md: authenticated locks and round progress, verified 2026-11-18.

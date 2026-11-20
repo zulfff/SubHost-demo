@@ -86,5 +86,5 @@ subhost node --validator \
 Restarting never rolls finalized history back. The ledger is append-only; the
 node replays the retained suffix against the verified head and re-authenticates
 restored voting obligations. If the previous run halted on a fork incident, the
-restart stays halted until an operator resolves it — a restart is not a recovery
+restart stays halted until an operator resolves it: a restart is not a recovery
 path.

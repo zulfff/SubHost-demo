@@ -18,8 +18,8 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   (Q-037 L0, interim mitigation C).** `max_tx_data_bytes` defaults to 16 KiB
   instead of 128 KiB (the protocol upper bound stays 128 KiB; operators can
   restore the old default explicitly). Replace-by-fee and capacity/byte-budget
-  eviction now rank by gas price per encoded byte — a higher raw price spread
-  over far more bytes no longer wins a slot or survives eviction — with the
+  eviction now rank by gas price per encoded byte: a higher raw price spread
+  over far more bytes no longer wins a slot or survives eviction, with the
   tie-break unchanged (highest nonce, then hash). Proposal ordering stays
   gas-price-first. Block selection gains a per-block calldata byte budget,
   default 256 KiB, settable via `RpcState::with_proposal_calldata_bytes_limit`;
@@ -331,12 +331,12 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   counter with exactly the three bounded labels `pruned`, `nothing_to_prune`,
   `refused_by_snapshot` (from a typed `LedgerPruneOutcome` in `subhost-metrics`;
   no height labels, errors are not an outcome), and `subhost_ledger_base_height`
-  gauge — both registered at 0. Recording is wired into `RpcState::retain_from`:
+  gauge, both registered at 0. Recording is wired into `RpcState::retain_from`:
   every outcome counts, only a real `Pruned` moves the base gauge, and attaching
   the registry seeds the gauge from the restored base so an already-trimmed
   ledger publishes its real base before the first prune. 0 on the gauge is a
   real value (full history retained), not unavailable. A snapshot refusal is a
-  normal no-op, not a fault — no refusal alert; `subhost_ledger_active_bytes`
+  normal no-op, not a fault: no refusal alert; `subhost_ledger_active_bytes`
   stays the operator growth signal. Without a registry the recording is a silent
   no-op and a prune never fails because of metrics. Tests cover zero
   registration, label boundedness, per-label increments, the refusal and error
@@ -358,7 +358,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   bound into the consensus context: legacy six-element and fee-only
   seven-element tuples stay byte-identical; priced chains append the
   Option-encoded fee policy and the schedule. Version-3 headers keep the
-  version-2 13-field layout — the version word alone names the validity rule
+  version-2 13-field layout: the version word alone names the validity rule
   and is inside every signature/QC commitment. The codec accepts {1, 2, 3} in
   binary and JSON and refuses unknown versions on both serialize and
   deserialize; a fee-era JSON document without `base_fee_per_gas` is refused,
@@ -396,7 +396,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   the `subhost-telemetry` `otlp` feature and wires the merged provider (#74):
   a global `--otlp-endpoint <URL>` flag (env `SUBHOST_OTLP_ENDPOINT`) opts in to
   OTLP HTTP/protobuf span export on any subcommand. Export stays off until an
-  endpoint is configured — default behaviour and log output are unchanged and no
+  endpoint is configured: default behaviour and log output are unchanged and no
   exporter is constructed. Telemetry init moves inside the tokio runtime (the
   batch processor needs a runtime context); the shutdown guard is retained for
   the process lifetime and flushes on exit. Construction/install failure warns
@@ -426,7 +426,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `scripts/testnet/prepare-public-genesis.sh`: generates the four distinct
   encrypted producer keystores (`subhost producer create`) plus owner-only
   credential files and a public-key manifest for a fresh chain-31338 genesis.
-  Prep-only — no deployment, no route changes, and no activation-ready genesis:
+  Prep-only: no deployment, no route changes, and no activation-ready genesis:
   it stops at the key material and prints the gated assembly steps (PoP
   regeneration, fee policy and calldata schedule binding) that wait on the
   fee/calldata CLI flags, Q-037 L4 and the S9.6 bootstrap (#79). Refuses a
@@ -437,7 +437,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 - **`subhost node --mempool-persist` CLI opt-in (S6.1b consumer, Q-016/Q-038).**
   Stacks on the `NodeConfig.mempool_persist` field (#84): plain bool flag,
   default off, no env var, passed straight into the node config. Durability is
-  an explicit operator choice — unset keeps the pool volatile and
+  an explicit operator choice: unset keeps the pool volatile and
   `mempool.bin` is never read or written. Boot policy A: a corrupt or foreign
   snapshot refuses boot; the runbook names the recovery path (move the
   snapshot aside + restart, an explicit operator choice, never auto-delete).
@@ -467,13 +467,13 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   distinct keys, regenerated RFC 9380 PoP, no legacy fallback), deployment
   revision pinning, redundant certified-history archives + private RPC tokens,
   the running-proofs plan mapped to the fixed-suite tests, the 503 re-enable
-  steps, and the S12.3 soak/abort rules. Prep-only — activation waits on the
+  steps, and the S12.3 soak/abort rules. Prep-only: activation waits on the
   gate; no keys or tokens are committed. Docs only.
 - **Encrypted node start-up: `subhost node --producer-credential-file`
   (S9.6 completion, ADR-011, activation-gate item).** With `--validator`, the
   flag unlocks `<data-dir>/producer.keystore.json` (or `--producer-key-file`)
   through `subhost-keystore`'s owner-only credential convention and boots via
-  `Node::bootstrap_with_producer_key` (#79) — same membership/PoP checks, the
+  `Node::bootstrap_with_producer_key` (#79): same membership/PoP checks, the
   configured key file never read when a key is supplied. Fail-closed before
   any validator activity: missing keystore, wrong or group-readable
   credential, and non-keystore files all refuse start-up; no plaintext
@@ -508,8 +508,8 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   layer, backed by a batch span processor and an OTLP HTTP/protobuf exporter
   with an explicit endpoint (default `http://localhost:4318/v1/traces`, env
   overrides honoured) and per-export timeout, and returns a retained shutdown
-  guard that flushes on drop. Once installed, any ordinary `tracing` span —
-  Track A block/consensus spans and Track B RPC spans — exports with no
+  guard that flushes on drop. Once installed, any ordinary `tracing` span,
+  Track A block/consensus spans and Track B RPC spans, exports with no
   per-crate export API; per-layer `EnvFilter`s govern what is exported, and only
   bounded operational fields enter spans (never secrets). Must be called within
   a tokio runtime; exporter startup failure is reported, never fatal. New
@@ -580,7 +580,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   added: visibility belongs to the installed subscriber (no-op without one;
   the default fmt layer logs no span events), and the opt-in OTLP export
   remains a separate slice. Spans ride `with_metrics`, so a library consumer
-  without a metrics registry gets none — documented in
+  without a metrics registry gets none, documented in
   `docs/operations/observability.md`. Zero `methods.rs` edits per the Q-033
   coordination; `tracing-subscriber` gains the additive `registry` feature for
   the target-filtered test capture.
@@ -611,7 +611,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `docs/operations/alerts.md` as the canonical sample Prometheus rules (height
   stall, a no-quorum finality-stall proxy, disk growth, finality lag, QC latency,
   RPC errors, not-ready) with a table of which metrics are live versus still
-  gated on node call-sites; `observability.md` now points to it. Docs only — no
+  gated on node call-sites; `observability.md` now points to it. Docs only: no
   code, metric or API change. Rotation is documented as genesis-bound (no online
   validator-set change protocol), and ledger recovery as restore-from-backup
   (append-only, no in-place rewrite of finalized history).
@@ -648,7 +648,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   keystore, 4 KiB password); non-Unix platforms fail explicitly. Writes publish
   a `0600` sibling tempfile with no-clobber hard-link semantics, file and
   directory sync, and an authenticated decrypt read-back. New CLI:
-  `subhost producer create/inspect/unlock/migrate` — passwords come from twice
+  `subhost producer create/inspect/unlock/migrate`: passwords come from twice
   non-echo prompts or an owner-only credential file (one trailing LF/CRLF
   stripped, embedded CR/LF/NUL refused), never a password argument.
   `subhost init --producer-credential-file` unlocks an existing keystore and
@@ -663,7 +663,7 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 - **S8 observability contract accessors (ADR-013, Q-032).** Additive, read-only:
   `RpcState::finalized_height()` reports the newest height committed with a
-  verified final Commit QC — the atomic is set only inside `commit_qc` and
+  verified final Commit QC: the atomic is set only inside `commit_qc` and
   `restore_committed_qc`, never from a peer announcement or a demo single-writer
   commit (a demo chain publishes 0 by design). `RpcState::ledger_disk_stats()`
   measures `LedgerStore::disk_stats()` under the existing commit lock, so it
@@ -713,9 +713,9 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   `Transaction::fee_breakdown` and the pure `settle_block_fees`;
   `State::credit_block_priority` settles a producer tip once with overflow
   checked before mutation and no account for a zero reward or validatorless
-  mode. `BlockHeader` gains `base_fee_per_gas` behind a custom codec — binary
+  mode. `BlockHeader` gains `base_fee_per_gas` behind a custom codec: binary
   12-element tuple for version 1, 13 for version 2, JSON named fields with the
-  fee as a decimal string — and `GenesisConfig` gains an optional `fee_policy`
+  fee as a decimal string, and `GenesisConfig` gains an optional `fee_policy`
   that binds into the consensus context only when present. **Nothing enables a
   policy in this step**: no node/RPC wiring, so chains still produce version-1
   blocks with byte-identical headers, genesis bindings and burn rules. Ledger
@@ -1090,6 +1090,22 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
   end-to-end HTTP round trips against a live server.
 
 ### Changed
+
+- **Records refresh and one-time R-02 punctuation sweep (docs only).**
+  `security-audit/` queue and audit package refreshed to the merge wave at
+  `1e45462`: Q-037 L0/L1/L2 merged (#95/#80/#94, ADR-015), L3 in flight, L4
+  staged; R-L2-01/02/03, R-88-01, R-84-01, R-96-01 closed; SUBHOST-2026-003
+  stays open until L4 is merged and verified plus the joint pricing and
+  amplification re-probe. ROADMAP status, stage rows and S6/S8/S12 details
+  refreshed from the tech-lead-approved draft. The sccache S3 cache re-enable
+  is recorded with both evidence samples stated honestly: the #92 gate run
+  670/0 with zero warnings (the clean cache-path sample) and the #88
+  supplementary run 734/0 (valid results, 12 server-restart fallback
+  warnings). One-time em-dash sweep per R-02 across CHANGELOG, ROADMAP,
+  `docs/operations/` and the ADR living docs: punctuation-only replacements
+  (commas, colons, plain hyphens), decision content unchanged; dated
+  security-audit reviews and evidence files stay untouched as historical
+  snapshots. AGENTS.md gains the R-02 prose rule in section 5.
 
 - The CLI constructs nodes through `NodeConfig::new` and overrides the selected
   options, retaining node-owned defaults when additive policy/timeout settings

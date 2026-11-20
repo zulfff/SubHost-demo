@@ -25,11 +25,11 @@ not a reorg.
 ## Investigate
 
 1. Confirm the symptom: `/health/ready` is 503, the driver is halted, and the log
-   names a fork incident (not a load error — that is
+   names a fork incident (not a load error, that is
    [ledger-repair.md](ledger-repair.md)).
 2. Read the incident fields from the log: the height, the local finalized hash
    and the incoming certified hash, and both views. The incoming certificate is
-   authenticated (quorum signatures, genesis context) — junk evidence is rejected
+   authenticated (quorum signatures, genesis context): junk evidence is rejected
    before it can halt, so a halt means a real quorum signed a contradiction.
 3. Determine which history is canonical. Compare the local and incoming hashes
    at that height against the rest of the network's finalized history. The

@@ -15,20 +15,20 @@ The metrics exporter (`subhost_metrics::Metrics::router`, default
 
 | Route | Meaning |
 | --- | --- |
-| `GET /health` (legacy) | 200 `ok` — the exporter process answers. |
-| `GET /health/live` | 200 `ok` — same liveness attestation, explicit name. |
+| `GET /health` (legacy) | 200 `ok`: the exporter process answers. |
+| `GET /health/live` | 200 `ok`: same liveness attestation, explicit name. |
 | `GET /health/ready` | 200 `ready` only when the node-published snapshot satisfies `ledger_loaded && !syncing && consensus_alive`; otherwise 503 `not ready`. |
 
 `Metrics::set_health(HealthStatus { ledger_loaded, syncing, consensus_alive })`
 publishes one coherent snapshot; the default is **not ready**. The predicates
 (agreed in Q-020):
 
-- `ledger_loaded` — genesis, ledger, validator registry and the newest
+- `ledger_loaded`: genesis, ledger, validator registry and the newest
   journal/archive recovery have all reconciled successfully.
-- `syncing` — a native catch-up range is active or waiting to complete.
+- `syncing`: a native catch-up range is active or waiting to complete.
   Ordinary peer absence is not syncing. A fatal sync/archive safety incident
   clears readiness rather than pretending sync completed.
-- `consensus_alive` — the configured block pipeline task started and has not
+- `consensus_alive`: the configured block pipeline task started and has not
   exited or reported a fatal error. For a signing validator this is the
   reconciled driver/journal service loop; for an observer the non-signing
   consensus ingress/verification loop; for the explicit single-writer demo the
@@ -50,8 +50,8 @@ All names live in the one `Metrics` registry (ADR-004); cloning shares it.
 | `subhost_ledger_snapshot_modified_seconds` | gauge | Same measurement; Unix seconds. **0 means unavailable**, not a real epoch time. |
 | `subhost_reorg_total` | counter | Registered at 0 with no increment API: reorgs are unsupported until a reviewed reorg protocol ships. Safety incidents are not reorgs. |
 | `subhost_mempool_transactions_total{event}` | counter | Pool lifecycle: `admitted`, `replaced`, `evicted`, `expired` (S6.3). Labels come from `MempoolEvent` only. Counts pool-committed admissions only; see below. |
-| `subhost_mempool_pending_cleanup_failures_total` | counter | Failed best-effort `mempool.bin` writes after an already durable block commit (S6.1b). Registered at 0 and **will increment** once the consumer wiring lands — unlike `subhost_reorg_total`, whose 0 is permanent. Not a pool lifecycle event, so it is deliberately separate from `transactions_total{event}`. Any increase means the pending file is stale while the chain is fine: ticket, not page. |
-| `subhost_ledger_prune_total{outcome}` | counter | Ledger retention attempts (Q-036), recorded by `RpcState::retain_from`. Labels come from `LedgerPruneOutcome` only: `pruned`, `nothing_to_prune`, `refused_by_snapshot` — no height labels, and errors are not an outcome. Registered at 0 with all three series; increments once a retention caller drives `retain_from`. A `refused_by_snapshot` no-op is a **normal** outcome (the newest snapshot is the hard floor), not a fault — do not alert on refusals alone; `subhost_ledger_active_bytes` is the operator growth signal. |
+| `subhost_mempool_pending_cleanup_failures_total` | counter | Failed best-effort `mempool.bin` writes after an already durable block commit (S6.1b). Registered at 0 and **will increment** once the consumer wiring lands, unlike `subhost_reorg_total`, whose 0 is permanent. Not a pool lifecycle event, so it is deliberately separate from `transactions_total{event}`. Any increase means the pending file is stale while the chain is fine: ticket, not page. |
+| `subhost_ledger_prune_total{outcome}` | counter | Ledger retention attempts (Q-036), recorded by `RpcState::retain_from`. Labels come from `LedgerPruneOutcome` only: `pruned`, `nothing_to_prune`, `refused_by_snapshot`: no height labels, and errors are not an outcome. Registered at 0 with all three series; increments once a retention caller drives `retain_from`. A `refused_by_snapshot` no-op is a **normal** outcome (the newest snapshot is the hard floor), not a fault: do not alert on refusals alone; `subhost_ledger_active_bytes` is the operator growth signal. |
 | `subhost_ledger_base_height` | gauge | Oldest retained block height (Q-036). Seeded from the current base when the registry is attached (a restored, already-trimmed ledger publishes its real base), then moved only by a `Pruned` outcome. **0 is a real value** meaning full history retained, not "unavailable". |
 
 Existing families (`subhost_rpc_*`, `subhost_connected_peers`,
@@ -61,7 +61,7 @@ Existing families (`subhost_rpc_*`, `subhost_connected_peers`,
 ### Ledger disk measurement
 
 `LedgerStore::disk_stats() -> LedgerDiskStats { active_file_bytes,
-snapshot_modified }` reads the validated manifest plus filesystem metadata —
+snapshot_modified }` reads the validated manifest plus filesystem metadata:
 no block replay, no checksum verification. It is an operational measurement,
 not block/QC authentication.
 
@@ -105,8 +105,8 @@ metrics (Q-033, contract Q-020):
 
 - Span name `rpc_call`, target `subhost_rpc` (tracing requires constant span
   names; the method travels in a field).
-- Fields: `rpc.method` — the registered static method name or `unknown`,
-  never the caller's raw string; `rpc.outcome` — `ok`/`error`;
+- Fields: `rpc.method`: the registered static method name or `unknown`,
+  never the caller's raw string; `rpc.outcome`: `ok`/`error`;
   `rpc.duration_ms`; and `rpc.error_code` on failure.
 - **Privacy boundary:** params, payloads, tokens, passwords and keys never
   enter a span. Tests assert caller-derived input appears in no span field.
@@ -119,13 +119,13 @@ not log span events, so default log output is unchanged. An env-filtered or
 OTLP subscriber (the opt-in S8.1 export slice) makes them visible.
 
 Caveat: spans exist only when a metrics registry is supplied via
-`RpcServer::with_metrics` — they ride that middleware. The node always
+`RpcServer::with_metrics`: they ride that middleware. The node always
 supplies one; a library consumer running without metrics gets no spans.
 
 ## OTLP export wiring (`subhost` CLI, S8.1 / Q-035)
 
 The `subhost` binary compiles the `subhost-telemetry` `otlp` feature in, but
-export stays **off until an endpoint is configured** — default behaviour and
+export stays **off until an endpoint is configured**, default behaviour and
 log output are unchanged, and no exporter is constructed.
 
 - Enable with the global flag `--otlp-endpoint <URL>` or the environment
@@ -138,7 +138,7 @@ log output are unchanged, and no exporter is constructed.
   runtime context). The shutdown guard is retained for the process lifetime;
   on exit it flushes pending spans.
 - Exporter construction or install failure is reported as a warning and falls
-  back to plain logging — never fatal to boot. An empty endpoint value behaves
+  back to plain logging, never fatal to boot. An empty endpoint value behaves
   exactly like unset.
 - What exports is governed by the same per-layer `EnvFilter` as the logs
   (`RUST_LOG`, else the verbosity directive): info spans such as `rpc_call`
@@ -202,8 +202,8 @@ absence of raw error text and transaction identity.
 
 ## Sample alert rules (S8.5)
 
-The canonical, expanded rule set — including a no-quorum finality-stall proxy
-and a table of which metrics are live versus still gated on node call-sites —
+The canonical, expanded rule set, including a no-quorum finality-stall proxy
+and a table of which metrics are live versus still gated on node call-sites,
 is in [alerts.md](alerts.md). The snippet below is the original quick summary;
 prefer `alerts.md` so the two do not drift.
 

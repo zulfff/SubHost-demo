@@ -3,7 +3,7 @@
 The ledger is append-only. There is no command that rewrites finalized history
 in place, and no reorg path: `subhost_reorg_total` stays registered at 0. A
 "repair" here means diagnosing why a node will not load and restoring a coherent
-state from backup — not performing surgery on committed blocks.
+state from backup, not performing surgery on committed blocks.
 
 ## Stop first
 
@@ -38,7 +38,7 @@ when diagnosing, so an exploratory command cannot damage the only good state.
 ## Recover
 
 - **Coherent backup available:** restore the whole data directory per
-  [backup-restore.md](backup-restore.md) — genesis, manifest, snapshots,
+  [backup-restore.md](backup-restore.md): genesis, manifest, snapshots,
   segments, journal and producer identity together. A restore must not run a
   second producer with the same identity alongside the original.
 - **No backup, damaged finalized data:** there is no supported in-place repair.
@@ -66,7 +66,7 @@ prune to "fix" a load failure, and never prune below the snapshot anchor.
 retention: once the trigger slice lands, the node prunes after a successful
 commit when `tip - base_height > N`, without an operator command. Unset = off
 (the default; today's offline-only behaviour). The flag is **accepted now but
-inert** until the node-side trigger lands — `subhost db prune` remains the only
+inert** until the node-side trigger lands: `subhost db prune` remains the only
 prune path until then.
 
 Semantics once active (agreed in Q-036):
@@ -80,7 +80,7 @@ Semantics once active (agreed in Q-036):
   is the operator signal that retention is not keeping up.
 - **Any `N >= 1` is allowed; below 4096 the node warns at boot.** Aggressive
   values make the node a degraded sync source: heights it no longer retains
-  are unavailable to peers (never an error — see
+  are unavailable to peers (never an error, see
   [certified-sync.md](certified-sync.md)), and historical certificates at
   pruned heights are unverifiable, not a fork. A small testnet genesis node may
   run lean; a public serving node should keep at least the certified-archive

@@ -75,7 +75,7 @@ not repository content: never stage them, even with `-f`. Only `README.md` and
 
 The whole loop happens in the working tree, in minutes, with plain edits: no branch,
 no commit, no PR, no review queue. A follow-up is another `## Follow-up <date>`
-section appended to the same reply file — the thread reads top to bottom like a chat.
+section appended to the same reply file: the thread reads top to bottom like a chat.
 
 A question with `blocks: none` does not stop anyone; it is a review request with a
 `review_by` stage. A question with `blocks: [S1.2]` stops whoever owns `S1.2`.
@@ -116,8 +116,8 @@ What the author thinks should happen, in one or two sentences.
 
 ## Evidence
 
-- `crates/.../lib.rs:123` — what the code does today.
-- https://docs.rs/... — what the upstream docs say (verified 2026-11-18).
+- `crates/.../lib.rs:123`: what the code does today.
+- https://docs.rs/...: what the upstream docs say (verified 2026-11-18).
 
 ## Decision rule
 

@@ -92,7 +92,7 @@ genesis-less demo chains with the same chain id are indistinguishable.
 A failed restore (corrupt, truncated, foreign, oversized, unauthenticated or
 partial snapshot) **refuses boot** rather than silently starting with an empty
 pool. The boot error names the snapshot path; RPC persistence errors keep no
-local detail. Recovery is an explicit operator action — the node never deletes
+local detail. Recovery is an explicit operator action: the node never deletes
 or repairs the snapshot itself:
 
 1. stop the node;
@@ -102,7 +102,7 @@ or repairs the snapshot itself:
 
 Moving the file aside is the recommended path; deleting it outright is also
 safe and equally an explicit operator choice. Either way the file holds signed
-**pending** transactions only — no committed ledger history, no votes or QCs,
+**pending** transactions only, no committed ledger history, no votes or QCs,
 no producer keys. The ledger, voting journal and archive are untouched. The
 only loss is accepted-but-unmined transactions, which clients can resubmit. An
 absent file is a normal empty start, not a failure.

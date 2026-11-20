@@ -2,7 +2,7 @@
 
 A short, ordered checklist for any node incident. Work top to bottom; stop the
 node before touching its data directory. Record everything in the incident log
-as you go — the public testnet soak (S12.3) requires a published incident log
+as you go: the public testnet soak (S12.3) requires a published incident log
 and no manual ledger repair.
 
 ## 1. Stabilize
@@ -53,5 +53,5 @@ and no manual ledger repair.
 - [ ] File a follow-up for the root cause (equivocation, fork, corruption,
       capacity) and link the preserved evidence.
 - [ ] If a metric or health predicate was unavailable during the incident, note
-      it — several runtime gauges are still pending Track A wiring
+      it: several runtime gauges are still pending Track A wiring
       ([observability.md](observability.md)).

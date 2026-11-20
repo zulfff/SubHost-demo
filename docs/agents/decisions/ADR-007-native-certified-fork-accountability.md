@@ -1,4 +1,4 @@
-# ADR-007 — Native certified candidate selection and finalized-fork accountability
+# ADR-007: Native certified candidate selection and finalized-fork accountability
 
 - **Status:** Accepted with S3.1/S3.2 implementation (Track A)
 - **Date:** 2026-11-19
@@ -98,7 +98,7 @@ the driver.
 - `docs/agents/questions/agreed/Q-013-native-certified-sync.md` resolution;
   `ROADMAP.md` S3 contract correction.
 
-## Amendment — S3.3 native certified history sync (Track A)
+## Amendment: S3.3 native certified history sync (Track A)
 
 *Status: implemented with S3.3/S3.4 (Track A).*
 
@@ -224,21 +224,21 @@ decision.
 
 ### Evidence for the amendment
 
-- `docs/agents/questions/agreed/Q-013-native-certified-sync.md` — bounded
+- `docs/agents/questions/agreed/Q-013-native-certified-sync.md`: bounded
   request/response, 4096 retention, serve only ledger-matching history.
-- `docs/agents/replies/Q-027-track-a.md` — consecutive `receive_commit` is the
+- `docs/agents/replies/Q-027-track-a.md`: consecutive `receive_commit` is the
   primitive; live per-item ordering on a driver clone; per-commit journal
   cadence; node-owned signing suppression.
-- https://github.com/cometbft/cometbft/blob/main/blocksync/reactor.go — a
+- https://github.com/cometbft/cometbft/blob/main/blocksync/reactor.go: a
   fetched commit is verified before execution/persistence (re-checked 2026-11-19).
-- `crates/subhost-node/src/basic_tests.rs` — a lagging validator backfills three
+- `crates/subhost-node/src/basic_tests.rs`: a lagging validator backfills three
   certified blocks and restarts at the synced tip; range request/serve bounds;
   conflicting evidence persists, halts and stays halted after restart; duplicate
   and forged evidence never halt; a buffered candidate applies after backfill and
   a forged far-ahead announcement creates no catch-up state; the stall budget
   releases signing.
 - `crates/subhost-node/src/certified_history.rs` and
-  `crates/subhost-node/src/fork_incident.rs` — reopen, torn tail, genesis/context
+  `crates/subhost-node/src/fork_incident.rs`: reopen, torn tail, genesis/context
   binding, retention, deduplication and bounded-ring tests.
 - Sari's review of PR #57: gap state may only come from an authenticated
   certificate and must have a bounded stall, which the classifier route and the

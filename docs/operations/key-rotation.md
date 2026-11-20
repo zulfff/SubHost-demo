@@ -14,10 +14,10 @@ create/inspect/unlock/migrate`) **are merged** (PR #59); see
 **node start-up** (Track A's `bootstrap_with_producer_key`, Q-018, sequenced
 after S6.2): until it lands, a running node uses the plaintext file, and the
 keystore is managed through the CLI. `subhost producer migrate` does **not**
-encrypt in place — it writes a **separate** `producer.keystore.json` and
+encrypt in place: it writes a **separate** `producer.keystore.json` and
 preserves the plaintext source on success and on every failure; removing the
 source is an explicit later operator action. When encrypted node start-up
-lands, the node will unlock the keystore with an owner-only credential file —
+lands, the node will unlock the keystore with an owner-only credential file,
 no implicit plaintext fallback.
 
 ## Protecting the identity
@@ -70,7 +70,7 @@ keep the plaintext `producer.key` for the running node.
 - Create a new encrypted identity: `subhost producer create`.
 - Unlock/verify: `subhost producer unlock` / `inspect`. Passwords come from
   non-echo prompts or an owner-only credential file; there is no password
-  argument. Losing the password loses the identity — there is no recovery.
+  argument. Losing the password loses the identity: there is no recovery.
 - Rotation semantics are unchanged: the keystore wraps the same genesis-bound
   identity; changing the validator key still requires a coordinated re-genesis.
 
