@@ -9,8 +9,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use prometheus::{
-    Counter, CounterVec, Encoder, Gauge, Histogram, HistogramOpts, HistogramVec, Opts, Registry,
-    TextEncoder,
+    Counter, CounterVec, Encoder, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, Opts,
+    Registry, TextEncoder,
 };
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -97,6 +97,58 @@ impl LedgerPruneOutcome {
     }
 }
 
+/// Bounded sender-depth buckets for the mempool pool-depth gauge (S6.3,
+/// Q-039). Labels come from this enum only, never from sender input; the four
+/// series are transaction-weighted and sum to the committed pool size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderDepthBucket {
+    /// Senders with exactly one pending transaction.
+    One,
+    /// Senders with 2 to 4 pending transactions.
+    TwoToFour,
+    /// Senders with 5 to 16 pending transactions.
+    FiveToSixteen,
+    /// Senders with 17 or more pending transactions.
+    SeventeenPlus,
+}
+
+impl SenderDepthBucket {
+    /// Every bucket, in label order, for registration and flush loops.
+    pub const ALL: [Self; 4] =
+        [Self::One, Self::TwoToFour, Self::FiveToSixteen, Self::SeventeenPlus];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::One => "1",
+            Self::TwoToFour => "2-4",
+            Self::FiveToSixteen => "5-16",
+            Self::SeventeenPlus => "17+",
+        }
+    }
+
+    /// Position in [`Self::ALL`], for indexing fixed-size flush accumulators.
+    pub fn index(self) -> usize {
+        match self {
+            Self::One => 0,
+            Self::TwoToFour => 1,
+            Self::FiveToSixteen => 2,
+            Self::SeventeenPlus => 3,
+        }
+    }
+
+    /// The bucket a sender with `depth` pending transactions falls into.
+    /// Depths are at least 1: the pool drops a sender's index entry when its
+    /// last nonce goes, so a zero-depth sender never reaches this call.
+    pub fn for_depth(depth: usize) -> Self {
+        match depth {
+            1 => Self::One,
+            2..=4 => Self::TwoToFour,
+            5..=16 => Self::FiveToSixteen,
+            _ => Self::SeventeenPlus,
+        }
+    }
+}
+
 /// The node's metric set.
 ///
 /// Cloning shares the same underlying registry, so any component can record into
@@ -116,6 +168,7 @@ pub struct Metrics {
     ledger_active_bytes: Gauge,
     ledger_snapshot_modified: Gauge,
     mempool_events: CounterVec,
+    mempool_sender_depth: GaugeVec,
     pending_cleanup_failures: Counter,
     ledger_prune: CounterVec,
     ledger_base_height: Gauge,
@@ -201,6 +254,17 @@ impl Metrics {
             mempool_events.with_label_values(&[event.label()]);
         }
 
+        let mempool_sender_depth = GaugeVec::new(
+            Opts::new(
+                "subhost_mempool_sender_depth",
+                "Pending transactions grouped by per-sender depth bucket (transaction-weighted: a sender with N pending contributes N to its bucket), not a sender count. Committed-only, updated on flush_events",
+            ),
+            &["bucket"],
+        )?;
+        for bucket in SenderDepthBucket::ALL {
+            mempool_sender_depth.with_label_values(&[bucket.label()]);
+        }
+
         // Registered at zero, and unlike `reorg_total` this one *will* increment:
         // S6.1b's best-effort pending-file cleanup counts its failures here once
         // the node wiring lands. A committed block never fails because of it.
@@ -245,6 +309,7 @@ impl Metrics {
         registry.register(Box::new(ledger_snapshot_modified.clone()))?;
         registry.register(Box::new(reorgs.clone()))?;
         registry.register(Box::new(mempool_events.clone()))?;
+        registry.register(Box::new(mempool_sender_depth.clone()))?;
         registry.register(Box::new(pending_cleanup_failures.clone()))?;
         registry.register(Box::new(ledger_prune.clone()))?;
         registry.register(Box::new(ledger_base_height.clone()))?;
@@ -263,6 +328,7 @@ impl Metrics {
             ledger_active_bytes,
             ledger_snapshot_modified,
             mempool_events,
+            mempool_sender_depth,
             pending_cleanup_failures,
             ledger_prune,
             ledger_base_height,
@@ -382,6 +448,13 @@ impl Metrics {
         self.ledger_base_height.set(height as f64);
     }
 
+    /// Set the pool-depth gauge for one sender-depth bucket (S6.3). Called
+    /// from the committed pool's flush, so the gauge carries the same
+    /// committed-only semantics as the lifecycle counters.
+    pub fn set_mempool_sender_depth(&self, bucket: SenderDepthBucket, transactions: u64) {
+        self.mempool_sender_depth.with_label_values(&[bucket.label()]).set(transactions as f64);
+    }
+
     /// Render the registry in the Prometheus text exposition format.
     pub fn encode(&self) -> Result<Vec<u8>, MetricsError> {
         let encoder = TextEncoder::new();
@@ -498,6 +571,7 @@ mod tests {
             "subhost_ledger_snapshot_modified_seconds",
             "subhost_reorg_total",
             "subhost_mempool_transactions_total",
+            "subhost_mempool_sender_depth",
             "subhost_mempool_pending_cleanup_failures_total",
             "subhost_ledger_prune_total",
             "subhost_ledger_base_height",
@@ -767,5 +841,35 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         String::from_utf8_lossy(&response).to_string()
+    }
+    #[test]
+    fn sender_depth_bucket_boundaries_are_exact() {
+        use SenderDepthBucket::*;
+        assert_eq!(SenderDepthBucket::for_depth(1), One);
+        assert_eq!(SenderDepthBucket::for_depth(2), TwoToFour);
+        assert_eq!(SenderDepthBucket::for_depth(4), TwoToFour);
+        assert_eq!(SenderDepthBucket::for_depth(5), FiveToSixteen);
+        assert_eq!(SenderDepthBucket::for_depth(16), FiveToSixteen);
+        assert_eq!(SenderDepthBucket::for_depth(17), SeventeenPlus);
+        assert_eq!(SenderDepthBucket::for_depth(usize::MAX), SeventeenPlus);
+        for (position, bucket) in SenderDepthBucket::ALL.iter().enumerate() {
+            assert_eq!(bucket.index(), position);
+        }
+    }
+
+    #[test]
+    fn sender_depth_gauge_registers_zero_and_overwrites() {
+        let metrics = Metrics::new().unwrap();
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        for label in ["1", "2-4", "5-16", "17+"] {
+            assert!(
+                rendered.contains(&format!("subhost_mempool_sender_depth{{bucket=\"{label}\"}} 0")),
+                "{label} missing at zero"
+            );
+        }
+        metrics.set_mempool_sender_depth(SenderDepthBucket::TwoToFour, 12);
+        metrics.set_mempool_sender_depth(SenderDepthBucket::TwoToFour, 3);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_sender_depth{bucket=\"2-4\"} 3"));
     }
 }

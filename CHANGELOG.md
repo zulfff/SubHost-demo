@@ -317,6 +317,20 @@ Full-repository audit and hardening pass. Verified with `cargo fmt --all
 
 ### Added
 
+- **Mempool TTL expiry and sender-depth gauge (S6.3, Q-039).** Pending
+  transactions now expire: `MempoolConfig.tx_ttl` (default 30 minutes, zero
+  refused) measured from admission, swept lazily by `Mempool::expire_before(now)`
+  on every admission path and available for a node timer. Each drop buffers the
+  `expired` lifecycle event that #51 registered at 0, with the same
+  committed-only flush semantics as the other counters. Restore resets the
+  clock: the Q-016 snapshot format is unchanged, so a restart never loses
+  accepted-but-unmined transactions, and parked entries expire one TTL after
+  the restart (operator-visible; restart docs state it). New
+  `subhost_mempool_sender_depth{bucket}` gauge with four bounded labels
+  (`1`, `2-4`, `5-16`, `17+`), transaction-weighted so the series sum to the
+  committed pool size, republished on every flush. No new alert: expiry is
+  normal hygiene like eviction.
+
 - **`subhost node --retention-blocks` configuration flag (Q-036 Q5, S12.3).**
   Stacks on the `NodeConfig.retention_blocks` field (#76): clap `u64` range
   `1..`, unset = off, no env var, passed straight into the node config. The

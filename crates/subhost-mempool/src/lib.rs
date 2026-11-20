@@ -5,8 +5,9 @@
 //! unbounded work in memory.
 
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 use subhost_core::{Address, Hash, Nonce, Transaction};
-use subhost_metrics::{MempoolEvent, Metrics};
+use subhost_metrics::{MempoolEvent, Metrics, SenderDepthBucket};
 use tracing::debug;
 
 mod persistence;
@@ -33,6 +34,11 @@ pub struct MempoolConfig {
     /// persistence on or off. Count and per-sender caps alone do not bound
     /// memory: `max_pending * max_tx_data_bytes` is over a GiB at the defaults.
     pub max_pending_bytes: usize,
+    /// How long a pending transaction may sit in the pool before the expiry
+    /// sweep drops it (S6.3, Q-039). Measured from admission into the live
+    /// pool; restore resets the clock because the snapshot stores transactions,
+    /// not timestamps. Must be non-zero.
+    pub tx_ttl: Duration,
 }
 
 impl Default for MempoolConfig {
@@ -45,6 +51,7 @@ impl Default for MempoolConfig {
             // Half the snapshot file cap, so a pool that fits the runtime budget
             // still fits `mempool.bin` with its framing overhead.
             max_pending_bytes: 32 * 1024 * 1024,
+            tx_ttl: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -63,6 +70,9 @@ impl MempoolConfig {
         }
         if self.max_pending_bytes == 0 {
             return Err(MempoolError::InvalidConfig("max_pending_bytes must be > 0".into()));
+        }
+        if self.tx_ttl.is_zero() {
+            return Err(MempoolError::InvalidConfig("tx_ttl must be > 0".into()));
         }
         Ok(())
     }
@@ -135,6 +145,9 @@ pub struct Mempool {
     /// Sum of the encoded sizes of the pending transactions, kept in step with
     /// `txs` so the byte budget never needs a full re-measure.
     pending_bytes: usize,
+    /// Admission instant per pending hash, the clock the expiry sweep reads
+    /// (S6.3). Kept in step with `txs` at every insert and removal site.
+    admitted_at: HashMap<Hash, Instant>,
 }
 
 impl Default for Mempool {
@@ -162,6 +175,7 @@ impl Mempool {
             by_sender: HashMap::new(),
             events: Vec::new(),
             pending_bytes: 0,
+            admitted_at: HashMap::new(),
         })
     }
 
@@ -202,6 +216,10 @@ impl Mempool {
         tx: Transaction,
         enforce_floor: bool,
     ) -> Result<Admission, MempoolError> {
+        // Expiry is hygiene independent of the admission outcome: dead entries
+        // go first so capacity and byte budgets never displace a live
+        // transaction to make room for them (S6.3, Q-039).
+        self.expire_before(Instant::now());
         if tx.data.len() > self.config.max_tx_data_bytes {
             return Err(MempoolError::DataTooLarge {
                 provided: tx.data.len(),
@@ -257,6 +275,7 @@ impl Mempool {
                 return Ok(Admission { hash: existing_hash, accepted: false, displaced: None });
             }
             displaced = self.txs.remove(&existing_hash);
+            self.admitted_at.remove(&existing_hash);
             if let Some(replaced) = &displaced {
                 self.pending_bytes = self.pending_bytes.saturating_sub(encoded_bytes(replaced));
                 self.events.push(MempoolEvent::Replaced);
@@ -299,11 +318,43 @@ impl Mempool {
 
         self.by_sender.entry(sender).or_default().insert(nonce, hash);
         self.txs.insert(hash, tx);
+        self.admitted_at.insert(hash, Instant::now());
         self.pending_bytes = self.pending_bytes.saturating_add(tx_bytes);
         self.events.push(MempoolEvent::Admitted);
         debug!(%sender, nonce, pool_size = self.txs.len(), "mempool admitted transaction");
 
         Ok(Admission { hash, accepted: true, displaced })
+    }
+
+    /// Drop every entry admitted at or before `now - tx_ttl`, buffering one
+    /// `Expired` event per drop (S6.3, Q-039). The clock is an argument so
+    /// callers — and tests — control time; the admission paths sweep with
+    /// `Instant::now()` so a full pool never evicts a live transaction to make
+    /// room for one that is already dead. Returns the number dropped. If `now`
+    /// predates one full TTL, nothing can be expired yet.
+    pub fn expire_before(&mut self, now: Instant) -> usize {
+        let Some(cutoff) = now.checked_sub(self.config.tx_ttl) else {
+            return 0;
+        };
+        let mut expired: Vec<Hash> = self
+            .admitted_at
+            .iter()
+            .filter(|(_, admitted)| **admitted <= cutoff)
+            .map(|(hash, _)| *hash)
+            .collect();
+        // Deterministic drop order, independent of hash-map iteration.
+        expired.sort();
+        let mut dropped = 0;
+        for hash in expired {
+            if self.remove(&hash) {
+                self.events.push(MempoolEvent::Expired);
+                dropped += 1;
+            }
+        }
+        if dropped > 0 {
+            debug!(dropped, pool_size = self.txs.len(), "mempool expired transactions");
+        }
+        dropped
     }
 
     /// Drain buffered lifecycle events into the registry.
@@ -316,6 +367,19 @@ impl Mempool {
     pub fn flush_events(&mut self, metrics: &Metrics) {
         for event in self.events.drain(..) {
             metrics.record_mempool_event(event);
+        }
+        // Pool depth per sender-depth bucket (S6.3, Q-039): the gauge value is
+        // the number of pending transactions whose sender sits in that bucket,
+        // so the four series sum to the pool size. Committed pool only, exactly
+        // like the counters above.
+        let mut depths = [0u64; SenderDepthBucket::ALL.len()];
+        for nonces in self.by_sender.values() {
+            let depth = nonces.len();
+            let bucket = SenderDepthBucket::for_depth(depth);
+            depths[bucket.index()] += depth as u64;
+        }
+        for (bucket, value) in SenderDepthBucket::ALL.iter().zip(depths) {
+            metrics.set_mempool_sender_depth(*bucket, value);
         }
     }
 
@@ -334,6 +398,7 @@ impl Mempool {
         let Some(tx) = self.txs.remove(tx_hash) else {
             return false;
         };
+        self.admitted_at.remove(tx_hash);
         self.pending_bytes = self.pending_bytes.saturating_sub(encoded_bytes(&tx));
         if let Some(nonces) = self.by_sender.get_mut(&tx.from) {
             nonces.remove(&tx.nonce);
@@ -1004,5 +1069,145 @@ mod tests {
         ));
         pool.admit_restored(sized(1, 0, 10, 16 * 1024)).unwrap();
         assert_eq!(pool.len(), 1);
+    }
+    // --- S6.3 (Q-039): TTL expiry and sender-depth gauge ---
+
+    #[test]
+    fn the_default_ttl_is_thirty_minutes_and_zero_is_refused() {
+        assert_eq!(MempoolConfig::default().tx_ttl, Duration::from_secs(30 * 60));
+        let zero = MempoolConfig { tx_ttl: Duration::ZERO, ..Default::default() };
+        assert!(matches!(Mempool::try_new(zero), Err(MempoolError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn expire_before_drops_only_entries_past_the_ttl() {
+        let mut pool = Mempool::default();
+        let ttl = pool.config().tx_ttl;
+        let before = Instant::now();
+        let hash = pool.add(tx(1, 0, 10)).unwrap();
+        let after = Instant::now();
+
+        // One nanosecond short of the TTL: nothing is expired yet.
+        assert_eq!(pool.expire_before(before + ttl - Duration::from_nanos(1)), 0);
+        assert!(pool.contains(&hash));
+
+        // A full TTL past the admission window: the entry goes, and every
+        // index and accounting view is cleaned with it.
+        assert_eq!(pool.expire_before(after + ttl), 1);
+        assert!(!pool.contains(&hash));
+        assert_eq!(pool.len(), 0);
+        assert_eq!(pool.sender_count(), 0);
+        assert_eq!(pool.pending_bytes(), 0);
+        // Idempotent: a second sweep drops nothing.
+        assert_eq!(pool.expire_before(after + ttl), 0);
+    }
+
+    #[test]
+    fn a_now_before_one_full_ttl_expires_nothing() {
+        let mut pool = Mempool::default();
+        pool.add(tx(1, 0, 10)).unwrap();
+        // checked_sub underflow path: the process just started.
+        assert_eq!(pool.expire_before(Instant::now()), 0);
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn expiry_buffers_events_that_only_a_committed_flush_counts() {
+        let metrics = Metrics::new().unwrap();
+        let mut pool = Mempool::default();
+        let ttl = pool.config().tx_ttl;
+        pool.add(tx(1, 0, 10)).unwrap();
+        pool.add(tx(2, 0, 10)).unwrap();
+        let now = Instant::now();
+        assert_eq!(pool.expire_before(now + ttl), 2);
+
+        // A dropped candidate takes its buffered events with it (Q-026).
+        let mut candidate = pool.clone();
+        candidate.drain_events();
+        candidate.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"expired\"} 0"));
+
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_transactions_total{event=\"expired\"} 2"));
+    }
+
+    #[test]
+    fn expiry_frees_capacity_before_eviction_touches_live_entries() {
+        let mut pool = Mempool::new(MempoolConfig { max_pending: 1, ..Default::default() });
+        let ttl = pool.config().tx_ttl;
+        let old = tx(1, 0, 10);
+        pool.add(old.clone()).unwrap();
+        assert_eq!(pool.expire_before(Instant::now() + ttl), 1);
+
+        // The slot is free: admitting a newcomer evicts nothing live.
+        let admission = pool.admit(tx(2, 0, 5)).unwrap();
+        assert!(admission.accepted);
+        assert!(admission.displaced.is_none());
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn replacement_removal_and_pruning_keep_the_expiry_clock_in_step() {
+        let mut pool = Mempool::default();
+        let ttl = pool.config().tx_ttl;
+        let original = tx(1, 0, 10);
+        pool.add(original.clone()).unwrap();
+        let replacement = tx(1, 0, 10_000);
+        pool.admit(replacement.clone()).unwrap();
+        pool.add(tx(1, 1, 10)).unwrap();
+        pool.add(tx(1, 2, 10)).unwrap();
+
+        // Prune the two lowest nonces, then expire: exactly the survivor goes,
+        // no ghost timestamps from the replaced or pruned entries.
+        assert_eq!(pool.prune_below_nonce(&original.from, 2), 2);
+        assert_eq!(pool.expire_before(Instant::now() + ttl), 1);
+        assert_eq!(pool.len(), 0);
+
+        // remove() also clears the clock.
+        pool.add(tx(2, 0, 10)).unwrap();
+        assert!(pool.remove(&tx(2, 0, 10).hash()));
+        assert_eq!(pool.expire_before(Instant::now() + ttl), 0);
+    }
+
+    #[test]
+    fn restore_resets_the_expiry_clock() {
+        let mut pool = Mempool::default();
+        let ttl = pool.config().tx_ttl;
+        pool.admit_restored(tx(1, 0, 10)).unwrap();
+        // A freshly restored entry is not already expired (Q-039 point 3).
+        assert_eq!(pool.expire_before(Instant::now()), 0);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool.expire_before(Instant::now() + ttl), 1);
+    }
+
+    #[test]
+    fn flush_publishes_sender_depth_buckets_that_sum_to_the_pool() {
+        // tania's boundary matrix: senders at exactly 1, 4, 5, 16 and 17.
+        let metrics = Metrics::new().unwrap();
+        let mut pool = Mempool::default();
+        for (sender, depth) in [(1u8, 1usize), (2, 4), (3, 5), (4, 16), (5, 17)] {
+            for nonce in 0..depth {
+                pool.add(tx(sender, nonce as u64, 10)).unwrap();
+            }
+        }
+        assert_eq!(pool.len(), 43);
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_sender_depth{bucket=\"1\"} 1"));
+        assert!(rendered.contains("subhost_mempool_sender_depth{bucket=\"2-4\"} 4"));
+        assert!(rendered.contains("subhost_mempool_sender_depth{bucket=\"5-16\"} 21"));
+        assert!(rendered.contains("subhost_mempool_sender_depth{bucket=\"17+\"} 17"));
+
+        // The gauge is set, not accumulated: a later flush after removals
+        // republishes the smaller depths, and the sum invariant holds. The
+        // 17-deep sender drops to depth 1 and moves buckets.
+        pool.prune_below_nonce(&Address::new([5u8; 20]), 16);
+        pool.flush_events(&metrics);
+        let rendered = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(rendered.contains("subhost_mempool_sender_depth{bucket=\"17+\"} 0"));
+        assert!(rendered.contains("subhost_mempool_sender_depth{bucket=\"1\"} 2"));
+        assert_eq!(pool.len(), 27);
     }
 }
