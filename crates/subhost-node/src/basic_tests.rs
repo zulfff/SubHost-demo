@@ -2,8 +2,9 @@ use super::*;
 use ed25519_dalek::{Signer, SigningKey};
 use subhost_consensus::driver::VotePhase;
 use subhost_core::{
-    Address, FeePolicy, Transaction, TransactionSignature, TransactionType, ValidatorInfo,
-    BLOCK_GAS_LIMIT, FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER, FEE_HEADER_VERSION,
+    Address, CalldataPolicy, FeePolicy, Transaction, TransactionSignature, TransactionType,
+    ValidatorInfo, BLOCK_GAS_LIMIT, CALLDATA_HEADER_VERSION, CALLDATA_POLICY_VERSION,
+    FEE_CHANGE_DENOMINATOR, FEE_ELASTICITY_MULTIPLIER, FEE_HEADER_VERSION,
 };
 use subhost_mempool::{Mempool, MempoolStore, MEMPOOL_FILE_NAME};
 
@@ -1357,6 +1358,164 @@ fn priced_transfer(key: &SigningKey, nonce: u64, value: u128, gas_price: u128) -
     tx.gas_price = gas_price;
     tx.signature = TransactionSignature::from_ed25519(&key.sign(&tx.signing_payload()).to_bytes());
     tx
+}
+
+/// The approved public-testnet calldata schedule (Q-037): 16 gas per byte.
+fn calldata_policy() -> CalldataPolicy {
+    CalldataPolicy { version: CALLDATA_POLICY_VERSION, gas_per_byte: 16 }
+}
+
+/// A transfer re-signed with calldata and an explicit gas limit, so it can be
+/// priced against, or fall below, the intrinsic floor.
+fn calldata_transfer(
+    key: &SigningKey,
+    nonce: u64,
+    value: u128,
+    data: Vec<u8>,
+    gas_limit: u64,
+) -> Transaction {
+    let mut tx = signed_transfer(key, nonce, value);
+    tx.data = data;
+    tx.gas_limit = gas_limit;
+    tx.signature = TransactionSignature::from_ed25519(&key.sign(&tx.signing_payload()).to_bytes());
+    tx
+}
+
+#[test]
+fn calldata_enabled_genesis_seals_v3_and_restores_under_the_same_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    let mut genesis = genesis_with(1, Some((sender, 1_000_000)));
+    genesis.calldata_policy = Some(calldata_policy());
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(node.state().block_height(), 0);
+    assert!(node.state().calldata_policy().is_some(), "the node binds the genesis schedule");
+    assert!(node.state().fee_policy().is_none(), "a calldata-only chain has no fee market");
+    assert!(
+        node.state().build_block().unwrap().is_none(),
+        "calldata-only chains skip empty blocks"
+    );
+
+    // Under-intrinsic calldata is refused at admission before any seal.
+    let cheap = calldata_transfer(&tx_key, 0, 10, vec![0; 2048], 21_000);
+    assert!(node.state().submit_transaction(cheap).is_err());
+    assert_eq!(node.state().block_height(), 0);
+
+    // Validly-priced calldata seals a v3 block at base fee 0.
+    let priced = calldata_transfer(&tx_key, 0, 10, vec![0; 1024], 21_000);
+    node.state().submit_transaction(priced.clone()).unwrap();
+    assert_eq!(node.state().block_height(), 1, "demo chains seal synchronously");
+    let sealed = node.state().block_at_height(1).unwrap();
+    assert_eq!(sealed.header.version, CALLDATA_HEADER_VERSION);
+    assert_eq!(sealed.header.base_fee_per_gas, 0);
+    assert_eq!(node.state().balance(&sender), 1_000_000 - 10 - 21_000);
+
+    // Restart replays the floor under the recorded schedule and keeps the tip.
+    let restarted = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(restarted.state().block_height(), 1);
+    assert!(restarted.state().calldata_policy().is_some());
+    assert_eq!(restarted.state().nonce(&sender), 1);
+    assert_eq!(restarted.state().balance(&sender), 1_000_000 - 10 - 21_000);
+    assert!(restarted.state().receipt(&priced.hash()).is_some());
+}
+
+#[test]
+fn calldata_only_genesis_without_allocations_persists_the_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut genesis = genesis_with(1, None);
+    genesis.calldata_policy = Some(calldata_policy());
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+    // A priced genesis persists its height-0 anchor even with no allocations
+    // (the guard treats a calldata schedule like a fee policy), so bootstrap
+    // succeeds and the schedule binds. With no funded account and empty blocks
+    // skipped the chain is inert but valid.
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(node.state().block_height(), 0);
+    assert!(node.state().calldata_policy().is_some());
+    assert!(node.state().build_block().unwrap().is_none());
+    drop(node);
+
+    // The anchor is durable: reopening binds the schedule to the empty ledger
+    // without a pre-version-3 refusal.
+    let restarted = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(restarted.state().block_height(), 0);
+    assert!(restarted.state().calldata_policy().is_some());
+}
+
+#[test]
+fn joint_fee_and_calldata_genesis_seals_empty_v3_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut genesis = genesis_with(1, None);
+    genesis.fee_policy = Some(fee_policy());
+    genesis.calldata_policy = Some(calldata_policy());
+    genesis.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert!(node.state().fee_policy().is_some());
+    assert!(node.state().calldata_policy().is_some());
+    // The calldata bound wins the version word; the fee schedule still drives
+    // the empty-block cadence and the base fee.
+    let empty = node.state().build_block().unwrap().expect("a joint chain seals empty blocks");
+    assert_eq!(empty.header.version, CALLDATA_HEADER_VERSION);
+    assert_eq!(empty.header.base_fee_per_gas, 8);
+    node.state().accept_block(empty).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+    assert_eq!(node.state().build_block().unwrap().unwrap().header.base_fee_per_gas, 7);
+
+    let restarted = Node::bootstrap(test_config(dir.path())).unwrap();
+    assert_eq!(restarted.state().block_height(), 1);
+    assert_eq!(restarted.state().build_block().unwrap().unwrap().header.base_fee_per_gas, 7);
+}
+
+#[test]
+fn a_calldata_policy_refuses_to_extend_a_legacy_data_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let tx_key = signing_key(7);
+    let sender = Address::from_public_key(&tx_key.verifying_key().to_bytes());
+    let mut legacy = genesis_with(1, Some((sender, 1_000_000)));
+    legacy.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    node.state().submit_transaction(signed_transfer(&tx_key, 0, 10)).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+    drop(node);
+
+    // The same directory with a calldata-priced genesis is refused, not
+    // rewritten: its v1 calldata was committed unpriced.
+    legacy.calldata_policy = Some(calldata_policy());
+    legacy.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let error = match Node::bootstrap(test_config(dir.path())) {
+        Err(error) => error,
+        Ok(_) => panic!("bootstrap must refuse a priced genesis on a legacy ledger"),
+    };
+    assert!(error.to_string().contains("pre-version-3"), "{error}");
+}
+
+#[test]
+fn a_calldata_policy_refuses_to_extend_a_fee_only_v2_data_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fee_only = genesis_with(1, None);
+    fee_only.fee_policy = Some(fee_policy());
+    fee_only.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let node = Node::bootstrap(test_config(dir.path())).unwrap();
+    let empty = node.state().build_block().unwrap().unwrap();
+    assert_eq!(empty.header.version, FEE_HEADER_VERSION);
+    node.state().accept_block(empty).unwrap();
+    assert_eq!(node.state().block_height(), 1);
+    drop(node);
+
+    // Adding a calldata schedule to a v2 ledger is refused: a priced genesis
+    // never extends pre-version-3 history (no v2 production on a priced chain).
+    fee_only.calldata_policy = Some(calldata_policy());
+    fee_only.save(&dir.path().join(GENESIS_FILE_NAME)).unwrap();
+    let error = match Node::bootstrap(test_config(dir.path())) {
+        Err(error) => error,
+        Ok(_) => panic!("bootstrap must refuse a priced genesis on a v2 ledger"),
+    };
+    assert!(error.to_string().contains("pre-version-3"), "{error}");
 }
 
 #[test]

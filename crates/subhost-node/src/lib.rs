@@ -429,6 +429,15 @@ impl Node {
             Some(policy) => store.with_fee_policy(policy.clone())?,
             None => store,
         };
+        // Bind the calldata schedule the same way (Q-037 L4): a restored
+        // version-3 ledger replays the floor with it, and the first persist
+        // records it in the manifest (Q-037 L3). Offline tools supply nothing
+        // and use the recorded schedule.
+        let calldata_policy = genesis.as_ref().and_then(|genesis| genesis.calldata_policy);
+        let store = match &calldata_policy {
+            Some(policy) => store.with_calldata_policy(*policy)?,
+            None => store,
+        };
         let mut state = RpcState::with_store(store)?.with_consensus_context(protocol_context);
         // Honour the genesis block gas limit end to end: the fee policy is
         // validated against it and every produced/accepted header carries it.
@@ -441,6 +450,12 @@ impl Node {
         // legacy fixed-price behaviour byte-for-byte.
         if let Some(policy) = fee_policy {
             state = state.with_fee_policy(policy)?;
+        }
+        // A calldata-priced genesis owns the byte floor for this chain; the
+        // node refuses to extend a pre-version-3 ledger with it. Absent
+        // schedule keeps the unpriced behaviour byte-for-byte.
+        if let Some(policy) = calldata_policy {
+            state = state.with_calldata_policy(policy)?;
         }
         if let Some(limit) = proposal_limit {
             state = state.with_proposal_bytes_limit(limit);
@@ -474,17 +489,21 @@ impl Node {
 
         if fresh {
             if let Some(genesis) = &genesis {
-                // A fee-enabled ledger needs its height-0 state anchor persisted
-                // before the first v2 block, even with no allocations: storage
-                // refuses a v2 append with no committed snapshot and no verified
-                // head (Q-030). `seed_accounts` always persists, so an empty
-                // allocation set still writes the anchor.
-                if !genesis.allocations.is_empty() || genesis.fee_policy.is_some() {
+                // A fee-enabled or calldata-priced ledger needs its height-0
+                // state anchor persisted before the first v2/v3 block, even
+                // with no allocations: storage refuses a v2+ append with no
+                // committed snapshot and no verified head (Q-030).
+                // `seed_accounts` always persists, so an empty allocation set
+                // still writes the anchor.
+                if !genesis.allocations.is_empty()
+                    || genesis.fee_policy.is_some()
+                    || genesis.calldata_policy.is_some()
+                {
                     state.seed_accounts(
                         genesis.allocations.iter().map(|(address, balance)| (*address, *balance)),
                     )?;
                     if genesis.allocations.is_empty() {
-                        info!("persisted the genesis state anchor for the fee-enabled ledger");
+                        info!("persisted the genesis state anchor for the priced ledger");
                     } else {
                         info!(accounts = genesis.allocations.len(), "applied genesis allocations");
                     }

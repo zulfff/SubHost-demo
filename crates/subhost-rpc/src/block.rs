@@ -8,6 +8,10 @@ mod proposal_budget_tests;
 #[path = "block_span_tests.rs"]
 mod block_span_tests;
 
+#[cfg(test)]
+#[path = "calldata_floor_tests.rs"]
+mod calldata_floor_tests;
+
 use crate::state::{lock, read, write, BlockEvent, RpcError, RpcState};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
@@ -15,7 +19,7 @@ use subhost_consensus::{ConsensusConfig, HotStuff, QuorumCertificate, ValidatorR
 use subhost_core::{
     encode_canonical, settle_block_fees, tx_root_of, Address, Amount, Block, BlockHeader,
     FeeContext, Gas, Hash, Receipt, ReceiptStatus, Transaction, ValidatorSignature,
-    FEE_HEADER_VERSION,
+    CALLDATA_HEADER_VERSION, FEE_HEADER_VERSION,
 };
 use subhost_crypto::{BLSScheme, PrivateKey};
 use subhost_mempool::Mempool;
@@ -100,8 +104,15 @@ fn settle_fees(
 
 impl RpcState {
     /// Header version this chain produces and accepts.
+    ///
+    /// A bound calldata schedule names version 3 with or without a fee policy
+    /// (Q-037 ruling 2026-11-22): the version word commits to the byte floor,
+    /// so a priced genesis never produces or accepts version 2. Fee-only
+    /// chains stay version 2, policy-less chains stay version 1.
     fn header_version(&self) -> u32 {
-        if self.fee_policy.is_some() {
+        if self.calldata_policy.is_some() {
+            CALLDATA_HEADER_VERSION
+        } else if self.fee_policy.is_some() {
             FEE_HEADER_VERSION
         } else {
             1
@@ -148,6 +159,16 @@ impl RpcState {
     pub fn submit_transaction(&self, tx: Transaction) -> Result<Hash, RpcError> {
         let _commit_guard = lock(&self.commit_lock);
         let requested_hash = tx.hash();
+
+        // Calldata validity floor (Q-037 L4): under-intrinsic gas or data over
+        // the protocol maximum can never execute, so refuse before the pool is
+        // touched. Validity, not economics: it binds even when a library
+        // caller relaxes the local mempool cap.
+        if let Some(policy) = self.calldata_policy() {
+            policy
+                .check_floor(&tx)
+                .map_err(|error| RpcError::TransactionRejected(error.to_string()))?;
+        }
 
         // Reject a bid below the next block's base fee before it touches the
         // pool. This is an admission policy, not a consensus rule: entries
@@ -257,6 +278,14 @@ impl RpcState {
         for sender in senders {
             for tx in pool.ready_for(&sender, state.nonce(&sender)) {
                 if fee.is_some_and(|fee| tx.gas_price < fee.base_fee_per_gas) {
+                    break;
+                }
+                // Calldata validity floor (Q-037 L4): break, not skip. The
+                // lane is nonce-ordered and gas_limit/data are signed, so a
+                // floor-failing entry can never become valid and blocks its
+                // sender's later nonces, exactly like the fee break above.
+                // Other senders' lanes are unaffected.
+                if self.calldata_policy().is_some_and(|policy| policy.check_floor(&tx).is_err()) {
                     break;
                 }
                 let Some(next_gas) = gas_used.checked_add(tx.gas_limit) else { break };
@@ -738,6 +767,19 @@ impl RpcState {
                         block.header.height, tx.gas_price, context.base_fee_per_gas
                     )));
                 }
+            }
+            // Calldata validity floor (Q-037 L4): consensus acceptance, before
+            // the state transition and before any persist. Acceptance and the
+            // store's replay/persist floor run the same pure check under the
+            // same bound schedule, so an accepted block can never fail the
+            // persist floor afterwards (Q-024 accept/persist pin).
+            if let Some(policy) = self.calldata_policy() {
+                policy.check_floor(tx).map_err(|error| {
+                    RpcError::BlockRejected(format!(
+                        "transaction {index} in block {}: {error}",
+                        block.header.height
+                    ))
+                })?;
             }
             let next_gas = gas_used.checked_add(tx.gas_limit).ok_or(RpcError::Internal)?;
             if next_gas > block.header.gas_limit {

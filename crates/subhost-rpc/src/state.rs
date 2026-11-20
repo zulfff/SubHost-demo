@@ -12,7 +12,7 @@ use subhost_core::{
     Receipt, Transaction, TransactionType, BLOCK_GAS_LIMIT, CALLDATA_HEADER_VERSION,
     FEE_HEADER_VERSION,
 };
-use subhost_mempool::{Mempool, MempoolStore};
+use subhost_mempool::{Mempool, MempoolError, MempoolStore};
 use subhost_metrics::{LedgerPruneOutcome, Metrics};
 use subhost_state::{AccountProof, State};
 use subhost_storage::{LedgerDiskStats, LedgerStore, PruneOutcome, StorageError};
@@ -483,10 +483,21 @@ impl RpcState {
             left.from.cmp(&right.from).then_with(|| left.nonce.cmp(&right.nonce))
         });
 
-        let (mut mined, mut oversized, mut refused) = (0usize, 0usize, 0usize);
+        let (mut mined, mut floor_dropped, mut oversized, mut cap_dropped, mut refused) =
+            (0usize, 0usize, 0usize, 0usize, 0usize);
         for tx in ordered {
             if tx.nonce < committed.nonce(&tx.from) {
                 mined += 1;
+                continue;
+            }
+            // Calldata validity floor (Q-037 L4): under-intrinsic gas or data
+            // over the protocol maximum can never become valid, both fields
+            // are signed, so drop, never park. Runs before admit_restored so a
+            // floor-invalid entry can never reach the parked set. First-match
+            // order: mined, floor, budget, then admission (cap, economics).
+            if self.calldata_policy.as_ref().is_some_and(|policy| policy.check_floor(&tx).is_err())
+            {
+                floor_dropped += 1;
                 continue;
             }
             if proposal_budget.is_some_and(|budget| encode_canonical(&tx).len() > budget) {
@@ -495,10 +506,22 @@ impl RpcState {
             }
             match candidate.admit_restored(tx) {
                 Ok(admission) if admission.accepted => {}
+                // Observation-only split (Q-037): the L0 cap drop gets its own
+                // reason instead of folding into refused. Same drop set and
+                // pool outcome as before, only the counter becomes visible.
+                Err(MempoolError::DataTooLarge { .. }) => cap_dropped += 1,
                 Ok(_) | Err(_) => refused += 1,
             }
         }
-        debug!(mined, oversized, refused, restored = candidate.len(), "pending pool restored");
+        debug!(
+            mined,
+            floor_dropped,
+            oversized,
+            cap_dropped,
+            refused,
+            restored = candidate.len(),
+            "pending pool restored"
+        );
         *write(&self.mempool) = candidate;
         // The filtered pool is now live; rewriting the file is best-effort so a
         // pending-file problem cannot stop a node whose ledger is durable.
