@@ -2,11 +2,12 @@
 
 Updated 2026-11-21 (WAVE COMPLETE: L2 #94, L0 #95, OTLP #88, #97, spans #98
 (`c5ce60c`), architecture #99 (`dd5b514`), start-stop #102 (`27b2c92`), L3
-#101 (`4dcd6d3`), sync-relay #100 (`936f3d1`) all MERGED; main = `936f3d1`;
+#101 (`4dcd6d3`), sync-relay #100 (`936f3d1`) all MERGED; main = `69207de` (records #104 merged);
 R-L2-01/02/03, R-88-01, R-84-01, R-96-01 CLOSED; sccache S3 cache RE-ENABLED,
 three clean cache-path samples. Q-037 ladder L0-L3 on main; L4 (bima)
 building, L5 (yoga) staged. Activation gate: L4 merged+verified + nara
-SUBHOST-2026-003 re-probe). Evidence logs under
+SUBHOST-2026-003 re-probe. Q-042 folded below: S8.1 end-to-end claims
+QUALIFIED until tania's export fix). Evidence logs under
 `2026-11-19-four-gate-baseline/` are kept intact (only `target/` build dirs
 were cleaned; the re-enabled sccache S3 cache makes rebuilds cheap).
 
@@ -22,14 +23,39 @@ were cleaned; the re-enabled sccache S3 cache makes rebuilds cheap).
 | yoga mempool-persist flag | PR #96 | `--mempool-persist` CLI | **MERGED** (`b5db69b`). APPROVE; R-84-01 CLOSED. R-96-01 (Low, duplicated doc paragraph) **CLOSED**: #97 merged (`b1f93c5`), dedupe verified on main (docs-only +3/-5, both facts kept) | Track B. Opt-in wired at both run_node call sites; default off, volatile pool. |
 | tania Q4 prune metrics | PR #92 | `subhost_ledger_prune_total{outcome}`, `subhost_ledger_base_height` | **MERGED** (`db2231d`) on CI green before the review landed (deviation noted by tech-lead; content verified). Post-merge APPROVE at `db2231d`: content-identical to reviewed `a670b00` outside CHANGELOG; nara gates at `a670b00` ALL GREEN 670/0 (first run on the re-enabled sccache path; cache-path validated, no sccache errors) | Track B. Three bounded labels, no `failed` outcome, no height labels; gauge seeded from the restored base at attach, moves only on `Pruned`; errors never counted; refusals are normal no-ops (no refusal alert). |
 | raka node trigger | `s12.3/retention-node-trigger` (PR pending) | prune-after-commit loop consuming `retain_from` | Trigger implemented on branch `s12.3/retention-node-trigger` (Q-041 agreed): prunes after a successful commit, refuses `0` at bootstrap, warns below the 4096-item certified archive window, excludes `--single-writer` demo mode. PR pending; recovery backlog (4 items) in `docs/agents/replies/raka-recovery-backlog.md`. **Prerequisite satisfied:** R-RET-01 fix merged (#89) before any trigger exists | Track A. Review against Q-036 contract: prune after commit, failure never halts, boot warning below 4096, demo single-writer caveat. |
-| sari block/consensus spans | PR #98 | block/consensus telemetry spans (S8.1, Q-035 contract over tania's #74 provider) | **MERGED** (`c5ce60c`, announced by tech-lead). Tech-lead contract APPROVE + yoga APPROVE + tania APPROVE (provider owner); nara security spot-check PASS at `f7d0c19`, carried to `5e6f294` (R-02 punctuation-only docs delta, zero code diff) and to the merge. Q-035 contract complete end-to-end: provider #74 + CLI #88 + spans #98 | Track A (sari). One span per driver step (never per vote); bounded `error_kind` static classification, no raw peer text; span cardinality / no secret labels; near-free no-ops without a subscriber. |
-| tania sync-relay OTLP | PR #100 | sync-relay example opt-in OTLP export (S8.1/Q-035 follow-up, mirrors #88) | **MERGED** (`936f3d1`, last of the wave). nara APPROVE at `e82f545`, carried through `962c225` (docs-only rebase, keep-both observability conflict with #98; range-diff patch delta observability.md-only, code + CHANGELOG content-identical; tech-lead precedent: gates + CI carry) to the merge (range-diff metadata-only). Contract: opt-in default off (unset/empty/whitespace = plain logging, no exporter), non-fatal fallback, guard retained in async main, malformed endpoint refused before global install, no credentials touched (Q-040 binds the auth-header slice, now GO), no new deps (otlp feature on subhost-cli since #88). Patch identity: `d8f3cf7` -> `e82f545` CHANGELOG-only 2-line interdiff (#96 precedent). nara gates at `e82f545` ALL GREEN 702/0 + example 16/16, zero sccache warnings (clean cache sample); tania bonus full re-gate at `962c225` 774/0 (63 focused + 711 workspace, zero warnings, tech-lead verified); CI 9/9. S8.1 export path complete end-to-end incl. the relay example | Track B (tania). Info: no-endpoint path relaxes `init(...)?` to `init_or_warn` (sole installer, no observable default change, mirrors #88). Evidence: issuecomment-7024298386 / issuecomment-7024446064 / issuecomment-7028567027; nara review on PR. |
+| sari block/consensus spans | PR #98 | block/consensus telemetry spans (S8.1, Q-035 contract over tania's #74 provider) | **MERGED** (`c5ce60c`, announced by tech-lead). Tech-lead contract APPROVE + yoga APPROVE + tania APPROVE (provider owner); nara security spot-check PASS at `f7d0c19`, carried to `5e6f294` (R-02 punctuation-only docs delta, zero code diff) and to the merge. Q-035 contract complete for wiring/spans: provider #74 + CLI #88 + spans #98 (export runtime QUALIFIED per Q-042 until tania's fix) | Track A (sari). One span per driver step (never per vote); bounded `error_kind` static classification, no raw peer text; span cardinality / no secret labels; near-free no-ops without a subscriber. |
+| tania sync-relay OTLP | PR #100 | sync-relay example opt-in OTLP export (S8.1/Q-035 follow-up, mirrors #88) | **MERGED** (`936f3d1`, last of the wave). nara APPROVE at `e82f545`, carried through `962c225` (docs-only rebase, keep-both observability conflict with #98; range-diff patch delta observability.md-only, code + CHANGELOG content-identical; tech-lead precedent: gates + CI carry) to the merge (range-diff metadata-only). Contract: opt-in default off (unset/empty/whitespace = plain logging, no exporter), non-fatal fallback, guard retained in async main, malformed endpoint refused before global install, no credentials touched (Q-040 binds the auth-header slice, now GO), no new deps (otlp feature on subhost-cli since #88). Patch identity: `d8f3cf7` -> `e82f545` CHANGELOG-only 2-line interdiff (#96 precedent). nara gates at `e82f545` ALL GREEN 702/0 + example 16/16, zero sccache warnings (clean cache sample); tania bonus full re-gate at `962c225` 774/0 (63 focused + 711 workspace, zero warnings, tech-lead verified); CI 9/9. S8.1 wiring complete incl. the relay example; export runtime QUALIFIED per Q-042 (batch-thread panic at first export) until tania's fix | Track B (tania). Info: no-endpoint path relaxes `init(...)?` to `init_or_warn` (sole installer, no observable default change, mirrors #88). Evidence: issuecomment-7024298386 / issuecomment-7024446064 / issuecomment-7028567027; nara review on PR. |
 | dewi L3 replay dispatch | PR #101 | manifest calldata_policy sibling binding + replay floor dispatch (Q-037 L3) | **MERGED** (`4dcd6d3`). Tech-lead contract review (rulings 1+2: calldata-only base-fee-0 chains, ALL-v3 priced ledgers; fail-closed missing schedule, mixed-version refusal, schedule through all paths incl. prune, RPC refuses repricing pre-v3 restored ledgers) + nara post-merge security verification PASS (full diff read at `4dcd6d3`, range-diff vs gated `5e735d9` metadata-only; all six bind guards, additive manifest version-2 byte-identity pin, check_floor per tx BEFORE execution on every replay path, calldata-only base-fee-0 refusal, RPC gas-limit frame + identical store schedule; 21 new tests). nara INDEPENDENT gates at `5e735d9` ALL GREEN 719/0, four markers + exit 0, zero sccache warnings (clean cache sample), exact match with dewi 719/0; CI 9/9; merge evidence per tech-lead | Track B (dewi). Replay-only: nothing produces v3 or enforces the floor on admission until L4. Info: `#[allow(clippy::too_many_arguments)]` on persist, documented structural rationale. Residual: restore_pending gas-mismatch regression + accept/persist round-trip + floor-invalid-untouched-tip tests in bima's L4 plan. Review: PR #101 issuecomment-7028820366. |
 | bima L4 activation wiring | (building on post-L3 main) | six insertion points + cap_dropped split + floor_dropped counter, restore filter order pin, select no-resurrection, accept/persist floor-before-state-transition (Q-024 pin), gas-mismatch regression | GO issued at `4dcd6d3`; sari peer-reviews; nara regressions + joint 003 re-probe on merge | Track A. Counter set mined/floor_dropped/oversized/cap_dropped/refused/restored (dewi ack'd). Two added tests: accept/persist round-trip; floor-invalid refusal with untouched tip. |
 | yoga L5 CLI/docs | (staged) | genesis calldata-schedule flag + docs | Builds after L4 merge; L3 API pre-verification assigned | Track B. |
-| tania auth-header slice | (GO per Q-040) | OTLP auth headers: presence-only override warning + documented precedence, fail-closed bad token file, zeroize with SDK-copy caveat, never logged/never in span attributes | Starts on #100 merge (done); branch from `936f3d1` | Track B. Agreed Q-040 secrets contract binds. |
+| tania auth-header slice | (GO per Q-040, AFTER the Q-042 fix) | OTLP auth headers: presence-only override warning + documented precedence, fail-closed bad token file, zeroize with SDK-copy caveat, never logged/never in span attributes | Gated on tania's Q-042 export fix landing FIRST (ruling order); rebases onto post-fix main | Track B. Agreed Q-040 secrets contract binds; delivery-surface review criterion applies (loopback capture). |
+| tania Q-042 export fix | (building) | workspace feature `hyper-client` -> `reqwest-blocking-client`; regression pin asserts a real export reaches a loopback listener through the dedicated batch thread; unreachable-endpoint failure path (no panic, processing survives) | GO per tech-lead ruling (`docs/agents/replies/Q-042-tech-lead.md`); lands BEFORE auth-header; fix PR corrects the ROADMAP S8.1 line + CHANGELOG (tania's, not nara's) | Track B. Functional QA finding, NOT a security advisory (see below). cargo deny re-check mandatory (feature unification changes the resolved graph). |
 | yoga architecture refresh | PR #99 | Q-037 L0 admission rules + stale persistence line (docs-only, +24/-9) | **MERGED** (`dd5b514`). Tech-lead GO + docs-only verified; nara spot-checked the two load-bearing source claims (16 KiB pool cap at mempool lib.rs:44, 128 KiB protocol bound at core calldata.rs:39): both accurate on main | Track B (yoga). No code or semantic change. |
 | yoga start-stop flag list | PR #102 | list `--otlp-endpoint` in start-stop opt-in flags (docs-only) | **MERGED** (`27b2c92`), tech-lead docs-only verified | Track B (yoga). |
+
+## Q-042: OTLP export runtime failure (functional QA, NOT a security advisory)
+
+Verified by tania, independently confirmed by the tech-lead at locked sources
+(2026-11-20, ruling in `docs/agents/replies/Q-042-tech-lead.md`): OTLP export
+on main panics on the dedicated batch thread at first export. The
+`hyper-client` feature of opentelemetry-http is reactor-bound (requires a
+Tokio runtime), but the SDK batch processor exports via
+`futures_executor::block_on` on a dedicated OS thread with no runtime
+entered. The panic is detached and shutdown errors are swallowed, so every
+construction/shutdown test stayed green: export was never asserted.
+
+- Classification: functional QA finding, silent export failure, no secret
+  exposure. Not a security advisory; no finding ID in the security ladder.
+- Impact on claims: "S8.1 complete end-to-end" is QUALIFIED to wiring/spans
+  until the fix merges (queue rows above corrected; ROADMAP/CHANGELOG
+  corrections ride tania's fix PR).
+- Ruling: Option A feature swap to `reqwest-blocking-client` (the
+  SDK-documented compatible path), tania owns, fix BEFORE auth-header.
+  Regression pin: a real export reaches a loopback listener through the
+  real batch processor; unreachable endpoint must not panic and must not
+  kill subsequent processing; clean-shutdown assertion kept.
+- Lesson adopted as a standing review criterion (gate practice above):
+  actual-delivery evidence required on any delivery surface.
 
 ## Tracked blocker: SUBHOST-2026-003 (High), three-fix ladder
 
@@ -95,7 +121,13 @@ outside the repo: never print, commit, or paste it). In-flight wrapper-free
 runs finished as-is per the decision (the bypass rows above are historical
 snapshots of that window). sccache 0.19 does not cache `--crate-type bin`
 (normal; workspace libs are cached). An sccache/connection error is never
-green: re-run. CLEAN cache-path samples (zero sccache warnings): #92 gate
+green: re-run. STANDING REVIEW CRITERION (tech-lead, Q-042 lesson):
+export/delivery surfaces need ACTUAL-DELIVERY evidence before APPROVE: a
+loopback capture asserting bytes reach a listener through the real runtime
+path (dedicated batch thread, no caller runtime), plus the failure path
+(unreachable endpoint: no panic, subsequent processing survives).
+Construction/shutdown-green is NOT sufficient: detached-thread panics and
+swallowed shutdown errors are invisible to it. CLEAN cache-path samples (zero sccache warnings): #92 gate
 670/0 (nara), #100 supplementary re-gate 774/0 (tania, `962c225`), #101
 independent 719/0 (nara). The #88 supplementary gate 734/0 (813 hits / 0
 errors) is a VALID result but NOT a clean sample: 12 server-restart fallback
@@ -122,7 +154,7 @@ CARGO=/usr/local/cargo/bin/cargo ~/.local/bin/cargo-deny --all-features check`.
 | #96 `yoga/mempool-persist-flag` | `--mempool-persist` CLI opt-in (Q-038) | MERGED (`b5db69b`). APPROVE; R-84-01 closed; R-96-01 Low doc nit fixed in merged #97 (`b1f93c5`), CLOSED. |
 | #91 `yoga/retention-blocks-flag` | `--retention-blocks` CLI + runbook (Q-036 Q5) | MERGED (`b49d05c`). APPROVE; inert until the node trigger. |
 | #84 `s6.1b/mempool-persist-node` | opt-in mempool persistence consumer (Q-016/Q-038) | MERGED (`f59fe71`). APPROVE; ADR-016 rebase identity verified. |
-| #98 `s8/block-consensus-spans` | S8.1 block/consensus spans (Q-035) | MERGED (`c5ce60c`). nara spot-check PASS carried through the R-02 docs-only amend; Q-035 complete end-to-end. |
+| #98 `s8/block-consensus-spans` | S8.1 block/consensus spans (Q-035) | MERGED (`c5ce60c`). nara spot-check PASS carried through the R-02 docs-only amend; Q-035 wiring/spans complete, export runtime qualified per Q-042. |
 | #99 (docs-only) | architecture.md Q-037 L0 admission rules + stale persistence line | MERGED (`dd5b514`). Load-bearing source claims spot-checked accurate on main. |
 | #102 (docs-only) | start-stop opt-in flag list adds `--otlp-endpoint` | MERGED (`27b2c92`). |
 | #101 `s6/calldata-l3` | Q-037 L3 manifest binding + replay floor dispatch | MERGED (`4dcd6d3`). Tech-lead contract review + nara post-merge security PASS; nara independent 719/0 + dewi 719/0, CI 9/9. |
